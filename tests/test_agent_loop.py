@@ -1,0 +1,372 @@
+"""Unit testy pro agent loop. Ollama je mockovaný — žádné network calls."""
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from voice.agent.loop import AgentLoop
+from voice.agent.tools import default_registry
+from voice.agent.tools.base import Tool, ToolRegistry
+
+
+class _FakeStream:
+    """Fake httpx.AsyncClient.stream() context manager. Emituje NDJSON
+    lines podle scriptu."""
+
+    def __init__(self, lines: list[str], status_code: int = 200):
+        self.lines = lines
+        self.status_code = status_code
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def aiter_lines(self):
+        for ln in self.lines:
+            yield ln
+
+    async def aread(self) -> bytes:
+        return "\n".join(self.lines).encode()
+
+
+class _FakeClient:
+    def __init__(self, scripts: list[list[str]]):
+        # scripts[i] = NDJSON lines pro i-tý request
+        self.scripts = scripts
+        self.idx = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def stream(self, method: str, url: str, json=None):  # noqa: ARG002
+        lines = self.scripts[self.idx]
+        self.idx += 1
+        return _FakeStream(lines)
+
+
+def _ollama_line(content: str = "", tool_calls=None, done: bool = False) -> str:
+    msg: dict = {"role": "assistant", "content": content}
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    return json.dumps({"message": msg, "done": done})
+
+
+@pytest.mark.asyncio
+async def test_loop_text_only_no_tools(tmp_path: Path):
+    """Model vrátí čistý text bez tool_calls → loop emituje text + agent_done."""
+    scripts = [[
+        _ollama_line(content="Ahoj "),
+        _ollama_line(content="světe!"),
+        _ollama_line(done=True),
+    ]]
+
+    turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+    loop = AgentLoop(
+        model="test",
+        messages=[{"role": "user", "content": "ahoj"}],
+        registry=default_registry("agent"),
+        turn_state=turn_state,
+        workdir=tmp_path,
+    )
+
+    with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+        events = [ev async for ev in loop.run()]
+
+    text = "".join(e["delta"] for e in events if e["type"] == "text")
+    assert text == "Ahoj světe!"
+    assert events[-1]["type"] == "agent_done"
+    # Žádný tool call ani approval
+    assert not any(e["type"] in ("tool_call", "tool_result", "approval_required") for e in events)
+
+
+@pytest.mark.asyncio
+async def test_loop_echo_tool_call(tmp_path: Path):
+    """Model volá echo, dostane result, pak doplní finalní text."""
+    scripts = [
+        # Turn 1: tool call
+        [
+            _ollama_line(
+                tool_calls=[{
+                    "function": {"name": "echo", "arguments": {"text": "hi"}},
+                }],
+                done=True,
+            ),
+        ],
+        # Turn 2: final text po tool result
+        [
+            _ollama_line(content="Hotovo: "),
+            _ollama_line(content="hi"),
+            _ollama_line(done=True),
+        ],
+    ]
+
+    turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+    loop = AgentLoop(
+        model="test",
+        messages=[{"role": "user", "content": "echo hi"}],
+        registry=default_registry("agent"),
+        turn_state=turn_state,
+        workdir=tmp_path,
+    )
+
+    with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+        events = [ev async for ev in loop.run()]
+
+    types = [e["type"] for e in events]
+    assert "tool_call" in types
+    assert "tool_result" in types
+    assert types[-1] == "agent_done"
+
+    tc_event = next(e for e in events if e["type"] == "tool_call")
+    assert tc_event["name"] == "echo"
+    assert tc_event["args"] == {"text": "hi"}
+
+    tr_event = next(e for e in events if e["type"] == "tool_result")
+    assert tr_event["ok"] is True
+    result_payload = json.loads(tr_event["content"])
+    assert result_payload == {"echoed": "hi", "length": 2}
+
+    # Final text byl emitován v druhé iteraci
+    text = "".join(e["delta"] for e in events if e["type"] == "text")
+    assert text == "Hotovo: hi"
+
+    # History musí obsahovat assistant s tool_calls + tool message + final assistant
+    history = loop.messages
+    roles = [m["role"] for m in history]
+    assert roles == ["user", "assistant", "tool", "assistant"]
+    assert "tool_calls" in history[1]
+    assert history[2]["tool_call_id"] == tc_event["id"]
+
+
+@pytest.mark.asyncio
+async def test_loop_unknown_tool_denied(tmp_path: Path):
+    """Model vrátí neznámý tool → loop ho zamítne, model dostane error
+    a v druhé iteraci dokončí turn textem."""
+    scripts = [
+        [
+            _ollama_line(
+                tool_calls=[{"function": {"name": "no_such_tool", "arguments": {}}}],
+                done=True,
+            ),
+        ],
+        [
+            _ollama_line(content="Ups, nemůžu."),
+            _ollama_line(done=True),
+        ],
+    ]
+    turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+    loop = AgentLoop(
+        model="test",
+        messages=[{"role": "user", "content": "go"}],
+        registry=default_registry("agent"),
+        turn_state=turn_state,
+        workdir=tmp_path,
+    )
+
+    with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+        events = [ev async for ev in loop.run()]
+
+    tr = next(e for e in events if e["type"] == "tool_result")
+    assert tr["ok"] is False
+    payload = json.loads(tr["content"])
+    assert "denied" in payload["error"] or "policy" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_loop_cancellation(tmp_path: Path):
+    """Cancel uprostřed streamu → agent_canceled, žádné další iterace."""
+    cancel_event = asyncio.Event()
+    turn_state = {"id": "t1", "canceled": False, "cancel_event": cancel_event}
+
+    async def slow_lines():
+        yield _ollama_line(content="zacatek ")
+        turn_state["canceled"] = True
+        yield _ollama_line(content="nedoraz")
+        yield _ollama_line(done=True)
+
+    class _SlowStream:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def aiter_lines(self):
+            async for ln in slow_lines():
+                yield ln
+        async def aread(self):
+            return b""
+        status_code = 200
+
+    class _SlowClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        def stream(self, *a, **kw):
+            return _SlowStream()
+
+    loop = AgentLoop(
+        model="test",
+        messages=[{"role": "user", "content": "ahoj"}],
+        registry=default_registry("agent"),
+        turn_state=turn_state,
+        workdir=tmp_path,
+    )
+
+    with patch("voice.agent.loop.httpx.AsyncClient", return_value=_SlowClient()):
+        events = [ev async for ev in loop.run()]
+
+    types = [e["type"] for e in events]
+    assert "agent_canceled" in types
+
+
+@pytest.mark.asyncio
+async def test_loop_ollama_error(tmp_path: Path):
+    """Ollama HTTP 500 → agent_error event."""
+    class _ErrStream:
+        status_code = 500
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def aiter_lines(self):
+            return
+            yield  # pragma: no cover
+        async def aread(self):
+            return b"server boom"
+
+    class _ErrClient:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        def stream(self, *a, **kw):
+            return _ErrStream()
+
+    turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+    loop = AgentLoop(
+        model="test",
+        messages=[{"role": "user", "content": "ahoj"}],
+        registry=default_registry("agent"),
+        turn_state=turn_state,
+        workdir=tmp_path,
+    )
+
+    with patch("voice.agent.loop.httpx.AsyncClient", return_value=_ErrClient()):
+        events = [ev async for ev in loop.run()]
+
+    err = [e for e in events if e["type"] == "agent_error"]
+    assert err
+    assert "500" in err[0]["msg"]
+
+
+@pytest.mark.asyncio
+async def test_loop_non_serializable_tool_output_degrades(tmp_path: Path):
+    """Tool vrátí ne-JSON-serializovatelný objekt (např. Path).
+    Loop nesmí spadnout — musí vrátit ok=False tool_result a pokračovat."""
+    from voice.agent import permissions
+
+    async def _bad_exec(args, ctx):
+        return {"path": Path("/tmp")}  # Path není JSON-serializable
+
+    bad_tool = Tool(
+        name="bad_unique_for_test",
+        description="returns non-serializable",
+        parameters_schema={"type": "object", "properties": {}},
+        execute=_bad_exec,
+    )
+    reg = ToolRegistry()
+    reg.register(bad_tool)
+
+    # AUTO classifier ať tool projde permission checkem.
+    @permissions.register_classifier("bad_unique_for_test")
+    def _cls(args, workdir):
+        return permissions.PermissionResult(
+            decision=permissions.Decision.AUTO, reason="test", summary="test",
+            risk="low", requires_explicit=False,
+        )
+
+    scripts = [
+        [_ollama_line(
+            tool_calls=[{"function": {"name": "bad_unique_for_test", "arguments": {}}}],
+            done=True,
+        )],
+        [_ollama_line(content="ok"), _ollama_line(done=True)],
+    ]
+    turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+    loop = AgentLoop(
+        model="test",
+        messages=[{"role": "user", "content": "go"}],
+        registry=reg,
+        turn_state=turn_state,
+        workdir=tmp_path,
+    )
+
+    with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+        events = [ev async for ev in loop.run()]
+
+    types = [e["type"] for e in events]
+    assert types[-1] == "agent_done"
+    tr = next(e for e in events if e["type"] == "tool_result")
+    assert tr["ok"] is False
+    payload = json.loads(tr["content"])
+    assert "non-serializable" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_loop_tool_call_cap_emits_synthetic_results(tmp_path: Path, monkeypatch):
+    """Při překročení MAX_TOOL_CALLS_PER_TURN musí pro dropped tool calls
+    vzniknout párový tool_result (jinak by LLM history byla malformed)."""
+    from voice.agent import config as cfg
+    monkeypatch.setattr(cfg, "MAX_TOOL_CALLS_PER_TURN", 1)
+
+    # Model emituje 3 echo tool calls v jednom kole.
+    scripts = [
+        [_ollama_line(
+            tool_calls=[
+                {"id": "tc_a", "function": {"name": "echo", "arguments": {"text": "a"}}},
+                {"id": "tc_b", "function": {"name": "echo", "arguments": {"text": "b"}}},
+                {"id": "tc_c", "function": {"name": "echo", "arguments": {"text": "c"}}},
+            ],
+            done=True,
+        )],
+    ]
+    turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+    loop = AgentLoop(
+        model="test",
+        messages=[{"role": "user", "content": "echo"}],
+        registry=default_registry("agent"),
+        turn_state=turn_state,
+        workdir=tmp_path,
+    )
+
+    with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+        events = [ev async for ev in loop.run()]
+
+    tool_results = [e for e in events if e["type"] == "tool_result"]
+    # 1 executed + 2 synthetic skipped — všechny 3 mají párový tool_result.
+    assert len(tool_results) == 3
+    ok_count = sum(1 for tr in tool_results if tr["ok"])
+    assert ok_count == 1
+    skipped = [tr for tr in tool_results if not tr["ok"]]
+    for tr in skipped:
+        payload = json.loads(tr["content"])
+        assert "limit" in payload["error"]
+
+    # History: assistant.tool_calls má 3 položky, následují 3 tool messages,
+    # poslední event je agent_error (cap přesažen).
+    history = loop.messages
+    asst = next(m for m in history if m["role"] == "assistant" and "tool_calls" in m)
+    assert len(asst["tool_calls"]) == 3
+    tool_msgs = [m for m in history if m["role"] == "tool"]
+    assert len(tool_msgs) == 3
+    assert events[-1]["type"] == "agent_error"
+    assert "tool-call limit" in events[-1]["msg"]

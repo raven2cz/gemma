@@ -1,0 +1,81 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "model": "ollama/gemma4-e4b-32k",
+  "small_model": "ollama/gemma4-e4b-32k",
+
+  "autoupdate": "notify",
+  "share": "disabled",
+  "snapshot": true,
+
+  "default_agent": "build",
+
+  "instructions": ["AGENTS.md"],
+
+  "permission": {
+    "edit": "ask",
+    "bash": "ask",
+    "webfetch": "ask"
+  },
+
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "reserved": 10000
+  },
+
+  "enabled_providers": ["ollama"],
+
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": {
+        "baseURL": "http://localhost:11434/v1"
+      },
+      "models": {
+        "gemma4-e4b-32k": {
+          "name": "Gemma 4 E4B (32K, rychlý)",
+          "tools": true,
+          "limit": { "context": 32768, "output": 4096 }
+        },
+        "gemma4-31b-8k": {
+          "name": "Gemma 4 31B Q4_K_M (32K)",
+          "tools": true,
+          "limit": { "context": 32768, "output": 4096 }
+        },
+        "gemma4-31b-gguf": {
+          "name": "Gemma 4 31B GGUF Unsloth (32K, laděný)",
+          "tools": true,
+          "limit": { "context": 32768, "output": 4096 }
+        }
+      }
+    }
+  },
+
+  "agent": {
+    "build": {
+      "mode": "primary",
+      "description": "Plná implementace: kvalitní 31B model, všechny nástroje.",
+      "model": "ollama/gemma4-31b-gguf",
+      "temperature": 0.3
+    },
+    "fast": {
+      "mode": "primary",
+      "description": "Rychlé odpovědi/malé úpravy: E4B, všechny nástroje.",
+      "model": "ollama/gemma4-e4b-32k",
+      "temperature": 0.3
+    },
+    "plan": {
+      "mode": "primary",
+      "description": "Plánování a analýza bez úprav souborů.",
+      "model": "ollama/gemma4-31b-gguf",
+      "temperature": 0.2,
+      "permission": {
+        "edit": "deny",
+        "bash": "ask",
+        "webfetch": "ask"
+      }
+    }
+  }
+}

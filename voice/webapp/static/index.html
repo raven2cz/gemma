@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice · Gemma</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/vendor/hljs-github-dark.css" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="/static/vendor/highlight.min.js" defer></script>
+  <script src="/static/vendor/marked.min.js" defer></script>
+  <script src="/static/vendor/purify.min.js" defer></script>
+</head>
+<body>
+  <div class="bg-mesh"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-name">voice · gemma</span>
+    </div>
+    <div class="topbar-actions">
+      <button id="mode-toggle" class="mode-chip" data-mode="chat" type="button" title="Chat / Agent mode (klik = přepnout)" aria-label="přepnout mode">
+        <span class="mode-chip-dot" aria-hidden="true"></span>
+        <span class="mode-chip-label">chat</span>
+      </button>
+      <label class="tts-quick" title="TTS on/off (hlasová odpověď)">
+        <input type="checkbox" id="tts-quick" checked />
+        <span class="tts-quick-track" aria-hidden="true"><span class="tts-quick-thumb"></span></span>
+        <svg class="tts-quick-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+          <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+          <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+        </svg>
+      </label>
+      <button id="clear-btn" class="icon-btn" title="Vymazat konverzaci" aria-label="Vymazat konverzaci">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+      </button>
+      <div class="health-indicator" id="health-dot" title="status"></div>
+      <button id="settings-btn" class="icon-btn settings-btn" type="button" aria-label="Nastavení" aria-expanded="false" aria-controls="settings-panel" title="Nastavení">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div id="settings-backdrop" class="settings-backdrop" hidden></div>
+  <aside id="settings-panel" class="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title" aria-hidden="true" hidden>
+    <div class="settings-header">
+      <h2 id="settings-title" class="settings-title">Nastavení</h2>
+      <button id="settings-close" class="icon-btn" type="button" aria-label="Zavřít nastavení" title="zavřít (Esc)">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+
+    <div class="settings-body">
+      <section class="settings-group settings-group--primary">
+        <h3 class="group-title">Model</h3>
+        <label class="field">
+          <span class="field-label">LLM model</span>
+          <select id="model-select" class="select field-control"></select>
+        </label>
+      </section>
+
+      <hr class="settings-divider" />
+
+      <section class="settings-group">
+        <h3 class="group-title">Hlas &amp; řeč</h3>
+        <p class="group-hint">Voice family se automaticky přepne podle detekovaného jazyka (např. <code>ref_{family}_{lang}.wav</code>).</p>
+
+        <label class="field">
+          <span class="field-label">voice</span>
+          <select id="voice-select" class="select field-control"></select>
+        </label>
+
+        <div class="field-advanced" id="ref-field" hidden>
+          <label class="field">
+            <span class="field-label">explicit ref (legacy)</span>
+            <select id="ref-select" class="select field-control"></select>
+          </label>
+          <button type="button" id="ref-clear" class="link-btn">zpět na voice family</button>
+        </div>
+
+        <label class="field toggle-field">
+          <input type="checkbox" id="tts-toggle" checked />
+          <span class="toggle-label">TTS (hlasová odpověď)</span>
+        </label>
+        <label class="field toggle-field">
+          <input type="checkbox" id="stream-toggle" checked />
+          <span class="toggle-label">stream TTS (chunk-by-chunk)</span>
+        </label>
+        <label class="field toggle-field">
+          <input type="checkbox" id="fast-toggle" />
+          <span class="toggle-label">rychlý TTS (kratší sampling)</span>
+        </label>
+      </section>
+
+      <hr class="settings-divider" />
+
+      <section class="settings-group">
+        <h3 class="group-title">Jazyk &amp; rozpoznávání</h3>
+        <label class="field">
+          <span class="field-label">jazyk</span>
+          <select id="lang-select" class="select field-control">
+            <option value="auto">🌐 Auto</option>
+            <option value="cs">🇨🇿 Čeština</option>
+            <option value="en">🇬🇧 English</option>
+          </select>
+        </label>
+        <label class="field toggle-field">
+          <input type="checkbox" id="vad-toggle" checked />
+          <span class="toggle-label">auto VAD (automatická detekce konce řeči)</span>
+        </label>
+      </section>
+    </div>
+  </aside>
+
+  <main class="stage">
+    <div class="orb-wrap" id="orb-wrap">
+      <button id="orb-toggle" class="orb-toggle" type="button" aria-label="skrýt / zobrazit avatar" title="skrýt avatar">
+        <svg class="orb-toggle-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+      <canvas id="orb-canvas"></canvas>
+      <div class="orb-caption" id="phase-label">ready</div>
+    </div>
+
+    <section class="transcript" id="transcript" aria-live="polite">
+      <div class="welcome">
+        <p class="welcome-title">napiš zprávu nebo zmáčkni mikrofon</p>
+        <p class="welcome-sub">mic = hlasová odpověď · text = textová odpověď · stop přeruší vše</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="bottombar">
+    <form class="composer" id="composer">
+      <textarea
+        id="text-input"
+        rows="1"
+        placeholder="napiš zprávu nebo stiskni mikrofon…"
+        aria-label="zpráva"
+        autocomplete="off"
+        spellcheck="true"
+      ></textarea>
+      <div class="composer-actions">
+        <button id="mic-btn" class="mic-btn" type="button" aria-label="mikrofon" title="mikrofon (Space)">
+          <svg class="mic-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="2" width="6" height="12" rx="3"/>
+            <path d="M5 10a7 7 0 0 0 14 0"/>
+            <line x1="12" y1="19" x2="12" y2="22"/>
+          </svg>
+        </button>
+        <button id="stop-btn" class="stop-btn" type="button" aria-label="stop" title="zastavit (Space)" hidden>
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
+        <button id="send-btn" class="send-btn" type="submit" aria-label="odeslat" title="odeslat (Enter)">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13"/>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          </svg>
+        </button>
+      </div>
+    </form>
+    <div class="status" id="status-text">ready</div>
+  </footer>
+
+  <div id="error-toast" class="error-toast" hidden></div>
+
+  <dialog id="approval-modal" class="approval-modal" aria-labelledby="approval-title">
+    <form method="dialog" class="approval-card">
+      <h3 id="approval-title" class="approval-title">Schválit akci</h3>
+      <p class="approval-summary" id="approval-summary"></p>
+      <div class="approval-risk" id="approval-risk"></div>
+      <details class="approval-details">
+        <summary>argumenty</summary>
+        <pre class="approval-args" id="approval-args"></pre>
+      </details>
+      <div class="approval-explicit" id="approval-explicit" hidden>
+        <p class="approval-explicit-hint">Tato akce je destruktivní. Napiš <code>ano povoluju</code> pro potvrzení.</p>
+        <input type="text" id="approval-phrase-input" placeholder="ano povoluju" autocomplete="off" />
+      </div>
+      <div class="approval-actions">
+        <button type="button" class="approval-btn approval-deny" id="approval-deny-btn">Deny</button>
+        <button type="button" class="approval-btn approval-allow" id="approval-allow-btn">Allow</button>
+      </div>
+    </form>
+  </dialog>
+
+  <audio id="tts-audio" preload="auto" style="display:none"></audio>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

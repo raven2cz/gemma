@@ -1,0 +1,12 @@
+gguf/*.gguf
+models/
+whisper.cpp/
+voice/.venv-tts/
+voice/chatterbox-cs/
+logs/
+*.log
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+voice/webapp/webapp.log
