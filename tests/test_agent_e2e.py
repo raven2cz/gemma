@@ -735,6 +735,186 @@ async def test_e2e_agent_read_special_file_denied(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_e2e_agent_bash_auto_pwd(client):
+    """Agent volá `run_bash("pwd")` → AUTO (pwd v allowlistu, no shell metas),
+    žádný approval, tool_result obsahuje stdout s cwd."""
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "run_bash",
+                                       "arguments": {"command": "pwd"}}}],
+            done=True,
+        )],
+        [_mk_lines(content="Hotovo."), _mk_lines(done=True)],
+    ]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "vypiš pwd"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+
+        types = [e["type"] for e in events]
+        assert "tool_call" in types
+        assert "tool_result" in types
+        assert "approval_required" not in types  # AUTO → žádný prompt
+
+        tc = next(e for e in events if e["type"] == "tool_call")
+        assert tc["name"] == "run_bash"
+
+        tr = next(e for e in events if e["type"] == "tool_result")
+        assert tr["ok"] is True
+        out = json.loads(tr["content"])
+        assert out["ok"] is True
+        assert out["exit_code"] == 0
+        assert out["stdout"].strip() != ""  # `pwd` vrátil nějakou cestu
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_e2e_agent_bash_ask_pipe_approval(client):
+    """Agent volá `run_bash("echo hi | wc -c")` (shell metas) → ASK medium,
+    POST approve → execute, output obsahuje "3" (echo hi má 3 byty + newline)."""
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "run_bash",
+                                       "arguments": {"command": "echo hi | wc -c"}}}],
+            done=True,
+        )],
+        [_mk_lines(content="Hotovo."), _mk_lines(done=True)],
+    ]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "spusti pipe"}],
+            "want_tts": False,
+        }
+        ap_seen = asyncio.Event()
+        events: list[dict] = []
+        tid_box: dict = {}
+
+        async def consume():
+            async with client.stream("POST", "/api/turn", json=payload) as r:
+                tid_box["tid"] = r.headers["x-turn-id"]
+                async for line in r.aiter_lines():
+                    if not line.strip():
+                        continue
+                    ev = json.loads(line)
+                    events.append(ev)
+                    if ev["type"] == "approval_required":
+                        tid_box["aid"] = ev["approval_id"]
+                        ap_seen.set()
+
+        async def approver():
+            await ap_seen.wait()
+            # Pipe → medium → stačí approve bez explicit fráze.
+            r = await client.post(
+                f"/api/turn/{tid_box['tid']}/approval/{tid_box['aid']}",
+                json={"decision": "approve"},
+            )
+            assert r.status_code == 200
+
+        await asyncio.gather(consume(), approver())
+
+        ap = next(e for e in events if e["type"] == "approval_required")
+        assert ap["requires_explicit"] is False
+        assert ap["risk"] == "medium"
+
+        tr = next(e for e in events if e["type"] == "tool_result")
+        assert tr["ok"] is True
+        out = json.loads(tr["content"])
+        assert out["ok"] is True
+        assert out["exit_code"] == 0
+        # `echo hi | wc -c` = 3 bytes (h, i, \n)
+        assert "3" in out["stdout"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_e2e_agent_bash_destructive_requires_phrase(client, tmp_path_factory):
+    """Agent volá `run_bash("rm <file>")` → destructive + requires_explicit.
+    POST bez fráze → 400, špatná → 400, "ano povoluju" → 200 + soubor smazán."""
+    target = tmp_path_factory.mktemp("e2e_bash_rm") / "victim.txt"
+    target.write_text("delete me")
+    assert target.exists()
+
+    # cwd musí být uvnitř workdir agenta → použijeme relativní cwd a absolutní rm cestu.
+    # Workdir = git root (kde test běží). Tool dovolí absolutní rm cestu (rm sám
+    # nehledí na sandbox — to dělá user via requires_explicit phrase).
+    cmd = f"rm {target}"
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "run_bash",
+                                       "arguments": {"command": cmd}}}],
+            done=True,
+        )],
+        [_mk_lines(content="Smazáno."), _mk_lines(done=True)],
+    ]
+    try:
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "smaž to"}],
+                "want_tts": False,
+            }
+            ap_seen = asyncio.Event()
+            events: list[dict] = []
+            tid_box: dict = {}
+
+            async def consume():
+                async with client.stream("POST", "/api/turn", json=payload) as r:
+                    tid_box["tid"] = r.headers["x-turn-id"]
+                    async for line in r.aiter_lines():
+                        if not line.strip():
+                            continue
+                        ev = json.loads(line)
+                        events.append(ev)
+                        if ev["type"] == "approval_required":
+                            tid_box["aid"] = ev["approval_id"]
+                            ap_seen.set()
+
+            async def approver():
+                await ap_seen.wait()
+                # Bez phrase → 400
+                r = await client.post(
+                    f"/api/turn/{tid_box['tid']}/approval/{tid_box['aid']}",
+                    json={"decision": "approve"},
+                )
+                assert r.status_code == 400
+                # Špatná phrase → 400
+                r = await client.post(
+                    f"/api/turn/{tid_box['tid']}/approval/{tid_box['aid']}",
+                    json={"decision": "approve", "phrase": "ano"},
+                )
+                assert r.status_code == 400
+                # Správná phrase → 200
+                r = await client.post(
+                    f"/api/turn/{tid_box['tid']}/approval/{tid_box['aid']}",
+                    json={"decision": "approve", "phrase": "ano povoluju"},
+                )
+                assert r.status_code == 200
+
+            await asyncio.gather(consume(), approver())
+
+            ap = next(e for e in events if e["type"] == "approval_required")
+            assert ap["requires_explicit"] is True
+            assert ap["risk"] == "destructive"
+
+            tr = next(e for e in events if e["type"] == "tool_result")
+            assert tr["ok"] is True
+            out = json.loads(tr["content"])
+            assert out["ok"] is True
+            assert out["exit_code"] == 0
+            # Soubor reálně smazaný.
+            assert not target.exists()
+    finally:
+        target.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.timeout(20)
 async def test_e2e_chat_mode_unchanged(client, monkeypatch):
     """Regress check: mode=chat (default) musí pořád fungovat — agent větev
