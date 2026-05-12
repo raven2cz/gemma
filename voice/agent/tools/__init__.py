@@ -8,6 +8,7 @@ from voice.agent.tools.base import Tool, ToolRegistry
 from voice.agent.tools import echo as _echo_mod
 from voice.agent.tools import fs as _fs_mod
 from voice.agent.tools import shell as _shell_mod
+from voice.agent.tools import web as _web_mod
 
 
 def default_registry(mode: str = "agent") -> ToolRegistry:
@@ -18,6 +19,9 @@ def default_registry(mode: str = "agent") -> ToolRegistry:
         reg.register(tool)
     # Phase 3: bash shell tool.
     reg.register(_shell_mod.TOOL)
+    # Phase 4: web tooly (fetch_url, web_search).
+    for tool in _web_mod.ALL_TOOLS:
+        reg.register(tool)
     return reg
 
 

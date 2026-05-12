@@ -957,3 +957,209 @@ async def test_e2e_chat_mode_unchanged(client, monkeypatch):
     assert "approval_required" not in types
     text = "".join(e["delta"] for e in events if e["type"] == "text")
     assert text == "Ahoj!"
+
+
+# ----------------------------------------------------------------------
+# Phase 4: web tooly (fetch_url, web_search)
+# ----------------------------------------------------------------------
+
+
+def _swap_tool_execute(tool, fake_exec):
+    """Bypass frozen dataclass — vrátí (original_exec, restore_fn)."""
+    original = tool.execute
+    object.__setattr__(tool, "execute", fake_exec)
+    return original, lambda: object.__setattr__(tool, "execute", original)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_fetch_url_auto(client):
+    """Agent volá fetch_url s public URL → AUTO permission (no approval),
+    tool_result obsahuje body. Mockujeme execute aby žádný real network."""
+    from voice.agent.tools import web as web_mod
+
+    async def fake_fetch(args, ctx):
+        assert args["url"] == "https://example.com/hello"
+        return {
+            "ok": True,
+            "url": "https://example.com/hello",
+            "final_url": "https://example.com/hello",
+            "status": 200,
+            "content_type": "text/html; charset=utf-8",
+            "size_bytes": 18,
+            "truncated": False,
+            "is_text": True,
+            "body": "<h1>HelloWorld</h1>",
+            "redirect_chain": [],
+            "duration_ms": 5,
+        }
+
+    _orig, restore = _swap_tool_execute(web_mod.FETCH_URL_TOOL, fake_fetch)
+    try:
+        script = [
+            [_mk_lines(
+                tool_calls=[{"function": {"name": "fetch_url",
+                                          "arguments": {"url": "https://example.com/hello"}}}],
+                done=True,
+            )],
+            [_mk_lines(content="Načteno."), _mk_lines(done=True)],
+        ]
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "fetch example"}],
+                "want_tts": False,
+            }
+            async with client.stream("POST", "/api/turn", json=payload) as r:
+                assert r.status_code == 200
+                events = await _stream_ndjson(r)
+
+        types = [e["type"] for e in events]
+        assert "tool_call" in types
+        assert "tool_result" in types
+        assert "approval_required" not in types
+
+        tc = next(e for e in events if e["type"] == "tool_call")
+        assert tc["name"] == "fetch_url"
+
+        tr = next(e for e in events if e["type"] == "tool_result")
+        assert tr["ok"] is True
+        out = json.loads(tr["content"])
+        assert out["ok"] is True
+        assert out["status"] == 200
+        assert "Hello" in out["body"]
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_fetch_url_ssrf_denied(client):
+    """Agent volá fetch_url na private IP → classifier DENY, žádný execute,
+    tool_result má ok=False s důvodem."""
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "fetch_url",
+                                      "arguments": {"url": "http://192.168.1.1/admin"}}}],
+            done=True,
+        )],
+        [_mk_lines(content="Nelze."), _mk_lines(done=True)],
+    ]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "ssrf attempt"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+
+    types = [e["type"] for e in events]
+    # DENY = no execute, no approval
+    assert "approval_required" not in types
+    # Loop emituje tool_result s ok=False (DENY message)
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert len(trs) >= 1
+    assert trs[0]["ok"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_fetch_url_invalid_scheme_denied(client):
+    """`file:///etc/passwd` → DENY scheme."""
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "fetch_url",
+                                      "arguments": {"url": "file:///etc/passwd"}}}],
+            done=True,
+        )],
+        [_mk_lines(content="x"), _mk_lines(done=True)],
+    ]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "exfil"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            events = await _stream_ndjson(r)
+
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert any(t["ok"] is False for t in trs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_web_search_auto(client):
+    """Agent volá web_search → AUTO, tool_result obsahuje results."""
+    from voice.agent.tools import web as web_mod
+
+    async def fake_search(args, ctx):
+        assert args["query"] == "asyncio tutorial"
+        return {
+            "ok": True,
+            "query": "asyncio tutorial",
+            "count": 2,
+            "results": [
+                {"title": "Asyncio docs", "url": "https://docs.python.org/3/library/asyncio.html", "snippet": "Python's standard async lib"},
+                {"title": "Real Python", "url": "https://realpython.com/async-io-python/", "snippet": "Tutorial"},
+            ],
+            "duration_ms": 50,
+        }
+
+    _orig, restore = _swap_tool_execute(web_mod.WEB_SEARCH_TOOL, fake_search)
+    try:
+        script = [
+            [_mk_lines(
+                tool_calls=[{"function": {"name": "web_search",
+                                          "arguments": {"query": "asyncio tutorial", "count": 2}}}],
+                done=True,
+            )],
+            [_mk_lines(content="Hledání hotové."), _mk_lines(done=True)],
+        ]
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "search"}],
+                "want_tts": False,
+            }
+            async with client.stream("POST", "/api/turn", json=payload) as r:
+                events = await _stream_ndjson(r)
+
+        types = [e["type"] for e in events]
+        assert "approval_required" not in types
+        tc = next(e for e in events if e["type"] == "tool_call")
+        assert tc["name"] == "web_search"
+        tr = next(e for e in events if e["type"] == "tool_result")
+        assert tr["ok"] is True
+        out = json.loads(tr["content"])
+        assert out["ok"] is True
+        assert out["count"] == 2
+        assert out["results"][0]["title"] == "Asyncio docs"
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_web_search_empty_query_denied(client):
+    """Empty query → classifier DENY."""
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "web_search",
+                                      "arguments": {"query": ""}}}],
+            done=True,
+        )],
+        [_mk_lines(content="x"), _mk_lines(done=True)],
+    ]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "?"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            events = await _stream_ndjson(r)
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert any(t["ok"] is False for t in trs)

@@ -569,3 +569,95 @@ def test_bash_iter5_cluster_and_attached_short_value(tmp_path: Path, command: st
     assert r.decision == Decision.ASK, f"{command!r}: expected ASK, got {r.decision}"
     assert r.requires_explicit is False, f"{command!r}: read-escape ne destructive"
     assert r.risk == "medium"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: fetch_url + web_search classifier
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com/",
+    "https://docs.python.org/3/library/asyncio.html",
+    "http://example.com/page?q=1&r=2",
+    "https://example.com:8443/x",
+    "https://example.com/path/with%20space",
+])
+def test_fetch_url_auto_public(tmp_path: Path, url: str):
+    r = decide("fetch_url", {"url": url}, tmp_path)
+    assert r.decision == Decision.AUTO, f"{url}: got {r.decision} ({r.reason})"
+    assert r.risk == "low"
+
+
+@pytest.mark.parametrize("url,reason_kw", [
+    # Scheme block
+    ("file:///etc/passwd", "scheme"),
+    ("ftp://ftp.example.com/", "scheme"),
+    ("gopher://example.com/0/", "scheme"),
+    ("javascript:alert(1)", "scheme"),
+    ("data:text/plain,hello", "scheme"),
+    ("ldap://x/", "scheme"),
+    # Loopback / private
+    ("http://localhost/", "blocked"),
+    ("http://localhost:8080/", "blocked"),
+    ("http://127.0.0.1/", "blocked"),
+    ("http://[::1]/", "blocked"),
+    ("http://10.0.0.1/", "blocked"),
+    ("http://192.168.1.1/", "blocked"),
+    ("http://172.16.0.1/", "blocked"),
+    ("http://169.254.169.254/latest/meta-data/", "blocked"),  # AWS metadata
+    ("http://foo.localhost/", "blocked"),
+    ("http://service.local/", "blocked"),
+    # Userinfo
+    ("http://user:pass@example.com/", "userinfo"),
+    ("https://admin@example.com/", "userinfo"),
+    # Garbage
+    ("", "empty"),
+    ("not-a-url", ""),
+    ("//no-scheme.com/", "scheme"),
+])
+def test_fetch_url_deny_unsafe(tmp_path: Path, url: str, reason_kw: str):
+    r = decide("fetch_url", {"url": url}, tmp_path)
+    assert r.decision == Decision.DENY, f"{url}: got {r.decision} ({r.reason})"
+    if reason_kw:
+        assert reason_kw.lower() in r.reason.lower(), f"{url}: reason={r.reason}"
+
+
+def test_fetch_url_too_long(tmp_path: Path):
+    r = decide("fetch_url", {"url": "https://example.com/" + "x" * 5000}, tmp_path)
+    assert r.decision == Decision.DENY
+    assert "long" in r.reason.lower()
+
+
+@pytest.mark.parametrize("args", [
+    {"query": "python tutorial"},
+    {"query": "weather Praha", "count": 5},
+    {"query": "x", "count": 1},
+    {"query": "y", "count": 20},
+])
+def test_web_search_auto(tmp_path: Path, args: dict):
+    r = decide("web_search", args, tmp_path)
+    assert r.decision == Decision.AUTO, f"{args}: got {r.decision} ({r.reason})"
+    assert r.risk == "low"
+
+
+@pytest.mark.parametrize("args,reason_kw", [
+    ({"query": ""}, "empty"),
+    ({"query": "   "}, "empty"),
+    ({"query": "x" * 500}, "long"),
+    ({"query": "x", "count": 0}, "range"),
+    ({"query": "x", "count": -1}, "range"),
+    ({"query": "x", "count": 21}, "range"),
+    ({"query": "x", "count": 100}, "range"),
+    ({"query": "x", "count": "abc"}, "integer"),
+    ({"query": "x", "count": 1.5}, ""),  # float — accepted as int via int(1.5)=1, OK
+])
+def test_web_search_deny_invalid(tmp_path: Path, args: dict, reason_kw: str):
+    r = decide("web_search", args, tmp_path)
+    if args == {"query": "x", "count": 1.5}:
+        # int(1.5) == 1 → AUTO. Doc this; not a bug.
+        assert r.decision == Decision.AUTO
+        return
+    assert r.decision == Decision.DENY, f"{args}: got {r.decision}"
+    if reason_kw:
+        assert reason_kw.lower() in r.reason.lower(), f"{args}: reason={r.reason}"

@@ -635,3 +635,220 @@ def _cls_run_bash(args: dict, workdir: Path) -> PermissionResult:
         summary=f"$ {short_cmd}",
         risk="low",
     )
+
+
+# ----------------------------------------------------------------------
+# Phase 4: Web tools (fetch_url, web_search)
+# ----------------------------------------------------------------------
+
+
+def _is_private_or_blocked_host(host: str) -> tuple[bool, str]:
+    """SSRF defense: blokuj private/loopback/link-local/multicast/reserved IPs
+    a special-case hostnames (localhost, *.localhost, …). Vrací (blocked, reason).
+
+    Pro DNS hostnames bez literal IP vrátí (False, "") — runtime fetch musí
+    resolvovat a re-checkovat (TOCTOU defense udělá custom backend
+    v tools/web.py). Tady jen statická validace.
+
+    IPv4-mapped IPv6 (`::ffff:127.0.0.1`) — v Pythonu < 3.12 `is_private` vrací
+    False, takže explicit unwrap přes `.ipv4_mapped` před privacy testem.
+    Stejně tak NAT64 (`64:ff9b::/96`) a 6to4/Teredo IPv6 mapped IPv4 — tahaj
+    embedded IPv4, ten musí být public.
+    """
+    import ipaddress
+
+    if not host:
+        return True, "empty host"
+
+    h = host.strip().lower()
+    # Bracketed IPv6: `[::1]` → `::1`
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+
+    # Special hostnames — blokuj bez DNS lookupu.
+    blocked_names = {
+        "localhost", "ip6-localhost", "ip6-loopback",
+        "broadcasthost",
+    }
+    if h in blocked_names or h.endswith(".localhost") or h.endswith(".local"):
+        return True, f"blocked hostname {host!r}"
+
+    # Try IP literal — pokud parseuje, classifikuj.
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False, ""  # not an IP literal — DNS resolve later
+
+    # IPv4-mapped IPv6 unwrap. Python 3.11 nemá auto is_private propagation.
+    if isinstance(ip, ipaddress.IPv6Address):
+        mapped = ip.ipv4_mapped
+        if mapped is not None:
+            check_ip: ipaddress._BaseAddress = mapped
+        else:
+            check_ip = ip
+    else:
+        check_ip = ip
+
+    if (
+        check_ip.is_private
+        or check_ip.is_loopback
+        or check_ip.is_link_local
+        or check_ip.is_multicast
+        or check_ip.is_reserved
+        or check_ip.is_unspecified
+        or getattr(check_ip, "is_site_local", False)
+    ):
+        return True, f"blocked IP {ip}"
+
+    # Block IPv6 translation/compatibility prefixes that might embed private IPv4s
+    if isinstance(check_ip, ipaddress.IPv6Address):
+        # NAT64 Well-Known Prefix (RFC 6052)
+        if check_ip in ipaddress.IPv6Network("64:ff9b::/96"):
+            return True, f"blocked NAT64 IP {ip}"
+        # NAT64 Local-Use Prefix (RFC 8215)
+        if check_ip in ipaddress.IPv6Network("64:ff9b:1::/48"):
+            return True, f"blocked NAT64 IP {ip}"
+        # IPv4-Translated (RFC 2765)
+        if check_ip in ipaddress.IPv6Network("::ffff:0:0:0/96"):
+            return True, f"blocked IPv4-translated IP {ip}"
+        # IPv4-Compatible (deprecated)
+        if check_ip in ipaddress.IPv6Network("::/96") and check_ip not in (ipaddress.IPv6Address("::1"), ipaddress.IPv6Address("::")):
+            return True, f"blocked IPv4-compatible IP {ip}"
+
+    # CGNAT (100.64.0.0/10) — RFC 6598 shared address space, často interní.
+    # ipaddress.is_private nezahrnuje. Blokujeme defensively.
+    try:
+        if isinstance(check_ip, ipaddress.IPv4Address):
+            if check_ip in ipaddress.IPv4Network("100.64.0.0/10"):
+                return True, f"blocked CGNAT IP {ip}"
+    except ValueError:
+        pass
+
+    return False, ""
+
+
+def _validate_url(url: str) -> tuple[str, str, str]:
+    """Parse + validate URL. Vrací (scheme, host, error). error=='' = OK.
+
+    - musí být http/https
+    - host nesmí být prázdný
+    - host nesmí být private/loopback IP nebo localhost (SSRF defense)
+    - userinfo (`user:pass@`) odmítnut (credentials exfiltration / phishing vektor)
+    - port mimo standard (80/443/8080/443/8443) → OK, ale runtime to může reject
+    """
+    from urllib.parse import urlparse
+
+    if not url or not isinstance(url, str):
+        return "", "", "empty url"
+    if len(url) > 4096:
+        return "", "", "url too long"
+
+    try:
+        parsed = urlparse(url)
+    except (ValueError, TypeError) as e:
+        return "", "", f"invalid url: {e}"
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        return scheme, "", f"unsupported scheme {scheme!r}"
+
+    # userinfo block (user:pass@) — credentials v URL je bezpečnostní risk.
+    # Pozn.: `parsed.username`/`password` může vyhodit ValueError pro URL kde
+    # syntax je nesmyslná — interpretovat jako "invalid url" než "no userinfo".
+    try:
+        if parsed.username or parsed.password:
+            return scheme, "", "url contains userinfo"
+    except ValueError as e:
+        return scheme, "", f"invalid userinfo: {e}"
+
+    # `parsed.port` může vyhodit ValueError pokud port není integer
+    # (`http://host:abc/`) nebo je mimo 0..65535. Bez catch by urllib bombardovala.
+    try:
+        port = parsed.port
+    except ValueError as e:
+        return scheme, "", f"invalid port: {e}"
+    if port is not None and (port < 1 or port > 65535):
+        return scheme, "", f"port {port} out of range"
+
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return scheme, "", "missing host"
+
+    blocked, why = _is_private_or_blocked_host(host)
+    if blocked:
+        return scheme, host, why
+
+    return scheme, host, ""
+
+
+@register_classifier("fetch_url")
+def _cls_fetch_url(args: dict, workdir: Path) -> PermissionResult:
+    """fetch_url(url) — AUTO pro public http(s); DENY pro file/ftp/private IPs.
+
+    Side-effect: žádný side effect na FS, jen HTTP GET. Risk = low pro veřejnou
+    síť. ASK by byl over-paranoidní (LLM dělá research). SSRF guard je tvrdý
+    DENY — žádný „ano povoluju" interní síti.
+    """
+    url = str(args.get("url", "")).strip()
+    scheme, host, err = _validate_url(url)
+    short = url[:80] + ("…" if len(url) > 80 else "")
+    if err:
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason=err,
+            summary=f"fetch_url odmítnuto: {err}",
+            risk="high",
+        )
+    return PermissionResult(
+        decision=Decision.AUTO,
+        reason=f"fetch {scheme}://{host}",
+        summary=f"fetch_url: {short}",
+        risk="low",
+    )
+
+
+@register_classifier("web_search")
+def _cls_web_search(args: dict, workdir: Path) -> PermissionResult:
+    """web_search(query, count?) — AUTO. Brave Search API call, no side effects."""
+    from voice.agent.config import WEB_SEARCH_MAX_COUNT
+
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason="empty query",
+            summary="web_search: prázdný dotaz",
+            risk="high",
+        )
+    if len(query) > 400:
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason="query too long (>400 chars)",
+            summary="web_search: dotaz příliš dlouhý",
+            risk="high",
+        )
+    count_arg = args.get("count", None)
+    if count_arg is not None:
+        try:
+            count = int(count_arg)
+        except (TypeError, ValueError):
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason="count must be integer",
+                summary="web_search: neplatný count",
+                risk="high",
+            )
+        if count < 1 or count > WEB_SEARCH_MAX_COUNT:
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason=f"count out of range 1..{WEB_SEARCH_MAX_COUNT}",
+                summary=f"web_search: count mimo 1..{WEB_SEARCH_MAX_COUNT}",
+                risk="high",
+            )
+    short = query if len(query) <= 60 else query[:57] + "…"
+    return PermissionResult(
+        decision=Decision.AUTO,
+        reason="brave web search",
+        summary=f'web_search: "{short}"',
+        risk="low",
+    )

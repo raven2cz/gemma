@@ -165,7 +165,63 @@ CLAUDE_UNRESTRICTED: bool = os.environ.get("AGENT_CLAUDE_UNRESTRICTED", "0") == 
 
 
 # Brave Search (fáze 4)
-BRAVE_SEARCH_API_KEY: str = os.environ.get("BRAVE_SEARCH_API_KEY", "")
+# Auto-load: env var → soubor `~/.brave-search-api` (path z env override).
+# Soubor MUSÍ být 0600 (jen owner read/write), jinak fallback selže.
+BRAVE_SEARCH_API_KEY_FILE: str = os.environ.get(
+    "BRAVE_SEARCH_API_KEY_FILE", str(Path.home() / ".brave-search-api"),
+)
+
+
+def _load_brave_key() -> str:
+    """env first, pak soubor s 0600 ověřením. Tichý fallback na ''."""
+    env = os.environ.get("BRAVE_SEARCH_API_KEY", "").strip()
+    if env:
+        return env
+    p = Path(BRAVE_SEARCH_API_KEY_FILE)
+    try:
+        st = p.stat()
+    except (FileNotFoundError, PermissionError, OSError):
+        return ""
+    # Pouze regular file; symlink follow akceptován (uživatel může mít vault).
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode):
+        return ""
+    # World/group readable → odmítnout (secret nesmí být group/other readable).
+    if st.st_mode & 0o077:
+        return ""
+    try:
+        return p.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+BRAVE_SEARCH_API_KEY: str = _load_brave_key()
+
+
+# Web tooly (fáze 4)
+# fetch_url: HTTP GET sandbox.
+FETCH_URL_TIMEOUT_SEC: float = float(os.environ.get("AGENT_FETCH_TIMEOUT_SEC", "15"))
+FETCH_URL_MAX_BYTES: int = int(os.environ.get("AGENT_FETCH_MAX_BYTES", str(2 * 1024 * 1024)))
+FETCH_URL_MAX_REDIRECTS: int = int(os.environ.get("AGENT_FETCH_MAX_REDIRECTS", "5"))
+# Allowed URL schemes. file://, ftp://, gopher://, dict://, ldap://, jar://, etc.
+# jsou explicit blocked (DENY). Pouze http(s).
+FETCH_URL_ALLOWED_SCHEMES: frozenset[str] = frozenset(["http", "https"])
+# Content-types, které vrátíme jako text. Cokoli mimo = binary, vrátíme jen
+# metadata (status + content_type + size), žádný body.
+FETCH_URL_TEXT_CONTENT_TYPES: tuple[str, ...] = (
+    "text/", "application/json", "application/xml", "application/xhtml+xml",
+    "application/javascript", "application/x-yaml", "application/yaml",
+    "application/ld+json", "application/rss+xml", "application/atom+xml",
+)
+# User-Agent string (žádný real-browser fingerprint — explicit agent identity).
+FETCH_URL_USER_AGENT: str = "gemma-agent/0.1 (+local)"
+
+
+# web_search (Brave Search API)
+WEB_SEARCH_DEFAULT_COUNT: int = 5
+WEB_SEARCH_MAX_COUNT: int = 20
+WEB_SEARCH_TIMEOUT_SEC: float = float(os.environ.get("AGENT_SEARCH_TIMEOUT_SEC", "10"))
+BRAVE_SEARCH_ENDPOINT: str = "https://api.search.brave.com/res/v1/web/search"
 
 
 # Voice approval — destruktivní akce vyžadují explicit „ano povoluju".
