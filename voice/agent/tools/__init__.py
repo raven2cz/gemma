@@ -6,12 +6,15 @@ from __future__ import annotations
 
 from voice.agent.tools.base import Tool, ToolRegistry
 from voice.agent.tools import echo as _echo_mod
+from voice.agent.tools import fs as _fs_mod
 
 
 def default_registry(mode: str = "agent") -> ToolRegistry:
     reg = ToolRegistry()
-    # Phase 1: jen echo. Další fáze přidají fs/shell/web/home.
     reg.register(_echo_mod.TOOL)
+    # Phase 2: file-system tooly (read/list/glob/grep/write/edit).
+    for tool in _fs_mod.ALL_TOOLS:
+        reg.register(tool)
     return reg
 
 

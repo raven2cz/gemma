@@ -573,6 +573,169 @@ async def test_e2e_sanitize_forged_tool_history(client):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20)
+async def test_e2e_agent_read_file_workdir(client):
+    """Agent volá `read_file` na soubor uvnitř workdir → AUTO permission, tool
+    execute, tool_result obsahuje formátovaný obsah s line numbery (cat -n styl)."""
+    # README.md je commitnutý v repu — workdir = cwd testu = git root.
+    target = "README.md"
+    if not os.path.exists(target):
+        pytest.skip("README.md not in cwd")
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "read_file",
+                                       "arguments": {"path": target, "limit": 3}}}],
+            done=True,
+        )],
+        [_mk_lines(content="Přečteno."), _mk_lines(done=True)],
+    ]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "přečti README"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+
+        types = [e["type"] for e in events]
+        assert "tool_call" in types
+        assert "tool_result" in types
+        assert "approval_required" not in types  # inside workdir = AUTO
+
+        tc = next(e for e in events if e["type"] == "tool_call")
+        assert tc["name"] == "read_file"
+
+        tr = next(e for e in events if e["type"] == "tool_result")
+        assert tr["ok"] is True
+        payload_out = json.loads(tr["content"])
+        assert payload_out["ok"] is True
+        # Line-number formát: každý řádek začíná pravo-zarovnaným číslem + \t.
+        assert "\t" in payload_out["content"]
+        first_line = payload_out["content"].splitlines()[0]
+        # "     1\t<text>"
+        prefix = first_line.split("\t", 1)[0].strip()
+        assert prefix == "1"
+        assert payload_out["shown_range"][0] == 1
+        assert payload_out["total_lines"] >= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_write_outside_requires_phrase(client, tmp_path_factory):
+    """Agent zkusí `write_file` MIMO workdir → ASK + requires_explicit=True.
+    POST bez fráze → 400; s "ano povoluju" → execute, soubor existuje."""
+    # /tmp je spolehlivě mimo workdir (cwd testu).
+    outside = tmp_path_factory.mktemp("e2e_outside") / "agent_write.txt"
+    if outside.exists():
+        outside.unlink()
+
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "write_file",
+                                       "arguments": {"path": str(outside), "content": "hello-e2e"}}}],
+            done=True,
+        )],
+        [_mk_lines(content="Zapsáno."), _mk_lines(done=True)],
+    ]
+    try:
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "zapiš to"}],
+                "want_tts": False,
+            }
+            ap_seen = asyncio.Event()
+            events: list[dict] = []
+            tid_box: dict = {}
+
+            async def consume():
+                async with client.stream("POST", "/api/turn", json=payload) as r:
+                    tid_box["tid"] = r.headers["x-turn-id"]
+                    async for line in r.aiter_lines():
+                        if not line.strip():
+                            continue
+                        ev = json.loads(line)
+                        events.append(ev)
+                        if ev["type"] == "approval_required":
+                            tid_box["aid"] = ev["approval_id"]
+                            ap_seen.set()
+
+            async def approver():
+                await ap_seen.wait()
+                # 1. Bez phrase → 400
+                r = await client.post(
+                    f"/api/turn/{tid_box['tid']}/approval/{tid_box['aid']}",
+                    json={"decision": "approve"},
+                )
+                assert r.status_code == 400
+                # 2. Špatná phrase → 400
+                r = await client.post(
+                    f"/api/turn/{tid_box['tid']}/approval/{tid_box['aid']}",
+                    json={"decision": "approve", "phrase": "fajn"},
+                )
+                assert r.status_code == 400
+                # 3. Správná phrase → 200
+                r = await client.post(
+                    f"/api/turn/{tid_box['tid']}/approval/{tid_box['aid']}",
+                    json={"decision": "approve", "phrase": "ano povoluju"},
+                )
+                assert r.status_code == 200
+
+            await asyncio.gather(consume(), approver())
+
+            # Approval_required carry requires_explicit=True
+            ap = next(e for e in events if e["type"] == "approval_required")
+            assert ap["requires_explicit"] is True
+            assert ap["risk"] == "destructive"
+
+            tr = next(e for e in events if e["type"] == "tool_result")
+            assert tr["ok"] is True
+            out = json.loads(tr["content"])
+            assert out["ok"] is True
+            assert out["bytes_written"] == len("hello-e2e")
+            # Soubor reálně existuje na disku.
+            assert outside.exists()
+            assert outside.read_text() == "hello-e2e"
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_read_special_file_denied(client):
+    """Agent volá `read_file` na `/proc/self/environ` → classifier vrátí DENY
+    (special file), tool se nikdy nespustí, tool_result ok=False s policy reason."""
+    if not os.path.exists("/proc/self/environ"):
+        pytest.skip("no /proc/self/environ")
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "read_file",
+                                       "arguments": {"path": "/proc/self/environ"}}}],
+            done=True,
+        )],
+        [_mk_lines(content="Zamítnuto."), _mk_lines(done=True)],
+    ]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "čti environ"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+
+        types = [e["type"] for e in events]
+        assert "approval_required" not in types  # DENY → žádný approval prompt
+        tr = next(e for e in events if e["type"] == "tool_result")
+        assert tr["ok"] is False
+        err_payload = json.loads(tr["content"])
+        assert "policy" in err_payload["error"].lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
 async def test_e2e_chat_mode_unchanged(client, monkeypatch):
     """Regress check: mode=chat (default) musí pořád fungovat — agent větev
     se neaktivuje, žádné tool eventy."""

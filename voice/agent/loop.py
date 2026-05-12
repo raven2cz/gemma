@@ -356,6 +356,7 @@ class AgentLoop:
             turn_id=self.turn_state.get("id", ""),
             cancel_event=self.turn_state.get("cancel_event"),
             workdir=self.workdir,
+            resolved_path=perm.resolved_path,
         )
         remaining = self._remaining_budget()
         if remaining <= 0:

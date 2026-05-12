@@ -9,10 +9,17 @@ from typing import Any, Awaitable, Callable
 
 @dataclass
 class ExecuteContext:
-    """Předáno do `Tool.execute` při každém volání."""
+    """Předáno do `Tool.execute` při každém volání.
+
+    `resolved_path` (volitelná) = canonical path, kterou classifier resolvoval
+    a na které spočinulo permission rozhodnutí. Tooly, které manipulují s FS,
+    by měly preferovat tuto cestu před vlastním re-resolve, aby se eliminoval
+    TOCTOU gap mezi klasifikací a exekucí.
+    """
     turn_id: str
     cancel_event: asyncio.Event | None
     workdir: Path
+    resolved_path: Path | None = None
 
 
 ExecuteFn = Callable[[dict, ExecuteContext], Awaitable[Any]]
