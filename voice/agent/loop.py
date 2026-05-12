@@ -40,13 +40,14 @@ from typing import AsyncIterator, Awaitable, Callable
 import httpx
 
 from voice.agent import config
+from voice.agent.audit import AuditLog
 from voice.agent.messages import (
     assistant_message,
     normalize_tool_calls,
     parse_tool_args,
     tool_message,
 )
-from voice.agent.permissions import Decision, decide
+from voice.agent.permissions import Decision, PermissionResult, decide
 from voice.agent.tools.base import ExecuteContext, ToolRegistry
 
 log = logging.getLogger("agent-loop")
@@ -67,12 +68,14 @@ class AgentLoop:
         registry: ToolRegistry,
         turn_state: dict,
         workdir: Path,
+        audit_log: AuditLog | None = None,
     ) -> None:
         self.model = model
         self.messages: list[dict] = list(messages)
         self.registry = registry
         self.turn_state = turn_state
         self.workdir = workdir
+        self.audit_log = audit_log
         self.deadline = time.monotonic() + config.MAX_WALL_TIME_SEC
         self._approval_resolver: ApprovalResolver | None = None
         self._rounds = 0
@@ -205,13 +208,11 @@ class AgentLoop:
                         await self._out_queue.put({"type": "agent_done"})
                         return
                     # Cap tool calls per turn (cumulative across rounds).
-                    remaining = config.MAX_TOOL_CALLS_PER_TURN - self._tool_calls_used
-                    if remaining <= 0:
-                        await self._out_queue.put(
-                            {"type": "agent_error",
-                             "msg": f"agent tool-call limit {config.MAX_TOOL_CALLS_PER_TURN} exceeded"}
-                        )
-                        return
+                    # Phase 8 iter-4 fix (Codex): pokud limit byl vyčerpán v
+                    # předchozím kole (remaining <= 0), všechny tcs v tomto
+                    # kole jsou dropped. Bez tohoto by ranní calls minuly
+                    # auditní stopu — LLM by mohl schovat malicious args.
+                    remaining = max(0, config.MAX_TOOL_CALLS_PER_TURN - self._tool_calls_used)
                     # Truncate na cap, ALE neztratíme dropped tool calls z LLM kontextu —
                     # historii necháme úplnou a pro dropped vygenerujeme syntetické
                     # tool_result, jinak by model viděl assistant.tool_calls bez párového
@@ -231,13 +232,41 @@ class AgentLoop:
                         for tc in dropped:
                             tcid = tc["id"]
                             tname = tc["function"]["name"]
-                            payload = {"ok": False,
-                                       "error": f"tool-call limit {config.MAX_TOOL_CALLS_PER_TURN} reached — skipped"}
+                            err = f"tool-call limit {config.MAX_TOOL_CALLS_PER_TURN} reached — skipped"
+                            payload = {"ok": False, "error": err}
                             content = json.dumps(payload, ensure_ascii=False)
                             await self._out_queue.put(
                                 {"type": "tool_result", "id": tcid, "ok": False, "content": content}
                             )
                             self.messages.append(tool_message(tcid, tname, content))
+                            # Phase 8 iter-3 fix (Codex): audit dropped calls
+                            # taky. Bez tohoto by LLM mohl schovat malicious
+                            # tool za rate-limit a nezůstala by forensic stopa.
+                            if self.audit_log is not None and self.audit_log.enabled:
+                                try:
+                                    dropped_args = parse_tool_args(tc)
+                                except Exception:
+                                    dropped_args = {}
+                                skipped_perm = {
+                                    "decision": "skipped_limit",
+                                    "risk": "n/a",
+                                    "reason": err,
+                                    "requires_explicit": False,
+                                    "summary": f"{tname}: skipped (rate limit)",
+                                }
+                                audit_task = asyncio.create_task(self.audit_log.record(
+                                    turn_id=str(self.turn_state.get("id", "")),
+                                    tool_call_id=tcid,
+                                    tool_name=tname,
+                                    args=dropped_args,
+                                    permission=skipped_perm,
+                                    approval=None,
+                                    ok=False,
+                                    error=err,
+                                    result_bytes=len(content.encode("utf-8")),
+                                    duration_ms=0,
+                                ))
+                                audit_task.add_done_callback(_swallow_task_exc)
                         await self._out_queue.put(
                             {"type": "agent_error",
                              "msg": f"agent tool-call limit {config.MAX_TOOL_CALLS_PER_TURN} exceeded"}
@@ -280,18 +309,23 @@ class AgentLoop:
             {"type": "tool_call", "id": tcid, "name": name, "args": args}
         )
 
+        t0 = time.monotonic()
         perm = decide(name, args, self.workdir)
         approved: bool
+        approval_outcome: str | None  # "approved" | "denied" | None (= nebylo soliciováno)
         deny_reason: str | None = None
 
         if perm.decision == Decision.AUTO:
             approved = True
+            approval_outcome = None
         elif perm.decision == Decision.DENY:
             approved = False
+            approval_outcome = None
             deny_reason = f"policy: {perm.reason}"
         else:  # ASK
             if self._approval_resolver is None:
                 approved = False
+                approval_outcome = "denied"
                 deny_reason = "no approval resolver configured"
             else:
                 from voice.agent.messages import new_approval_id
@@ -313,6 +347,7 @@ class AgentLoop:
                 remaining = self._remaining_budget()
                 if remaining <= 0:
                     approved = False
+                    approval_outcome = "denied"
                     deny_reason = f"wall-time {config.MAX_WALL_TIME_SEC}s exceeded before approval"
                 else:
                     try:
@@ -322,34 +357,45 @@ class AgentLoop:
                         )
                     except asyncio.TimeoutError:
                         approved = False
+                        approval_outcome = "denied"
                         deny_reason = f"wall-time {config.MAX_WALL_TIME_SEC}s exceeded waiting for approval"
                     except asyncio.CancelledError:
+                        # Best-effort audit před re-raise — forensic gap fix
+                        # (Phase 8 iter-1 review). Cancellation se může stát
+                        # mezi approval a tool exec, audit nesmí zmizet.
+                        self._audit_cancellation_fire_and_forget(
+                            tcid, name, args, perm, "denied", t0,
+                            stage="cancelled during approval wait",
+                        )
                         raise
                     except Exception as e:
                         log.exception("approval resolver raised")
                         approved = False
+                        approval_outcome = "denied"
                         deny_reason = f"approval error: {type(e).__name__}: {e}"
                     else:
+                        approval_outcome = "approved" if approved else "denied"
                         if not approved:
                             deny_reason = "user denied"
 
         if not approved:
-            payload = {"ok": False, "error": deny_reason or "denied"}
-            content = json.dumps(payload, ensure_ascii=False)
-            await self._out_queue.put(
-                {"type": "tool_result", "id": tcid, "ok": False, "content": content}
+            await self._finalize_tool_call(
+                tcid=tcid, name=name, args=args, perm=perm,
+                approval=approval_outcome, ok=False,
+                content=json.dumps({"ok": False, "error": deny_reason or "denied"}, ensure_ascii=False),
+                error=deny_reason or "denied", t0=t0,
             )
-            self.messages.append(tool_message(tcid, name, content))
             return
 
         tool = self.registry.get(name)
         if tool is None:
-            payload = {"ok": False, "error": f"unknown tool {name!r}"}
-            content = json.dumps(payload, ensure_ascii=False)
-            await self._out_queue.put(
-                {"type": "tool_result", "id": tcid, "ok": False, "content": content}
+            err = f"unknown tool {name!r}"
+            await self._finalize_tool_call(
+                tcid=tcid, name=name, args=args, perm=perm,
+                approval=approval_outcome, ok=False,
+                content=json.dumps({"ok": False, "error": err}, ensure_ascii=False),
+                error=err, t0=t0,
             )
-            self.messages.append(tool_message(tcid, name, content))
             return
 
         ctx = ExecuteContext(
@@ -360,33 +406,42 @@ class AgentLoop:
         )
         remaining = self._remaining_budget()
         if remaining <= 0:
-            payload = {"ok": False, "error": f"wall-time {config.MAX_WALL_TIME_SEC}s exceeded before tool"}
-            content = json.dumps(payload, ensure_ascii=False)
-            await self._out_queue.put(
-                {"type": "tool_result", "id": tcid, "ok": False, "content": content}
+            err = f"wall-time {config.MAX_WALL_TIME_SEC}s exceeded before tool"
+            await self._finalize_tool_call(
+                tcid=tcid, name=name, args=args, perm=perm,
+                approval=approval_outcome, ok=False,
+                content=json.dumps({"ok": False, "error": err}, ensure_ascii=False),
+                error=err, t0=t0,
             )
-            self.messages.append(tool_message(tcid, name, content))
             return
         try:
             out = await asyncio.wait_for(tool.execute(args, ctx), timeout=remaining)
         except asyncio.TimeoutError:
-            payload = {"ok": False, "error": f"wall-time {config.MAX_WALL_TIME_SEC}s exceeded during tool"}
-            content = json.dumps(payload, ensure_ascii=False)
-            await self._out_queue.put(
-                {"type": "tool_result", "id": tcid, "ok": False, "content": content}
+            err = f"wall-time {config.MAX_WALL_TIME_SEC}s exceeded during tool"
+            await self._finalize_tool_call(
+                tcid=tcid, name=name, args=args, perm=perm,
+                approval=approval_outcome, ok=False,
+                content=json.dumps({"ok": False, "error": err}, ensure_ascii=False),
+                error=err, t0=t0,
             )
-            self.messages.append(tool_message(tcid, name, content))
             return
         except asyncio.CancelledError:
+            # Tool byl approved (jinak by sem nedošlo) a possibly partially
+            # executed. Best-effort audit s ok=False, error="cancelled".
+            self._audit_cancellation_fire_and_forget(
+                tcid, name, args, perm, approval_outcome, t0,
+                stage="cancelled during tool execution",
+            )
             raise
         except Exception as e:
             log.exception("tool %s failed", name)
-            payload = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-            content = json.dumps(payload, ensure_ascii=False)
-            await self._out_queue.put(
-                {"type": "tool_result", "id": tcid, "ok": False, "content": content}
+            err = f"{type(e).__name__}: {e}"
+            await self._finalize_tool_call(
+                tcid=tcid, name=name, args=args, perm=perm,
+                approval=approval_outcome, ok=False,
+                content=json.dumps({"ok": False, "error": err}, ensure_ascii=False),
+                error=err, t0=t0,
             )
-            self.messages.append(tool_message(tcid, name, content))
             return
 
         if isinstance(out, str):
@@ -397,12 +452,13 @@ class AgentLoop:
             except (TypeError, ValueError) as e:
                 # Non-serializable tool output — degrade gracefully místo crashe driveru.
                 log.warning("tool %s returned non-serializable output: %s", name, e)
-                payload = {"ok": False, "error": f"non-serializable tool output: {type(e).__name__}: {e}"}
-                content = json.dumps(payload, ensure_ascii=False)
-                await self._out_queue.put(
-                    {"type": "tool_result", "id": tcid, "ok": False, "content": content}
+                err = f"non-serializable tool output: {type(e).__name__}: {e}"
+                await self._finalize_tool_call(
+                    tcid=tcid, name=name, args=args, perm=perm,
+                    approval=approval_outcome, ok=False,
+                    content=json.dumps({"ok": False, "error": err}, ensure_ascii=False),
+                    error=err, t0=t0,
                 )
-                self.messages.append(tool_message(tcid, name, content))
                 return
         encoded = content.encode("utf-8")
         cap = config.TOOL_OUTPUT_CAP_BYTES
@@ -410,10 +466,122 @@ class AgentLoop:
             # Byte-level slice + decode errors='ignore' uřízne neúplný UTF-8 prefix.
             content = encoded[:cap].decode("utf-8", errors="ignore") + "\n…[truncated]"
 
-        await self._out_queue.put(
-            {"type": "tool_result", "id": tcid, "ok": True, "content": content}
+        await self._finalize_tool_call(
+            tcid=tcid, name=name, args=args, perm=perm,
+            approval=approval_outcome, ok=True,
+            content=content, error=None, t0=t0,
         )
+
+    def _audit_cancellation_fire_and_forget(
+        self,
+        tcid: str,
+        name: str,
+        args: dict,
+        perm: PermissionResult,
+        approval_outcome: str | None,
+        t0: float,
+        *,
+        stage: str,
+    ) -> None:
+        """Spawn detached audit task při CancelledError. Await uvnitř cancelled
+        contextu by znovu vyhodil CancelledError; create_task ho protne. Task
+        doběhne v event loopu paralelně s tear-downem agenta. Helper neraise-uje."""
+        if self.audit_log is None or not self.audit_log.enabled:
+            return
+        try:
+            coro = self.audit_log.record(
+                turn_id=str(self.turn_state.get("id", "")),
+                tool_call_id=tcid,
+                tool_name=name,
+                args=args,
+                permission={
+                    "decision": perm.decision.value if hasattr(perm.decision, "value") else str(perm.decision),
+                    "risk": perm.risk,
+                    "reason": perm.reason,
+                    "requires_explicit": perm.requires_explicit,
+                    "summary": perm.summary,
+                },
+                approval=approval_outcome,
+                ok=False,
+                error=stage,
+                result_bytes=0,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+            )
+            task = asyncio.create_task(coro)
+            # Connect default exception handler — bez tohoto by event loop
+            # vyhodil "Task exception was never retrieved" warning, kdyby
+            # uvnitř .record() vznikla unexpected exception.
+            task.add_done_callback(_swallow_task_exc)
+        except Exception:
+            log.exception("audit: failed to spawn cancel record task")
+
+    async def _finalize_tool_call(
+        self,
+        *,
+        tcid: str,
+        name: str,
+        args: dict,
+        perm: PermissionResult,
+        approval: str | None,
+        ok: bool,
+        content: str,
+        error: str | None,
+        t0: float,
+    ) -> None:
+        """Emit tool_result + push tool_message do history + zapsat audit.
+        Cancellation hardening: pokud je task cancelled během out_queue.put,
+        fire-and-forget audit aby forensic stopa nezmizela. Audit samotný
+        je shieldnutý → outer cancel ho nezruší (běží detached do konce)."""
+        try:
+            await self._out_queue.put(
+                {"type": "tool_result", "id": tcid, "ok": ok, "content": content}
+            )
+        except asyncio.CancelledError:
+            self._audit_cancellation_fire_and_forget(
+                tcid, name, args, perm, approval, t0,
+                stage="cancelled during tool_result emission",
+            )
+            raise
         self.messages.append(tool_message(tcid, name, content))
+        if self.audit_log is not None and self.audit_log.enabled:
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            audit_task = asyncio.create_task(self.audit_log.record(
+                turn_id=str(self.turn_state.get("id", "")),
+                tool_call_id=tcid,
+                tool_name=name,
+                args=args,
+                permission={
+                    "decision": perm.decision.value if hasattr(perm.decision, "value") else str(perm.decision),
+                    "risk": perm.risk,
+                    "reason": perm.reason,
+                    "requires_explicit": perm.requires_explicit,
+                    "summary": perm.summary,
+                },
+                approval=approval,
+                ok=ok,
+                error=error,
+                result_bytes=len(content.encode("utf-8")),
+                duration_ms=duration_ms,
+            ))
+            audit_task.add_done_callback(_swallow_task_exc)
+            try:
+                # Shield: pokud caller (_execute_one) je cancelled, audit_task
+                # pokračuje detached. Tady jen čekáme do dokončení v happy path.
+                await asyncio.shield(audit_task)
+            except asyncio.CancelledError:
+                # audit_task běží dál; přidaný done callback zaloguje případnou exc.
+                raise
+            except Exception:
+                log.exception("audit: record failed for %s", name)
 
 
 _SENTINEL = object()
+
+
+def _swallow_task_exc(task: "asyncio.Task[None]") -> None:
+    """Done-callback pro fire-and-forget audit tasky. Bez tohoto by event loop
+    při .exception() != None vyhodil 'Task exception was never retrieved' warning."""
+    try:
+        task.exception()
+    except (asyncio.CancelledError, Exception):
+        pass

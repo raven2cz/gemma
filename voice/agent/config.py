@@ -314,6 +314,26 @@ def _load_hue_config() -> tuple[str, str]:
 HUE_BRIDGE_IP, HUE_APP_KEY = _load_hue_config()
 
 
+# Audit log (fáze 8)
+# Per-tool-call append-only JSONL log s permission decision + approval outcome
+# + result. Soubor `~/.gemma/agent-audit/YYYY-MM-DD.jsonl`, 0o600. Disabled
+# když `AGENT_AUDIT_DIR=off` (case-insensitive) nebo prázdná hodnota.
+def _resolve_audit_dir() -> Path | None:
+    raw = os.environ.get("AGENT_AUDIT_DIR")
+    if raw is not None:
+        if raw.strip().lower() in ("", "off", "0", "false", "no"):
+            return None
+        return Path(raw).expanduser()
+    return Path.home() / ".gemma" / "agent-audit"
+
+
+AUDIT_DIR: Path | None = _resolve_audit_dir()
+# Per-string truncation cap pro logged args (chars, ne bytes — JSON je text).
+AUDIT_FIELD_CAP: int = int(os.environ.get("AGENT_AUDIT_FIELD_CAP", "500"))
+# Preview cap pro tool-specific redaction (prompt/system).
+AUDIT_ARG_PREVIEW: int = int(os.environ.get("AGENT_AUDIT_ARG_PREVIEW", "200"))
+
+
 # Voice approval — destruktivní akce vyžadují explicit „ano povoluju".
 DESTRUCTIVE_APPROVAL_PHRASE: str = "ano povoluju"
 APPROVE_PHRASES: tuple[str, ...] = ("ano", "jo", "ok", "okej", "okay", "povol", "povoluju", "jasně", "jasne", "fajn", "yes")

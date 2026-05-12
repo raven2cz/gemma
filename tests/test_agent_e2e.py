@@ -1499,3 +1499,168 @@ async def test_e2e_router_does_not_swap_runtime_model(client):
     # router_decision target claude, ale stream pokračoval lokálně
     rd = next(e for e in events if e["type"] == "router_decision")
     assert rd["target"] == "claude"
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: audit log per tool call
+# ---------------------------------------------------------------------------
+
+
+def _set_audit_dir(tmp_dir: Path | None):
+    """Monkeypatch AUDIT_DIR na voice.agent.config v živém serveru.
+    Vrátí (orig, restore_callable) pro try/finally cleanup."""
+    from voice.agent import config as cfg_mod
+    orig = cfg_mod.AUDIT_DIR
+    cfg_mod.AUDIT_DIR = tmp_dir
+
+    def restore() -> None:
+        cfg_mod.AUDIT_DIR = orig
+    return orig, restore
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_audit_records_echo_tool(client, tmp_path):
+    """Plný agent flow: AUTO echo → audit log zapsán s decision=auto, ok=True."""
+    audit_dir = tmp_path / "audit"
+    _orig, restore = _set_audit_dir(audit_dir)
+    try:
+        script = [
+            [_mk_lines(
+                tool_calls=[{"function": {"name": "echo", "arguments": {"text": "hi"}}}],
+                done=True,
+            )],
+            [_mk_lines(content="Done"), _mk_lines(done=True)],
+        ]
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "echo hi"}],
+                "want_tts": False,
+            }
+            async with client.stream("POST", "/api/turn", json=payload) as r:
+                events = await _stream_ndjson(r)
+        # Stream OK
+        assert "agent_done" in [e["type"] for e in events]
+
+        # Audit log file present
+        files = list(audit_dir.glob("*.jsonl"))
+        assert len(files) == 1, f"expected 1 audit file, got {files}"
+        records = []
+        for line in files[0].read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+        assert len(records) == 1
+        r0 = records[0]
+        assert r0["tool"] == "echo"
+        assert r0["args"] == {"text": "hi"}
+        assert r0["permission"]["decision"] == "auto"
+        assert r0["approval"] is None
+        assert r0["ok"] is True
+        assert r0["error"] is None
+        assert r0["result_bytes"] > 0
+        assert r0["duration_ms"] >= 0
+        assert r0["tool_call_id"].startswith("tc_") or r0["tool_call_id"]
+        assert r0["turn_id"]
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_audit_records_ask_denial(client, tmp_path):
+    """ASK → user denies → audit log zapsán s approval=denied, ok=False."""
+    from voice.agent import permissions
+    from voice.agent.permissions import Decision, PermissionResult
+
+    audit_dir = tmp_path / "audit"
+    _orig, restore = _set_audit_dir(audit_dir)
+    original = permissions._CLASSIFIERS.get("echo")
+    permissions._CLASSIFIERS["echo"] = lambda args, wd: PermissionResult(
+        decision=Decision.ASK, reason="test ask",
+        summary=f"echo: {args.get('text','')}", risk="medium",
+    )
+    try:
+        script = [
+            [_mk_lines(
+                tool_calls=[{"function": {"name": "echo", "arguments": {"text": "x"}}}],
+                done=True,
+            )],
+            [_mk_lines(content="ok"), _mk_lines(done=True)],
+        ]
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "ask"}],
+                "want_tts": False,
+            }
+            approved_event = asyncio.Event()
+            holder: dict = {}
+            events: list[dict] = []
+
+            async def consume():
+                async with client.stream("POST", "/api/turn", json=payload) as r:
+                    holder["tid"] = r.headers["x-turn-id"]
+                    async for line in r.aiter_lines():
+                        if not line.strip():
+                            continue
+                        ev = json.loads(line)
+                        events.append(ev)
+                        if ev["type"] == "approval_required":
+                            holder["aid"] = ev["approval_id"]
+                            approved_event.set()
+
+            async def denier():
+                await approved_event.wait()
+                r = await client.post(
+                    f"/api/turn/{holder['tid']}/approval/{holder['aid']}",
+                    json={"decision": "deny"},
+                )
+                assert r.status_code == 200
+
+            await asyncio.gather(consume(), denier())
+
+        # Audit log obsahuje záznam s approval=denied
+        files = list(audit_dir.glob("*.jsonl"))
+        assert len(files) == 1
+        records = [json.loads(l) for l in files[0].read_text(encoding="utf-8").splitlines() if l.strip()]
+        echo_records = [r for r in records if r["tool"] == "echo"]
+        assert len(echo_records) == 1
+        r0 = echo_records[0]
+        assert r0["permission"]["decision"] == "ask"
+        assert r0["approval"] == "denied"
+        assert r0["ok"] is False
+        assert r0["error"]  # nějaký deny reason
+    finally:
+        if original is not None:
+            permissions._CLASSIFIERS["echo"] = original
+        restore()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_audit_disabled_no_file_written(client, tmp_path):
+    """AUDIT_DIR=None → žádný soubor nezapsán, agent funguje normálně."""
+    audit_dir = tmp_path / "audit"  # nesmí existovat po testu
+    _orig, restore = _set_audit_dir(None)
+    try:
+        script = [
+            [_mk_lines(
+                tool_calls=[{"function": {"name": "echo", "arguments": {"text": "x"}}}],
+                done=True,
+            )],
+            [_mk_lines(content="ok"), _mk_lines(done=True)],
+        ]
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "echo"}],
+                "want_tts": False,
+            }
+            async with client.stream("POST", "/api/turn", json=payload) as r:
+                events = await _stream_ndjson(r)
+        assert "agent_done" in [e["type"] for e in events]
+        # Žádný audit dir nesmí vzniknout
+        assert not audit_dir.exists()
+    finally:
+        restore()

@@ -1204,7 +1204,8 @@ async def _run_agent_turn(
         user_lang, text, tool_call, tool_result, approval_required,
         agent_error, canceled, done.
     """
-    from voice.agent.config import WORKDIR
+    from voice.agent.audit import AuditLog
+    from voice.agent.config import AUDIT_DIR, WORKDIR
     from voice.agent.loop import AgentLoop
     from voice.agent.tools import default_registry
 
@@ -1213,12 +1214,14 @@ async def _run_agent_turn(
     _SENTINEL = object()
 
     history = _build_agent_messages(messages, user_lang, want_tts)
+    audit_log = AuditLog(AUDIT_DIR)
     agent = AgentLoop(
         model=model,
         messages=history,
         registry=default_registry("agent"),
         turn_state=turn_state,
         workdir=WORKDIR,
+        audit_log=audit_log,
     )
 
     async def approval_resolver(approval_id: str, event: dict) -> bool:
@@ -1236,9 +1239,13 @@ async def _run_agent_turn(
         try:
             return await fut
         except asyncio.CancelledError:
+            # Cancellation MUSÍ propagovat — loop._execute_one má except
+            # CancelledError handler, který triggernuje audit fire-and-forget.
+            # Spolknutím + return False bychom forensic stopu ztratili
+            # (cancellation by se zapsala jen jako běžné approval=denied).
             if not fut.done():
                 fut.cancel()
-            return False
+            raise
         finally:
             turn_state["approvals"].pop(approval_id, None)
 
