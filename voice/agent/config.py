@@ -336,5 +336,21 @@ AUDIT_ARG_PREVIEW: int = int(os.environ.get("AGENT_AUDIT_ARG_PREVIEW", "200"))
 
 # Voice approval — destruktivní akce vyžadují explicit „ano povoluju".
 DESTRUCTIVE_APPROVAL_PHRASE: str = "ano povoluju"
+
+# Auto-degradace po destruktivní akci (Fáze 9). Po každém ÚSPĚŠNÉM schválení
+# destruktivní operace se po dobu N sekund přepne AUTO → ASK pro stejný workdir,
+# i pro jinak allowlistové příkazy. Anti-momentum: jedna fráze „ano povoluju"
+# nesmí otevřít neomezený coast pro další destruktivní akce.
+AUTO_DEGRADE_AFTER_DESTRUCTIVE_SEC: int = int(
+    os.environ.get("AGENT_AUTO_DEGRADE_SEC", "300")
+)
+
+
+# Audio filler delay (Fáze 9.3). Pokud běží tool déle než tato hodnota,
+# loop emit `audio_filler` event a frontend přehraje krátké „moment, hledám…"
+# aby user věděl, že systém pracuje. 0 = vypnuto.
+AUDIO_FILLER_DELAY_SEC: float = float(
+    os.environ.get("AGENT_AUDIO_FILLER_DELAY_SEC", "2.0")
+)
 APPROVE_PHRASES: tuple[str, ...] = ("ano", "jo", "ok", "okej", "okay", "povol", "povoluju", "jasně", "jasne", "fajn", "yes")
 DENY_PHRASES: tuple[str, ...] = ("ne", "stop", "zruš", "zrus", "nepovoluju", "nechci", "no")

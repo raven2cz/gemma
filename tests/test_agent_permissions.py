@@ -761,3 +761,108 @@ def test_ask_claude_deny(tmp_path: Path, args: dict, reason_kw: str):
     r = decide("ask_claude", args, tmp_path)
     assert r.decision == Decision.DENY, f"{args}: got {r.decision} ({r.reason})"
     assert reason_kw.lower() in r.reason.lower(), f"{args}: reason={r.reason}"
+
+
+# ----------------------------------------------------------------------
+# Fáze 9.4 — Auto-degradace po destruktivní akci
+# ----------------------------------------------------------------------
+
+
+def test_auto_degrade_downgrades_auto_to_ask(tmp_path: Path):
+    """Po mark_destructive_approval se AUTO musí přepnout na ASK."""
+    from voice.agent import permissions as perm
+    perm.clear_degrade_state()
+    try:
+        # baseline: echo je AUTO
+        r0 = decide("echo", {"text": "hi"}, tmp_path)
+        assert r0.decision == Decision.AUTO
+
+        # po destruktivním approve → AUTO → ASK
+        perm.mark_destructive_approval(tmp_path)
+        r1 = decide("echo", {"text": "hi"}, tmp_path)
+        assert r1.decision == Decision.ASK
+        assert "auto-degradace" in r1.reason
+        # původní reason je zachován v reasoning trail
+        assert r0.reason in r1.reason
+        # summary zůstal stejný (pro UI clarity)
+        assert r1.summary == r0.summary
+        # risk se zvedl z low na medium (AUTO low → degradované ASK medium)
+        assert r1.risk == "medium"
+    finally:
+        perm.clear_degrade_state()
+
+
+def test_auto_degrade_expires_after_window(tmp_path: Path, monkeypatch):
+    """Mimo časové okno musí AUTO zůstat AUTO."""
+    from voice.agent import config
+    from voice.agent import permissions as perm
+    perm.clear_degrade_state()
+    monkeypatch.setattr(config, "AUTO_DEGRADE_AFTER_DESTRUCTIVE_SEC", 0)
+    try:
+        perm.mark_destructive_approval(tmp_path)
+        # window = 0s → okamžitě venku
+        r = decide("echo", {"text": "hi"}, tmp_path)
+        assert r.decision == Decision.AUTO
+    finally:
+        perm.clear_degrade_state()
+
+
+def test_auto_degrade_does_not_affect_ask_decisions(tmp_path: Path):
+    """ASK/DENY rozhodnutí nesmí být modifikována (degrace jen sníží AUTO)."""
+    from voice.agent import permissions as perm
+    perm.clear_degrade_state()
+    try:
+        # neznámý tool = DENY i bez degradace
+        r0 = decide("neznamy_nastroj_xyz", {}, tmp_path)
+        assert r0.decision == Decision.DENY
+
+        perm.mark_destructive_approval(tmp_path)
+        r1 = decide("neznamy_nastroj_xyz", {}, tmp_path)
+        # DENY musí zůstat DENY (degradace by ho neměla „vylepšit" na ASK)
+        assert r1.decision == Decision.DENY
+
+        # bash s shell metaznaky = ASK i bez degradace
+        r2 = decide("run_bash", {"command": "ls | wc -l"}, tmp_path)
+        assert r2.decision == Decision.ASK
+        r3 = decide("run_bash", {"command": "ls | wc -l"}, tmp_path)
+        assert r3.decision == Decision.ASK
+        # reason originálního ASK NESMÍ být přepsán „auto-degradace …"
+        assert "auto-degradace" not in r3.reason
+    finally:
+        perm.clear_degrade_state()
+
+
+def test_auto_degrade_per_workdir_isolation(tmp_path: Path):
+    """Degradace pro workdir A neovlivní workdir B."""
+    from voice.agent import permissions as perm
+    perm.clear_degrade_state()
+    wd_a = tmp_path / "a"
+    wd_b = tmp_path / "b"
+    wd_a.mkdir()
+    wd_b.mkdir()
+    try:
+        perm.mark_destructive_approval(wd_a)
+        r_a = decide("echo", {"text": "x"}, wd_a)
+        r_b = decide("echo", {"text": "x"}, wd_b)
+        assert r_a.decision == Decision.ASK, "wd_a má být degradovaný"
+        assert r_b.decision == Decision.AUTO, "wd_b mimo degradaci"
+    finally:
+        perm.clear_degrade_state()
+
+
+def test_auto_degrade_remaining_time_in_reason(tmp_path: Path):
+    """Reason má obsahovat zbývající čas (int sekundy)."""
+    from voice.agent import permissions as perm
+    perm.clear_degrade_state()
+    try:
+        perm.mark_destructive_approval(tmp_path)
+        r = decide("echo", {"text": "x"}, tmp_path)
+        assert r.decision == Decision.ASK
+        # default window = 300s, právě teď zbývá ~300
+        import re as _re
+        m = _re.search(r"auto-degradace (\d+)s", r.reason)
+        assert m is not None, f"reason missing seconds: {r.reason!r}"
+        sec = int(m.group(1))
+        assert 250 <= sec <= 300, f"unexpected remaining: {sec}"
+    finally:
+        perm.clear_degrade_state()

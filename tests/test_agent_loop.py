@@ -370,3 +370,214 @@ async def test_loop_tool_call_cap_emits_synthetic_results(tmp_path: Path, monkey
     assert len(tool_msgs) == 3
     assert events[-1]["type"] == "agent_error"
     assert "tool-call limit" in events[-1]["msg"]
+
+
+# ----------------------------------------------------------------------
+# Fáze 9.3 — Audio filler watchdog
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_loop_audio_filler_emitted_for_slow_tool(tmp_path: Path, monkeypatch):
+    """Tool, který trvá déle než AUDIO_FILLER_DELAY_SEC, musí způsobit emit
+    `audio_filler` event před `tool_result`."""
+    from voice.agent import config as cfg
+    monkeypatch.setattr(cfg, "AUDIO_FILLER_DELAY_SEC", 0.05)
+
+    async def _slow_exec(args, ctx):
+        await asyncio.sleep(0.2)
+        return "done"
+
+    from voice.agent import permissions as perm
+    from voice.agent.permissions import Decision, PermissionResult, register_classifier
+
+    slow = Tool(
+        name="slow_unique_for_filler",
+        description="sleeps",
+        parameters_schema={"type": "object", "properties": {}},
+        execute=_slow_exec,
+    )
+    reg = ToolRegistry()
+    reg.register(slow)
+
+    @register_classifier("slow_unique_for_filler")
+    def _cls(args, workdir):
+        return PermissionResult(
+            decision=Decision.AUTO, reason="t", summary="t", risk="low",
+            requires_explicit=False,
+        )
+
+    try:
+        scripts = [
+            [_ollama_line(
+                tool_calls=[{"function": {"name": "slow_unique_for_filler", "arguments": {}}}],
+                done=True,
+            )],
+            [_ollama_line(content="ok"), _ollama_line(done=True)],
+        ]
+        turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+        loop = AgentLoop(
+            model="test", messages=[{"role": "user", "content": "go"}],
+            registry=reg, turn_state=turn_state, workdir=tmp_path,
+        )
+        with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+            events = [ev async for ev in loop.run()]
+        types = [e["type"] for e in events]
+        # audio_filler musí být PŘED tool_result (jinak je k ničemu)
+        ai_idx = types.index("audio_filler")
+        tr_idx = types.index("tool_result")
+        assert ai_idx < tr_idx
+        # payload
+        af = events[ai_idx]
+        assert af["tool"] == "slow_unique_for_filler"
+        assert af["tool_call_id"]
+    finally:
+        perm._CLASSIFIERS.pop("slow_unique_for_filler", None)
+
+
+@pytest.mark.asyncio
+async def test_loop_audio_filler_skipped_for_fast_tool(tmp_path: Path, monkeypatch):
+    """Rychlý tool (< AUDIO_FILLER_DELAY_SEC) NESMÍ emit `audio_filler`."""
+    from voice.agent import config as cfg
+    monkeypatch.setattr(cfg, "AUDIO_FILLER_DELAY_SEC", 0.5)
+
+    scripts = [
+        [_ollama_line(
+            tool_calls=[{"function": {"name": "echo", "arguments": {"text": "hi"}}}],
+            done=True,
+        )],
+        [_ollama_line(content="ok"), _ollama_line(done=True)],
+    ]
+    turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+    loop = AgentLoop(
+        model="test", messages=[{"role": "user", "content": "go"}],
+        registry=default_registry("agent"), turn_state=turn_state, workdir=tmp_path,
+    )
+    with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+        events = [ev async for ev in loop.run()]
+    types = [e["type"] for e in events]
+    assert "audio_filler" not in types, f"unexpected filler in {types}"
+
+
+@pytest.mark.asyncio
+async def test_loop_audio_filler_no_race_against_finalize(tmp_path: Path, monkeypatch):
+    """Regression (Gemini iter-1): pokud tool doběhne těsně PŘED delay vypršením,
+    ale finalize_tool_call dělá I/O await (audit log shield, queue.put), starý
+    kód (cancel ve vnějším finally) by mohl emit audio_filler PO tool_result.
+
+    Setup: tool sleep 0.1s, delay 0.15s → tool finishes BEFORE delay. Pak v
+    cestě k tool_result vložíme umělé `asyncio.sleep(0.2)` (simulace pomalého
+    audit logu) — pokud by filler_task nebyl cancelován ihned po execute(),
+    stihne v této pauze emitovat. Po fixu musí cancel proběhnout PŘED tímto
+    artificialním sleep.
+    """
+    from voice.agent import config as cfg
+    from voice.agent import permissions as perm
+    from voice.agent.permissions import Decision, PermissionResult, register_classifier
+    from voice.agent.loop import AgentLoop
+
+    monkeypatch.setattr(cfg, "AUDIO_FILLER_DELAY_SEC", 0.15)
+
+    async def _quick_exec(args, ctx):
+        await asyncio.sleep(0.1)  # finish PŘED delay vypršením
+        return "done"
+
+    quick = Tool(
+        name="quick_race_unique",
+        description="quick",
+        parameters_schema={"type": "object", "properties": {}},
+        execute=_quick_exec,
+    )
+    reg = ToolRegistry()
+    reg.register(quick)
+
+    @register_classifier("quick_race_unique")
+    def _cls(args, workdir):
+        return PermissionResult(
+            decision=Decision.AUTO, reason="t", summary="t", risk="low",
+            requires_explicit=False,
+        )
+
+    # Monkeypatch _finalize_tool_call → vlož umělý sleep mezi return execute
+    # a queue.put. Po fixu je filler_task už cancelován; před fixem by stihl emit.
+    orig_finalize = AgentLoop._finalize_tool_call
+
+    async def _slow_finalize(self, **kw):
+        await asyncio.sleep(0.2)
+        return await orig_finalize(self, **kw)
+
+    monkeypatch.setattr(AgentLoop, "_finalize_tool_call", _slow_finalize)
+
+    try:
+        scripts = [
+            [_ollama_line(
+                tool_calls=[{"function": {"name": "quick_race_unique", "arguments": {}}}],
+                done=True,
+            )],
+            [_ollama_line(content="ok"), _ollama_line(done=True)],
+        ]
+        turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+        loop = AgentLoop(
+            model="test", messages=[{"role": "user", "content": "go"}],
+            registry=reg, turn_state=turn_state, workdir=tmp_path,
+        )
+        with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+            events = [ev async for ev in loop.run()]
+        types = [e["type"] for e in events]
+        # Tool finished BEFORE delay → filler NESMÍ být emitován ani po
+        # I/O pauze v finalize. (Bez fixu: filler by se mezitím probudil.)
+        assert "audio_filler" not in types, (
+            f"filler emitted out-of-order after tool_result: {types}"
+        )
+    finally:
+        perm._CLASSIFIERS.pop("quick_race_unique", None)
+
+
+@pytest.mark.asyncio
+async def test_loop_audio_filler_disabled_when_delay_zero(tmp_path: Path, monkeypatch):
+    """AUDIO_FILLER_DELAY_SEC = 0 → filler completely disabled."""
+    from voice.agent import config as cfg
+    monkeypatch.setattr(cfg, "AUDIO_FILLER_DELAY_SEC", 0)
+
+    async def _slow_exec(args, ctx):
+        await asyncio.sleep(0.1)
+        return "done"
+
+    from voice.agent import permissions as perm
+    from voice.agent.permissions import Decision, PermissionResult, register_classifier
+
+    slow = Tool(
+        name="slow2_unique_for_filler",
+        description="sleeps",
+        parameters_schema={"type": "object", "properties": {}},
+        execute=_slow_exec,
+    )
+    reg = ToolRegistry()
+    reg.register(slow)
+
+    @register_classifier("slow2_unique_for_filler")
+    def _cls(args, workdir):
+        return PermissionResult(
+            decision=Decision.AUTO, reason="t", summary="t", risk="low",
+            requires_explicit=False,
+        )
+
+    try:
+        scripts = [
+            [_ollama_line(
+                tool_calls=[{"function": {"name": "slow2_unique_for_filler", "arguments": {}}}],
+                done=True,
+            )],
+            [_ollama_line(content="ok"), _ollama_line(done=True)],
+        ]
+        turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+        loop = AgentLoop(
+            model="test", messages=[{"role": "user", "content": "go"}],
+            registry=reg, turn_state=turn_state, workdir=tmp_path,
+        )
+        with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+            events = [ev async for ev in loop.run()]
+        types = [e["type"] for e in events]
+        assert "audio_filler" not in types
+    finally:
+        perm._CLASSIFIERS.pop("slow2_unique_for_filler", None)

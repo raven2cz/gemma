@@ -8,10 +8,13 @@ classifier dekorátorem `@register_classifier(name)`.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable
+
+from voice.agent import config
 
 
 class Decision(str, Enum):
@@ -48,6 +51,50 @@ def register_classifier(name: str) -> Callable[[Classifier], Classifier]:
     return wrap
 
 
+# ----------------------------------------------------------------------
+# Auto-degradace po destruktivní akci (Fáze 9).
+# Po úspěšném schválení destruktivního tool callu (requires_explicit=True
+# + user napsal/řekl „ano povoluju") přepneme AUTO → ASK pro daný workdir
+# na AUTO_DEGRADE_AFTER_DESTRUCTIVE_SEC sekund. Brání eskalaci kdy jediný
+# souhlas otevře okno pro libovolné další tichí AUTO příkazy.
+# ----------------------------------------------------------------------
+
+# Klíč = absolutní cesta workdiru, hodnota = monotonic timestamp poslední
+# destruktivní approval. Modul-level state přetrvá přes turn boundaries
+# (stejný proces serveru = jedna session). Reset přes `clear_degrade_state()`
+# pro testy + případný admin reset endpoint.
+_DESTRUCTIVE_APPROVAL_TS: dict[str, float] = {}
+
+
+def _workdir_key(workdir: Path) -> str:
+    try:
+        return str(Path(workdir).resolve())
+    except (OSError, RuntimeError):
+        return str(workdir)
+
+
+def mark_destructive_approval(workdir: Path) -> None:
+    """Zaznamenat ÚSPĚŠNÉ schválení destruktivní operace pro daný workdir.
+    Volá se ze server.py po validaci `requires_explicit` fráze.
+    """
+    _DESTRUCTIVE_APPROVAL_TS[_workdir_key(workdir)] = time.monotonic()
+
+
+def _degrade_remaining_sec(workdir: Path) -> float:
+    """Vrátí kolik sekund zbývá v degradačním okně (0 = mimo okno)."""
+    ts = _DESTRUCTIVE_APPROVAL_TS.get(_workdir_key(workdir))
+    if ts is None:
+        return 0.0
+    elapsed = time.monotonic() - ts
+    remaining = config.AUTO_DEGRADE_AFTER_DESTRUCTIVE_SEC - elapsed
+    return max(0.0, remaining)
+
+
+def clear_degrade_state() -> None:
+    """Vymaže auto-degrade state. Test-only / admin reset."""
+    _DESTRUCTIVE_APPROVAL_TS.clear()
+
+
 def decide(tool_name: str, args: dict, workdir: Path) -> PermissionResult:
     fn = _CLASSIFIERS.get(tool_name)
     if fn is None:
@@ -57,7 +104,23 @@ def decide(tool_name: str, args: dict, workdir: Path) -> PermissionResult:
             summary=f"Neznámý nástroj {tool_name!r}",
             risk="high",
         )
-    return fn(args, workdir)
+    result = fn(args, workdir)
+    # Auto-degradace: pokud jsme uvnitř okna po destruktivním approve a
+    # classifier vrátil AUTO, downgrade na ASK. ASK/DENY rozhodnutí
+    # nemodifikujeme — ta už jsou „bezpečnější nebo stejná".
+    if result.decision == Decision.AUTO:
+        remaining = _degrade_remaining_sec(workdir)
+        if remaining > 0:
+            return replace(
+                result,
+                decision=Decision.ASK,
+                reason=(
+                    f"auto-degradace {int(remaining)}s po destruktivní akci "
+                    f"(původně: {result.reason})"
+                ),
+                risk="medium" if result.risk == "low" else result.risk,
+            )
+    return result
 
 
 # ----------------------------------------------------------------------

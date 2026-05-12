@@ -810,6 +810,13 @@ async function runTurn() {
             fillToolResult({ ...ev, denied: isDenied });
             break;
           }
+          case 'audio_filler': {
+            // Phase 9.3: tool běží > 2s. Krátká fráze přes prohlížečové
+            // speechSynthesis (cs-CZ). Hlavní TTS pipeline je zaneprázdněná
+            // odpovědí agenta; tady chceme jen rychlou hluboko-latentní indikaci.
+            playAudioFiller();
+            break;
+          }
           case 'agent_error':
             throw new Error(ev.msg || 'agent error');
           case 'agent_canceled':
@@ -1004,7 +1011,63 @@ function applyMode(mode) {
 }
 
 function toggleMode() {
-  applyMode(state.mode === 'agent' ? 'chat' : 'agent');
+  const next = state.mode === 'agent' ? 'chat' : 'agent';
+  applyMode(next);
+  playModeBeep(next);
+}
+
+// Web Audio API — krátký tón při přepnutí mode. Agent = vyšší (880 Hz, "up"),
+// chat = nižší (440 Hz, "down"). User-gesture safe (toggleMode je vždy z kliku).
+let _beepCtx = null;
+function playModeBeep(mode) {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    _beepCtx = _beepCtx || new AC();
+    const ctx = _beepCtx;
+    if (ctx.state === 'suspended') ctx.resume();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = mode === 'agent' ? 880 : 440;
+    osc.connect(gain).connect(ctx.destination);
+    const now = ctx.currentTime;
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.18, now + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
+    osc.start(now);
+    osc.stop(now + 0.2);
+  } catch {}
+}
+
+// Phase 9.3: Audio filler — krátké rotující CZ fráze přes prohlížečové
+// speechSynthesis. Throttled aby série rychlých tool callů nezahltila audio.
+const _FILLER_PHRASES = ['Moment.', 'Hledám.', 'Pracuju na tom.', 'Chvilku.'];
+let _fillerLastAt = 0;
+let _fillerIdx = 0;
+function playAudioFiller() {
+  try {
+    const now = Date.now();
+    // Throttle: max jeden filler za 4s, ať to není opakované drmolení.
+    if (now - _fillerLastAt < 4000) return;
+    _fillerLastAt = now;
+    if (!('speechSynthesis' in window)) return;
+    // Pokud běží hlavní TTS audio, neskákej do něj.
+    const mainAudio = document.getElementById('tts-audio');
+    if (mainAudio && !mainAudio.paused && !mainAudio.ended) return;
+    const phrase = _FILLER_PHRASES[_fillerIdx % _FILLER_PHRASES.length];
+    _fillerIdx++;
+    const u = new SpeechSynthesisUtterance(phrase);
+    u.lang = 'cs-CZ';
+    u.rate = 1.05;
+    u.volume = 0.6;
+    // Vyber CZ hlas pokud existuje, jinak default.
+    const voices = window.speechSynthesis.getVoices();
+    const cs = voices.find(v => /^cs/i.test(v.lang));
+    if (cs) u.voice = cs;
+    window.speechSynthesis.cancel(); // zruš případné staré utterance
+    window.speechSynthesis.speak(u);
+  } catch {}
 }
 
 if (modeToggle) {

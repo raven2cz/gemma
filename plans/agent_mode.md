@@ -269,11 +269,19 @@ loop atomicky. Tool error nezastaví turn (loop pokračuje, model dostane chybu)
 
 ### Fáze 9 — Polish
 
-- [ ] Acoustic mode beep (krátký tón při hlasovém přepnutí mode).
-- [ ] Barge-in: během dlouhých tool exekucí uživatel může přerušit hlasem.
-- [ ] Audio filler („moment, hledám…") během tool exekucí > 2s.
-- [ ] Auto-degradace: po destruktivní akci na 5 min default = ASK (i pro
-      allowlist příkazy).
+- [x] Acoustic mode beep (Web Audio API tón při toggleMode — agent=880Hz, chat=440Hz).
+- [ ] ~~Barge-in: během dlouhých tool exekucí uživatel může přerušit hlasem.~~
+      **DEFERRED** — whisper.cpp je CUDA build a /api/transcribe volá `_unload_all_llms()`,
+      což by zabilo běžícího agenta. Akustický VAD by trpěl false-positives v
+      multi-user prostředí. CPU-only whisper-tiny by šel, ale není nutný — Stop
+      tlačítko + Space jsou dostatečný cancel mechanism. Refile do budoucí fáze
+      pokud vznikne reálná potřeba.
+- [x] Audio filler („moment, hledám…") — server emit `audio_filler` SSE event
+      po `AUDIO_FILLER_DELAY_SEC=2.0` sekundách tool execution, frontend přehraje
+      krátkou frázi přes prohlížečové `speechSynthesis` API (cs-CZ).
+- [x] Auto-degradace: 5 min po úspěšném `requires_explicit` approve se classifier
+      AUTO výsledky downgrade na ASK (per-workdir, monotonic-time-based, reset
+      přes `clear_degrade_state()` pro testy).
 
 ## 6. Finální rozhodnutí (user sign-off)
 

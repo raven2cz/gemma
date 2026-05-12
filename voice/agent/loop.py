@@ -20,6 +20,7 @@ Event typy (dict)::
     {"type": "approval_required", "approval_id": "ap_X", "tool_call_id": "tc_X",
      "tool": "...", "summary": "...", "risk": "low|medium|high",
      "requires_explicit": False, "args": {...}}
+    {"type": "audio_filler", "tool_call_id": "tc_X", "tool": "..."}  # Phase 9.3
     {"type": "tool_result", "id": "tc_X", "ok": True|False, "content": "..."}
     {"type": "agent_error", "msg": "..."}
     {"type": "agent_canceled"}
@@ -414,9 +415,20 @@ class AgentLoop:
                 error=err, t0=t0,
             )
             return
+        # Phase 9.3: Audio filler watchdog — pokud tool běží > AUDIO_FILLER_DELAY_SEC,
+        # emit `audio_filler` event aby frontend řekl „moment, hledám…". Spuštěno
+        # paraleln s tool.execute, kanselováno IHNED po návratu z execute (před
+        # finalize await chainem). Gemini iter-1 finding: cancel ve vnějším
+        # finally umožní race — finalize_tool_call (queue.put + audit shield)
+        # await-uje I/O, během kterého stihne filler.sleep vypršet a vyemitovat
+        # event AŽ PO tool_result.
+        filler_task = asyncio.create_task(
+            self._emit_audio_filler_after_delay(tcid, name)
+        )
         try:
             out = await asyncio.wait_for(tool.execute(args, ctx), timeout=remaining)
         except asyncio.TimeoutError:
+            filler_task.cancel()
             err = f"wall-time {config.MAX_WALL_TIME_SEC}s exceeded during tool"
             await self._finalize_tool_call(
                 tcid=tcid, name=name, args=args, perm=perm,
@@ -426,6 +438,7 @@ class AgentLoop:
             )
             return
         except asyncio.CancelledError:
+            filler_task.cancel()
             # Tool byl approved (jinak by sem nedošlo) a possibly partially
             # executed. Best-effort audit s ok=False, error="cancelled".
             self._audit_cancellation_fire_and_forget(
@@ -434,6 +447,7 @@ class AgentLoop:
             )
             raise
         except Exception as e:
+            filler_task.cancel()
             log.exception("tool %s failed", name)
             err = f"{type(e).__name__}: {e}"
             await self._finalize_tool_call(
@@ -443,6 +457,8 @@ class AgentLoop:
                 error=err, t0=t0,
             )
             return
+        # Happy path: nejdřív zruš watchdog (žádný další await mezi nimi).
+        filler_task.cancel()
 
         if isinstance(out, str):
             content = out
@@ -471,6 +487,26 @@ class AgentLoop:
             approval=approval_outcome, ok=True,
             content=content, error=None, t0=t0,
         )
+
+    async def _emit_audio_filler_after_delay(self, tcid: str, name: str) -> None:
+        """Phase 9.3: Po `AUDIO_FILLER_DELAY_SEC` emit jeden `audio_filler` event.
+        Pokud delay=0 nebo task je cancelled předtím, neemituje nic.
+        Helper neraise-uje (nesmí zabít hlavní loop)."""
+        delay = config.AUDIO_FILLER_DELAY_SEC
+        if delay <= 0:
+            return
+        try:
+            await asyncio.sleep(delay)
+            await self._out_queue.put({
+                "type": "audio_filler",
+                "tool_call_id": tcid,
+                "tool": name,
+            })
+        except asyncio.CancelledError:
+            # Tool skončil rychleji než delay — žádný filler ani nemá vyjít.
+            raise
+        except Exception:
+            log.exception("audio_filler emit failed (tcid=%s, tool=%s)", tcid, name)
 
     def _audit_cancellation_fire_and_forget(
         self,

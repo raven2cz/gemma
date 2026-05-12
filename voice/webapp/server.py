@@ -1775,6 +1775,15 @@ async def turn_approval(tid: str, aid: str, req: Request):
                 f"destructive approval requires phrase '{DESTRUCTIVE_APPROVAL_PHRASE}'",
             )
 
+    # Auto-degradace (Fáze 9.4): úspěšný destruktivní approve překlopí budoucí
+    # AUTO classifier decisions na ASK pro dobu AUTO_DEGRADE_AFTER_DESTRUCTIVE_SEC.
+    # Provádíme JEN při approve (deny nemá co degradovat). Mark BEFORE set_result
+    # aby žádný čekající tool call nezačal v nedegradovaném stavu.
+    if decision == "approve" and pending.get("requires_explicit"):
+        from voice.agent.config import WORKDIR
+        from voice.agent.permissions import mark_destructive_approval
+        mark_destructive_approval(WORKDIR)
+
     fut.set_result(decision == "approve")
     log.info("turn %s: approval %s -> %s (tool=%s, risk=%s)",
              tid, aid, decision, pending.get("tool"), pending.get("risk"))
