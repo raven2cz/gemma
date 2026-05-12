@@ -661,3 +661,61 @@ def test_web_search_deny_invalid(tmp_path: Path, args: dict, reason_kw: str):
     assert r.decision == Decision.DENY, f"{args}: got {r.decision}"
     if reason_kw:
         assert reason_kw.lower() in r.reason.lower(), f"{args}: reason={r.reason}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Hue smart-home classifiers (light_list, light_set)
+# ---------------------------------------------------------------------------
+
+
+def test_light_list_auto(tmp_path: Path):
+    r = decide("light_list", {}, tmp_path)
+    assert r.decision == Decision.AUTO
+    assert r.risk == "low"
+    assert r.requires_explicit is False
+    assert "light_list" in r.summary
+
+
+@pytest.mark.parametrize("args", [
+    {"name": "obývák", "on": True},
+    {"name": "Lampa", "on": False},
+    {"name": "Kuchyň", "brightness": 50},
+    {"name": "L", "brightness": 0},
+    {"name": "L", "brightness": 100},
+    {"name": "L", "color_name": "warm"},
+    {"name": "L", "color_name": "RED"},  # case-insensitive
+    {"name": "L", "on": True, "brightness": 80, "color_name": "blue"},
+])
+def test_light_set_auto(tmp_path: Path, args: dict):
+    r = decide("light_set", args, tmp_path)
+    assert r.decision == Decision.AUTO, f"{args}: got {r.decision} ({r.reason})"
+    assert r.risk == "low"
+    assert r.requires_explicit is False
+
+
+@pytest.mark.parametrize("args,reason_kw", [
+    ({}, "name"),
+    ({"name": ""}, "name"),
+    ({"name": "   "}, "name"),
+    ({"name": "x" * 200, "on": True}, "long"),
+    ({"name": "L"}, "at least one"),  # no change specified
+    ({"name": "L", "on": "yes"}, "boolean"),
+    ({"name": "L", "on": 1}, "boolean"),
+    ({"name": "L", "brightness": "high"}, "number"),
+    ({"name": "L", "brightness": 150}, "range"),
+    ({"name": "L", "brightness": -1}, "range"),
+    ({"name": "L", "brightness": float("nan")}, "finite"),
+    ({"name": "L", "brightness": float("inf")}, "finite"),
+    ({"name": "L", "brightness": float("-inf")}, "finite"),
+    ({"name": "L", "brightness": True}, "bool"),
+    ({"name": "L", "brightness": False}, "bool"),
+    ({"name": "L\x00null", "on": True}, "control"),
+    ({"name": "L\nfoo", "on": True}, "control"),
+    ({"name": "L\x7fdel", "on": True}, "control"),
+    ({"name": "L", "color_name": "puce"}, "color_name"),
+    ({"name": "L", "color_name": "strobe"}, "color_name"),
+])
+def test_light_set_deny(tmp_path: Path, args: dict, reason_kw: str):
+    r = decide("light_set", args, tmp_path)
+    assert r.decision == Decision.DENY, f"{args}: got {r.decision} ({r.reason})"
+    assert reason_kw.lower() in r.reason.lower(), f"{args}: reason={r.reason}"

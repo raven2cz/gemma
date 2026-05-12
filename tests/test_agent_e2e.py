@@ -1163,3 +1163,139 @@ async def test_e2e_agent_web_search_empty_query_denied(client):
             events = await _stream_ndjson(r)
     trs = [e for e in events if e["type"] == "tool_result"]
     assert any(t["ok"] is False for t in trs)
+
+
+# ----------------------------------------------------------------------
+# Phase 5: Hue tooly (light_list, light_set)
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_light_list_auto(client):
+    """Agent calls light_list → AUTO, returns lights summary, no approval."""
+    from voice.agent.tools import hue as hue_mod
+
+    async def fake_list(args, ctx):
+        return {
+            "ok": True,
+            "count": 2,
+            "lights": [
+                {"id": "id1", "name": "Obývák", "archetype": "ceiling_round",
+                 "on": True, "brightness": 80.0, "color_xy": [0.4, 0.4]},
+                {"id": "id2", "name": "Kuchyň", "archetype": "bulb",
+                 "on": False, "brightness": 10.0, "color_xy": None},
+            ],
+            "duration_ms": 8,
+        }
+
+    _orig, restore = _swap_tool_execute(hue_mod.LIGHT_LIST_TOOL, fake_list)
+    try:
+        script = [
+            [_mk_lines(
+                tool_calls=[{"function": {"name": "light_list", "arguments": {}}}],
+                done=True,
+            )],
+            [_mk_lines(content="Mám seznam."), _mk_lines(done=True)],
+        ]
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "vypiš světla"}],
+                "want_tts": False,
+            }
+            async with client.stream("POST", "/api/turn", json=payload) as r:
+                events = await _stream_ndjson(r)
+
+        types = [e["type"] for e in events]
+        assert "tool_call" in types
+        assert "tool_result" in types
+        assert "approval_required" not in types
+        tc = next(e for e in events if e["type"] == "tool_call")
+        assert tc["name"] == "light_list"
+        tr = next(e for e in events if e["type"] == "tool_result")
+        assert tr["ok"] is True
+        out = json.loads(tr["content"])
+        assert out["ok"] is True
+        assert out["count"] == 2
+        assert out["lights"][0]["name"] == "Obývák"
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_light_set_auto(client):
+    """Agent calls light_set with valid args → AUTO, no approval, success."""
+    from voice.agent.tools import hue as hue_mod
+
+    captured = {}
+
+    async def fake_set(args, ctx):
+        captured["args"] = args
+        return {
+            "ok": True,
+            "light_id": "idX",
+            "name": args["name"],
+            "applied": ["on", "dimming"],
+            "duration_ms": 12,
+        }
+
+    _orig, restore = _swap_tool_execute(hue_mod.LIGHT_SET_TOOL, fake_set)
+    try:
+        script = [
+            [_mk_lines(
+                tool_calls=[{"function": {"name": "light_set",
+                                          "arguments": {"name": "obývák", "on": True, "brightness": 75}}}],
+                done=True,
+            )],
+            [_mk_lines(content="Rozsvíceno."), _mk_lines(done=True)],
+        ]
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "rozsviť obývák"}],
+                "want_tts": False,
+            }
+            async with client.stream("POST", "/api/turn", json=payload) as r:
+                events = await _stream_ndjson(r)
+
+        types = [e["type"] for e in events]
+        assert "approval_required" not in types
+        tc = next(e for e in events if e["type"] == "tool_call")
+        assert tc["name"] == "light_set"
+        tr = next(e for e in events if e["type"] == "tool_result")
+        assert tr["ok"] is True
+        out = json.loads(tr["content"])
+        assert out["ok"] is True
+        assert out["light_id"] == "idX"
+        assert captured["args"]["name"] == "obývák"
+        assert captured["args"]["brightness"] == 75
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_light_set_invalid_color_denied(client):
+    """Unknown color_name → classifier DENY, no execute."""
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "light_set",
+                                      "arguments": {"name": "x", "color_name": "puce"}}}],
+            done=True,
+        )],
+        [_mk_lines(content="ne"), _mk_lines(done=True)],
+    ]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "?"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            events = await _stream_ndjson(r)
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert any(t["ok"] is False for t in trs)
+    types = [e["type"] for e in events]
+    assert "approval_required" not in types

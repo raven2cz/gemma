@@ -224,6 +224,58 @@ WEB_SEARCH_TIMEOUT_SEC: float = float(os.environ.get("AGENT_SEARCH_TIMEOUT_SEC",
 BRAVE_SEARCH_ENDPOINT: str = "https://api.search.brave.com/res/v1/web/search"
 
 
+# Philips Hue / OpenHue (fáze 5)
+# `light_list` + `light_set` volají přímo Hue Bridge API v2 přes HTTPS.
+# Bridge IP + application key jsou v `~/.openhue/config.yaml` (vytvořeno
+# příkazem `openhue setup`). Loader níže to čte a vrátí ("", "") pokud chybí.
+HUE_CONFIG_FILE: str = os.environ.get(
+    "HUE_CONFIG_FILE", str(Path.home() / ".openhue" / "config.yaml"),
+)
+HUE_TIMEOUT_SEC: float = float(os.environ.get("AGENT_HUE_TIMEOUT_SEC", "8"))
+HUE_OUTPUT_CAP_BYTES: int = int(os.environ.get("AGENT_HUE_OUTPUT_CAP_BYTES", str(512 * 1024)))
+
+
+def _load_hue_config() -> tuple[str, str]:
+    """Načte (bridge_ip, app_key) z ~/.openhue/config.yaml.
+    Vrátí ("", "") pokud konfigurace chybí nebo má špatná oprávnění.
+
+    Formát:
+        bridge: 192.168.x.x
+        key: <40-char application key>
+
+    Bridge IP musí být literal IPv4/IPv6 a privátní (defense — `_validate_url`
+    by jinak vyžadoval public IP; tady cíleně cílíme local network).
+    """
+    p = Path(HUE_CONFIG_FILE)
+    try:
+        st = p.stat()
+    except (FileNotFoundError, PermissionError, OSError):
+        return "", ""
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode):
+        return "", ""
+    # Nedáváme nutně 0600, protože openhue CLI ho píše s default umask.
+    # Ale jakákoli world-write je no-go (cizí proces by mohl změnit klíč).
+    if st.st_mode & 0o002:
+        return "", ""
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return "", ""
+    bridge = ""
+    key = ""
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("bridge:"):
+            bridge = line.split(":", 1)[1].strip()
+        elif line.startswith("key:"):
+            key = line.split(":", 1)[1].strip()
+    return bridge, key
+
+
+HUE_BRIDGE_IP, HUE_APP_KEY = _load_hue_config()
+
+
 # Voice approval — destruktivní akce vyžadují explicit „ano povoluju".
 DESTRUCTIVE_APPROVAL_PHRASE: str = "ano povoluju"
 APPROVE_PHRASES: tuple[str, ...] = ("ano", "jo", "ok", "okej", "okay", "povol", "povoluju", "jasně", "jasne", "fajn", "yes")

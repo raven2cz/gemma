@@ -807,6 +807,141 @@ def _cls_fetch_url(args: dict, workdir: Path) -> PermissionResult:
     )
 
 
+# ----------------------------------------------------------------------
+# Phase 5: Philips Hue smart-home tools (light_list, light_set)
+# ----------------------------------------------------------------------
+
+
+@register_classifier("light_list")
+def _cls_light_list(args: dict, workdir: Path) -> PermissionResult:
+    """light_list — AUTO. Read-only GET na local Hue Bridge.
+
+    Bridge IP a app key jsou load-time fixed v config.py (LLM nekontroluje target).
+    Žádný FS side effect, žádná persistent change.
+    """
+    return PermissionResult(
+        decision=Decision.AUTO,
+        reason="read-only Hue lights list (local network, config-fixed bridge)",
+        summary="light_list",
+        risk="low",
+    )
+
+
+@register_classifier("light_set")
+def _cls_light_set(args: dict, workdir: Path) -> PermissionResult:
+    """light_set(name, on?, brightness?, color_name?) — AUTO low.
+
+    Změna stavu světla je reverzibilní (user může jen vypnout/rozsvítit zpět).
+    LLM kontroluje jen name (mapped na resource ID via Hue), bool on, brightness
+    integer (validated 0..100), color_name (validated proti fixed paletě).
+    Bridge URL je hard-coded z config — žádná URL injection.
+    Žádný credentials log, žádný FS side effect.
+    """
+    name = str(args.get("name", "")).strip()
+    if not name:
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason="empty name",
+            summary="light_set: prázdné jméno",
+            risk="high",
+        )
+    if len(name) > 80:
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason="name too long",
+            summary="light_set: jméno příliš dlouhé",
+            risk="high",
+        )
+    # Reject control chars / newlines (could confuse log readers or
+    # log-injection downstream — defense in depth).
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in name):
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason="name contains control characters",
+            summary="light_set: jméno obsahuje řídicí znaky",
+            risk="high",
+        )
+    # Validate types early (defense in depth — exec re-validates).
+    on_arg = args.get("on", None)
+    if on_arg is not None and not isinstance(on_arg, bool):
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason="on must be boolean",
+            summary="light_set: on musí být bool",
+            risk="high",
+        )
+    br_arg = args.get("brightness", None)
+    if br_arg is not None:
+        # bool is subclass of int — `True/False` would coerce to 1.0/0.0 and
+        # silently pass; reject explicitly so user must pick the right field.
+        if isinstance(br_arg, bool):
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason="brightness must be number, not bool",
+                summary="light_set: brightness není číslo",
+                risk="high",
+            )
+        try:
+            br = float(br_arg)
+        except (TypeError, ValueError):
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason="brightness must be number",
+                summary="light_set: brightness není číslo",
+                risk="high",
+            )
+        # NaN/inf bypass: `nan < 0` and `nan > 100` both False → bypass.
+        # math.isfinite excludes NaN, +inf, -inf.
+        import math as _math
+        if not _math.isfinite(br):
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason="brightness must be finite number",
+                summary="light_set: brightness není konečné",
+                risk="high",
+            )
+        if br < 0 or br > 100:
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason="brightness out of range 0..100",
+                summary="light_set: brightness mimo 0..100",
+                risk="high",
+            )
+    color_arg = args.get("color_name", None)
+    if color_arg is not None:
+        from voice.agent.tools.hue import COLOR_PALETTE
+        cname = str(color_arg).strip().lower()
+        if cname not in COLOR_PALETTE:
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason=f"unknown color_name {cname!r}",
+                summary=f"light_set: neznámá barva {cname!r}",
+                risk="high",
+            )
+    if on_arg is None and br_arg is None and color_arg is None:
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason="must specify at least one of: on, brightness, color_name",
+            summary="light_set: žádná změna",
+            risk="high",
+        )
+
+    parts = []
+    if on_arg is not None:
+        parts.append(f"on={on_arg}")
+    if br_arg is not None:
+        parts.append(f"bri={br_arg}")
+    if color_arg is not None:
+        parts.append(f"color={color_arg}")
+    short_name = name if len(name) <= 40 else name[:37] + "…"
+    return PermissionResult(
+        decision=Decision.AUTO,
+        reason="local hue light control",
+        summary=f"light_set {short_name}: {', '.join(parts)}",
+        risk="low",
+    )
+
+
 @register_classifier("web_search")
 def _cls_web_search(args: dict, workdir: Path) -> PermissionResult:
     """web_search(query, count?) — AUTO. Brave Search API call, no side effects."""
