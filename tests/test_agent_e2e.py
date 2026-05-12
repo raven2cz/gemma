@@ -1637,6 +1637,74 @@ async def test_e2e_audit_records_ask_denial(client, tmp_path):
         restore()
 
 
+def test_sanitize_history_canonicalizes_malformed_tool_args():
+    """Production bug: klient pošle assistant.tool_calls s truncated JSON v
+    arguments (např. uložené v localStorage z předchozí broken session).
+
+    Bez canonicalize: server propustil raw string → Ollama vrátila HTTP 400
+    `Value looks like object, but can't find closing '}' symbol` → turn padl.
+
+    Po fixu: `_sanitize_agent_history` musí args canonicalizovat na sentinel
+    JSON object, který je validní JSON pro Ollama a detekovatelný v loopu.
+    """
+    from voice.webapp.server import _sanitize_agent_history
+
+    history = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "tc_1", "type": "function",
+            "function": {"name": "run_bash", "arguments": '{"command": "rm -rf'},
+        }]},
+        {"role": "tool", "tool_call_id": "tc_1", "name": "run_bash",
+         "content": '{"ok":false}'},
+    ]
+    out = _sanitize_agent_history(history)
+    # Role pořadí zachováno
+    assert [m["role"] for m in out] == ["user", "assistant", "tool"]
+    # Arguments: validní JSON (sentinel), NE raw truncated string
+    args_str = out[1]["tool_calls"][0]["function"]["arguments"]
+    decoded = json.loads(args_str)  # MUSÍ být parsable — jinak Ollama 400
+    assert decoded["_parse_error"] == "invalid_json"
+    assert "raw_hash" in decoded  # forensic stopa zachována
+    # Žádný raw_preview — "rm -rf" command NESMÍ leaknout do history
+    assert "raw_preview" not in decoded
+    # Tool message zachována (klient přivedl už hotový párový výsledek)
+    assert out[2]["tool_call_id"] == "tc_1"
+
+
+def test_sanitize_history_canonicalizes_dict_args_to_string():
+    """Klient může poslat arguments jako dict (např. po restore z disku);
+    sanitize musí konvertovat na JSON string per Ollama spec."""
+    from voice.webapp.server import _sanitize_agent_history
+
+    history = [
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "tc_1", "type": "function",
+            "function": {"name": "echo", "arguments": {"text": "hi"}},
+        }]},
+        {"role": "tool", "tool_call_id": "tc_1", "name": "echo", "content": "{}"},
+    ]
+    out = _sanitize_agent_history(history)
+    args_str = out[0]["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(args_str, str)
+    assert json.loads(args_str) == {"text": "hi"}
+
+
+def test_sanitize_history_empty_args_become_empty_object():
+    """Arguments None / empty string → `{}` (per Ollama spec)."""
+    from voice.webapp.server import _sanitize_agent_history
+
+    history = [
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "tc_1", "type": "function",
+            "function": {"name": "echo", "arguments": None},
+        }]},
+        {"role": "tool", "tool_call_id": "tc_1", "name": "echo", "content": "{}"},
+    ]
+    out = _sanitize_agent_history(history)
+    assert out[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(20)
 async def test_e2e_audit_disabled_no_file_written(client, tmp_path):

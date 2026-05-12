@@ -581,3 +581,209 @@ async def test_loop_audio_filler_disabled_when_delay_zero(tmp_path: Path, monkey
         assert "audio_filler" not in types
     finally:
         perm._CLASSIFIERS.pop("slow2_unique_for_filler", None)
+
+
+# ─────────────────── Logging chyb (Ollama 400, agent_error propagace) ───────────────────
+
+
+class _FakeClient400:
+    """FakeClient, který vrátí non-200 status pro první request."""
+
+    def __init__(self, status_code: int, body: str = "model not found"):
+        self.status_code = status_code
+        self.body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def stream(self, method: str, url: str, json=None):  # noqa: ARG002
+        return _FakeStream([self.body], status_code=self.status_code)
+
+
+@pytest.mark.asyncio
+async def test_loop_ollama_400_logs_error(tmp_path: Path, caplog):
+    """Když Ollama vrátí 400, loop MUSÍ:
+    1. zalogovat ERROR s detaily (status, body, payload keys),
+    2. zalogovat ERROR „agent loop terminating",
+    3. emit agent_error event s informativní zprávou.
+    """
+    import logging
+    caplog.set_level(logging.WARNING, logger="agent-loop")
+
+    turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+    loop = AgentLoop(
+        model="test",
+        messages=[{"role": "user", "content": "test"}],
+        registry=default_registry("agent"),
+        turn_state=turn_state,
+        workdir=tmp_path,
+    )
+
+    with patch(
+        "voice.agent.loop.httpx.AsyncClient",
+        return_value=_FakeClient400(400, body='{"error":"invalid request"}'),
+    ):
+        events = [ev async for ev in loop.run()]
+
+    # Event: agent_error obsahuje status code i body
+    errs = [e for e in events if e["type"] == "agent_error"]
+    assert len(errs) == 1
+    assert "ollama 400" in errs[0]["msg"]
+    assert "invalid request" in errs[0]["msg"]
+
+    # Logging: ERROR pro non-200 i pro agent loop terminate
+    log_msgs = [r.getMessage() for r in caplog.records if r.name == "agent-loop"]
+    assert any("non-200" in m and "400" in m for m in log_msgs), \
+        f"missing non-200 log; got: {log_msgs}"
+    assert any("terminating with error" in m for m in log_msgs), \
+        f"missing terminating log; got: {log_msgs}"
+
+
+# ─────── Malformed tool_call arguments (production bug: Ollama 400 mid-turn) ───────
+
+
+@pytest.mark.asyncio
+async def test_loop_malformed_args_short_circuits_execution(tmp_path: Path):
+    """Model emituje truncated JSON v `arguments` (např. max_tokens uprostřed
+    `{"command":"rm -rf`).
+
+    Production bug repro: před fixem se raw string propagoval do history
+    a další Ollama round vrátil HTTP 400 `Value looks like object, but can't
+    find closing '}' symbol`.
+
+    Po fixu (defense in depth):
+    1. `normalize_tool_calls` přepíše arguments na sentinel JSON
+       (validní object → Ollama nevyhodí 400),
+    2. `_execute_one` detekuje sentinel přes `is_malformed_args` a tool
+       NESPUSTÍ (security: prevence schování destruktivních args za malformed JSON),
+    3. emit paired `tool_result` ok=False s `_parse_error` + `raw_hash`,
+    4. history obsahuje validní JSON arguments → další round projde.
+    """
+    # Echo tool by execute když bychom dostali args. Pokud test selže
+    # (short-circuit nefunguje), echo by vrátil `{"echoed":"","length":0}`
+    # místo error payloadu → assertion na _parse_error by failnula.
+    truncated = '{"text": "hi'  # uříznutý JSON object
+    scripts = [
+        [_ollama_line(
+            tool_calls=[{
+                "id": "tc_malformed",
+                "function": {"name": "echo", "arguments": truncated},
+            }],
+            done=True,
+        )],
+        # Druhý round: po malformed tool_result agent dokončí turn textem.
+        [_ollama_line(content="ok, malformed"), _ollama_line(done=True)],
+    ]
+
+    turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+    loop = AgentLoop(
+        model="test",
+        messages=[{"role": "user", "content": "go"}],
+        registry=default_registry("agent"),
+        turn_state=turn_state,
+        workdir=tmp_path,
+    )
+
+    with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+        events = [ev async for ev in loop.run()]
+
+    # tool_call event: args už jsou sentinel (NE empty {} a NE raw string)
+    tc_ev = next(e for e in events if e["type"] == "tool_call")
+    assert tc_ev["args"]["_parse_error"] == "invalid_json"
+    assert tc_ev["args"]["raw_length"] == len(truncated)
+    assert len(tc_ev["args"]["raw_hash"]) == 64
+    # Žádný raw_preview → "hi" string NESMÍ leaknout do eventu
+    assert "raw_preview" not in tc_ev["args"]
+
+    # tool_result: ok=False, payload obsahuje _parse_error
+    tr = next(e for e in events if e["type"] == "tool_result")
+    assert tr["ok"] is False
+    payload = json.loads(tr["content"])
+    assert payload["_parse_error"] == "invalid_json"
+    assert payload["raw_hash"] == tc_ev["args"]["raw_hash"]
+    assert "malformed" in payload["error"]
+
+    # History: assistant.tool_calls arguments MUSÍ být validní JSON
+    # (sentinel object), jinak by Ollama na další round vyhodila 400.
+    asst = next(m for m in loop.messages if m["role"] == "assistant" and "tool_calls" in m)
+    args_str = asst["tool_calls"][0]["function"]["arguments"]
+    decoded = json.loads(args_str)  # MUSÍ být parsable
+    assert decoded["_parse_error"] == "invalid_json"
+
+    # Tool message taky validní JSON (per spec).
+    tool_msg = next(m for m in loop.messages if m["role"] == "tool")
+    tool_payload = json.loads(tool_msg["content"])
+    assert tool_payload["ok"] is False
+
+    # Turn úspěšně doběhl — final text z druhého round, žádný agent_error
+    types = [e["type"] for e in events]
+    assert types[-1] == "agent_done"
+    text = "".join(e["delta"] for e in events if e["type"] == "text")
+    assert "ok, malformed" in text
+
+
+@pytest.mark.asyncio
+async def test_loop_malformed_args_does_not_execute_tool(tmp_path: Path):
+    """Security regression: tool s side effects NESMÍ proběhnout, když args
+    jsou malformed. Bez short-circuit by classifier viděl prázdné `{}` a
+    tool dostal defaults → destruktivní akce mimo audit.
+    """
+    from voice.agent import permissions as perm
+    from voice.agent.permissions import Decision, PermissionResult, register_classifier
+
+    executed_count = 0
+
+    async def _counting_exec(args, ctx):
+        nonlocal executed_count
+        executed_count += 1
+        return {"ran": True}
+
+    counting = Tool(
+        name="counting_destructive_unique",
+        description="counter",
+        parameters_schema={"type": "object", "properties": {}},
+        execute=_counting_exec,
+    )
+    reg = ToolRegistry()
+    reg.register(counting)
+
+    @register_classifier("counting_destructive_unique")
+    def _cls(args, workdir):
+        # AUTO — kdyby short-circuit selhal, tool by se spustil bez ptaní.
+        return PermissionResult(
+            decision=Decision.AUTO, reason="t", summary="t", risk="low",
+            requires_explicit=False,
+        )
+
+    try:
+        scripts = [
+            [_ollama_line(
+                tool_calls=[{
+                    "id": "tc_x",
+                    "function": {
+                        "name": "counting_destructive_unique",
+                        "arguments": '{"path": "/tmp/x',  # truncated
+                    },
+                }],
+                done=True,
+            )],
+            [_ollama_line(content="done"), _ollama_line(done=True)],
+        ]
+        turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+        loop = AgentLoop(
+            model="test", messages=[{"role": "user", "content": "go"}],
+            registry=reg, turn_state=turn_state, workdir=tmp_path,
+        )
+        with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+            events = [ev async for ev in loop.run()]
+
+        # Tool nebyl spuštěn — short-circuit zafungoval PŘED classifier i execute
+        assert executed_count == 0
+        tr = next(e for e in events if e["type"] == "tool_result")
+        assert tr["ok"] is False
+        assert json.loads(tr["content"])["_parse_error"] == "invalid_json"
+    finally:
+        perm._CLASSIFIERS.pop("counting_destructive_unique", None)

@@ -44,6 +44,7 @@ from voice.agent import config
 from voice.agent.audit import AuditLog
 from voice.agent.messages import (
     assistant_message,
+    is_malformed_args,
     normalize_tool_calls,
     parse_tool_args,
     tool_message,
@@ -125,6 +126,10 @@ class AgentLoop:
                 async with c.stream("POST", f"{OLLAMA}/api/chat", json=payload) as r:
                     if r.status_code != 200:
                         body = (await r.aread()).decode(errors="ignore")[:500]
+                        log.error(
+                            "ollama /api/chat non-200: status=%d body=%s payload_keys=%s msgs=%d",
+                            r.status_code, body, sorted(payload.keys()), len(payload.get("messages", [])),
+                        )
                         return text, tool_calls, f"ollama {r.status_code}: {body}"
                     async for line in r.aiter_lines():
                         if self._canceled():
@@ -146,6 +151,17 @@ class AgentLoop:
                             await self._emit_text(tok)
                         tc = msg.get("tool_calls") or []
                         if tc:
+                            # Ollama native /api/chat emituje tool_calls až v
+                            # done-chunku jako kompletní pole (žádné partial
+                            # arguments deltas). Pokud by se to v budoucí
+                            # verzi Ollama změnilo na OpenAI-style streaming
+                            # s delta accumulationem, normalize_tool_calls
+                            # zachová last-write-wins per id — což je bezpečné
+                            # pro duplikáty, ale ztratí prefix u true deltas.
+                            # Canonicalize + sentinel + short-circuit v
+                            # `_execute_one` zajistí, že malformed partial
+                            # NIKDY nezpůsobí Ollama 400 ani spuštění toolu
+                            # s incomplete args.
                             tool_calls.extend(tc)
                         if obj.get("done"):
                             break
@@ -188,6 +204,7 @@ class AgentLoop:
 
                     text, raw_tcs, err = await self._stream_model_turn()
                     if err is not None:
+                        log.error("agent loop terminating with error: %s", err)
                         await self._out_queue.put({"type": "agent_error", "msg": err})
                         return
                     if self._canceled():
@@ -311,6 +328,40 @@ class AgentLoop:
         )
 
         t0 = time.monotonic()
+
+        # Bezpečnostní short-circuit: model vygeneroval malformed JSON v
+        # arguments (typicky uříznutý EOS/max_tokens uprostřed `{...}`).
+        # `parse_tool_args` vrací sentinel s `_parse_error` místo prázdného
+        # `{}` (security fix: bez tohoto by classifier viděl prázdné args
+        # a model mohl schovat malicious destruktivní obsah za malformed JSON).
+        # Tool NESPOUŠTÍME, ani neposíláme do permission classifieru —
+        # rovnou emit paired tool_result s ok=False a audit zápisem.
+        if is_malformed_args(args):
+            reason = args.get("_parse_error", "invalid")
+            err = f"malformed tool_call arguments: {reason}"
+            log.warning(
+                "tool %s rejected: malformed args (%s), raw_hash=%s",
+                name, reason, args.get("raw_hash", "")[:16],
+            )
+            malformed_perm = PermissionResult(
+                decision=Decision.DENY,
+                risk="high",
+                reason=err,
+                summary=f"{name}: malformed args (no execution)",
+                requires_explicit=False,
+            )
+            await self._finalize_tool_call(
+                tcid=tcid, name=name, args=args, perm=malformed_perm,
+                approval=None, ok=False,
+                content=json.dumps(
+                    {"ok": False, "error": err, "_parse_error": reason,
+                     "raw_hash": args.get("raw_hash", "")},
+                    ensure_ascii=False,
+                ),
+                error=err, t0=t0,
+            )
+            return
+
         perm = decide(name, args, self.workdir)
         approved: bool
         approval_outcome: str | None  # "approved" | "denied" | None (= nebylo soliciováno)

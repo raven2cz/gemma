@@ -1110,7 +1110,15 @@ def _sanitize_agent_history(messages: list[dict]) -> list[dict]:
       `tool` (= nedořešené tooly z dřívějšího cancelu = může vést ke špatnému
       kontextu, ale nevadí pro bezpečnost; necháváme).
     - Drop neznámé role (`function`, `developer`, atd.).
+
+    Bezpečnostně kritické: `tool_call.function.arguments` se MUSÍ canonicalizovat
+    přes `canonicalize_arguments` — klient může poslat truncated/malformed JSON
+    string (přímé editace localStorage, nebo restored history s historickým
+    bugem). Bez canonicalize by Ollama na další round vrátila HTTP 400
+    `Value looks like object, but can't find closing '}' symbol`.
     """
+    from voice.agent.messages import canonicalize_arguments
+
     valid_roles = {"user", "assistant", "tool"}
     out: list[dict] = []
     pending_ids: set[str] = set()  # tool_call_ids z poslední assistant zprávy
@@ -1134,13 +1142,7 @@ def _sanitize_agent_history(messages: list[dict]) -> list[dict]:
                     tcid = tc.get("id")
                     if not name or not isinstance(tcid, str) or not tcid:
                         continue
-                    args = fn.get("arguments")
-                    if isinstance(args, dict):
-                        args_str = json.dumps(args, ensure_ascii=False)
-                    elif isinstance(args, str):
-                        args_str = args
-                    else:
-                        args_str = "{}"
+                    args_str = canonicalize_arguments(fn.get("arguments"))
                     clean_tcs.append({
                         "id": tcid,
                         "type": "function",
@@ -1268,6 +1270,11 @@ async def _run_agent_turn(
             async for ev in agent.run():
                 if turn_state["canceled"]:
                     break
+                # Forensic stopa: jakékoli `agent_error` z loopu zaloguj jako
+                # ERROR. Bez tohoto by chyba existovala jen v transient NDJSON
+                # streamu (UI toast 6s → user nestihne) a do log souboru nic.
+                if isinstance(ev, dict) and ev.get("type") == "agent_error":
+                    log.error("turn %s: agent_error event: %s", tid, ev.get("msg"))
                 await out_queue.put(ev)
         except asyncio.CancelledError:
             raise
