@@ -1412,3 +1412,90 @@ async def test_e2e_agent_ask_claude_empty_prompt_denied(client):
     assert "approval_required" not in types
     trs = [e for e in events if e["type"] == "tool_result"]
     assert any(t["ok"] is False for t in trs)
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: Pre-flight router (router_decision event emitted at turn start)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_router_decision_local_default(client):
+    """Defaultní user message (žádný marker) → router_decision local/high."""
+    script = [[_mk_lines(content="ahoj"), _mk_lines(done=True)]]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "ahoj jak se máš"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            events = await _stream_ndjson(r)
+    rd = [e for e in events if e["type"] == "router_decision"]
+    assert len(rd) == 1, f"got {[e['type'] for e in events]}"
+    assert rd[0]["target"] == "local"
+    assert rd[0]["confidence"] == "high"
+    # Event musí přijít před prvním text/tool_call eventem.
+    types = [e["type"] for e in events]
+    rd_idx = types.index("router_decision")
+    assert types[:rd_idx] == ["user_lang"], f"types: {types}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_router_decision_explicit_claude(client):
+    """Explicit @claude marker → router_decision claude/high."""
+    script = [[_mk_lines(content="ok"), _mk_lines(done=True)]]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "@claude vysvětli tohle"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            events = await _stream_ndjson(r)
+    rd = next(e for e in events if e["type"] == "router_decision")
+    assert rd["target"] == "claude"
+    assert rd["confidence"] == "high"
+    assert "explicit" in rd["reason"].lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_router_decision_smart_home_local(client):
+    """Smart-home command → router_decision local/high (fast-path)."""
+    script = [[_mk_lines(content="ok"), _mk_lines(done=True)]]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "Rozsviť obývák"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            events = await _stream_ndjson(r)
+    rd = next(e for e in events if e["type"] == "router_decision")
+    assert rd["target"] == "local"
+    assert rd["confidence"] == "high"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_router_does_not_swap_runtime_model(client):
+    """Router je observability-only — i pro claude target zůstane runtime Ollama
+    (ověřit tím, že agent loop dokončí přes mock Ollama script)."""
+    script = [[_mk_lines(content="answer"), _mk_lines(done=True)]]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "@claude review this"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            events = await _stream_ndjson(r)
+    types = [e["type"] for e in events]
+    # Stream proběhl normálně, došel k 'done' = mock Ollama byl zavolán
+    assert "done" in types
+    # router_decision target claude, ale stream pokračoval lokálně
+    rd = next(e for e in events if e["type"] == "router_decision")
+    assert rd["target"] == "claude"

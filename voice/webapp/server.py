@@ -1247,6 +1247,17 @@ async def _run_agent_turn(
     async def driver() -> None:
         try:
             await out_queue.put({"type": "user_lang", "lang": user_lang})
+            # Phase 7: pre-flight heuristic router — observability only,
+            # runtime stále jede přes Ollama. Decision: foundation pro
+            # budoucí model-swap + Phase 8 audit log.
+            from voice.agent.router import decide_route
+            route = decide_route(messages)
+            await out_queue.put({
+                "type": "router_decision",
+                "target": route.target,
+                "reason": route.reason,
+                "confidence": route.confidence,
+            })
             async for ev in agent.run():
                 if turn_state["canceled"]:
                     break
