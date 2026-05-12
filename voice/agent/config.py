@@ -160,8 +160,46 @@ MAX_TOOL_CALLS_PER_TURN: int = int(os.environ.get("AGENT_MAX_TOOL_CALLS", "32"))
 
 
 # Claude bridge (fáze 6)
+# `ask_claude` tool deleguje na Anthropic Messages API.
+# Klíč: env `ANTHROPIC_API_KEY` → fallback soubor `~/.anthropic-api-key` (0600).
 CLAUDE_DEFAULT_MODEL: str = os.environ.get("AGENT_CLAUDE_MODEL", "claude-opus-4-7")
-CLAUDE_UNRESTRICTED: bool = os.environ.get("AGENT_CLAUDE_UNRESTRICTED", "0") == "1"
+CLAUDE_API_ENDPOINT: str = "https://api.anthropic.com/v1/messages"
+CLAUDE_API_VERSION: str = "2023-06-01"
+CLAUDE_TIMEOUT_SEC: float = float(os.environ.get("AGENT_CLAUDE_TIMEOUT_SEC", "60"))
+CLAUDE_MAX_TOKENS_DEFAULT: int = int(os.environ.get("AGENT_CLAUDE_MAX_TOKENS", "1024"))
+CLAUDE_MAX_TOKENS_LIMIT: int = int(os.environ.get("AGENT_CLAUDE_MAX_TOKENS_LIMIT", "4096"))
+CLAUDE_MAX_PROMPT_BYTES: int = int(os.environ.get("AGENT_CLAUDE_MAX_PROMPT_BYTES", str(64 * 1024)))
+CLAUDE_MAX_SYSTEM_BYTES: int = int(os.environ.get("AGENT_CLAUDE_MAX_SYSTEM_BYTES", str(16 * 1024)))
+CLAUDE_OUTPUT_CAP_BYTES: int = int(os.environ.get("AGENT_CLAUDE_OUTPUT_CAP_BYTES", str(256 * 1024)))
+
+ANTHROPIC_API_KEY_FILE: str = os.environ.get(
+    "ANTHROPIC_API_KEY_FILE", str(Path.home() / ".anthropic-api-key"),
+)
+
+
+def _load_anthropic_key() -> str:
+    """env first, pak soubor s 0600 ověřením. Tichý fallback na ''."""
+    env = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if env:
+        return env
+    p = Path(ANTHROPIC_API_KEY_FILE)
+    try:
+        st = p.stat()
+    except (FileNotFoundError, PermissionError, OSError):
+        return ""
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode):
+        return ""
+    # World/group readable → odmítnout (secret nesmí být group/other readable).
+    if st.st_mode & 0o077:
+        return ""
+    try:
+        return p.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+ANTHROPIC_API_KEY: str = _load_anthropic_key()
 
 
 # Brave Search (fáze 4)

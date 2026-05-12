@@ -5,6 +5,7 @@ zvolený `mode` (chat: jen skills; agent: vše)."""
 from __future__ import annotations
 
 from voice.agent.tools.base import Tool, ToolRegistry
+from voice.agent.tools import claude as _claude_mod
 from voice.agent.tools import echo as _echo_mod
 from voice.agent.tools import fs as _fs_mod
 from voice.agent.tools import hue as _hue_mod
@@ -25,6 +26,9 @@ def default_registry(mode: str = "agent") -> ToolRegistry:
         reg.register(tool)
     # Phase 5: Philips Hue smart-home tooly (light_list, light_set).
     for tool in _hue_mod.ALL_TOOLS:
+        reg.register(tool)
+    # Phase 6: Claude bridge (ask_claude).
+    for tool in _claude_mod.ALL_TOOLS:
         reg.register(tool)
     return reg
 

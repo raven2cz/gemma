@@ -719,3 +719,45 @@ def test_light_set_deny(tmp_path: Path, args: dict, reason_kw: str):
     r = decide("light_set", args, tmp_path)
     assert r.decision == Decision.DENY, f"{args}: got {r.decision} ({r.reason})"
     assert reason_kw.lower() in r.reason.lower(), f"{args}: reason={r.reason}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: ask_claude classifier
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("args", [
+    {"prompt": "Hello"},
+    {"prompt": "Compare these two approaches", "system": "You are a senior engineer."},
+    {"prompt": "Q", "max_tokens": 100},
+    {"prompt": "Q", "max_tokens": 4096},
+    {"prompt": "Q", "system": "S", "max_tokens": 256},
+])
+def test_ask_claude_ask(tmp_path: Path, args: dict):
+    r = decide("ask_claude", args, tmp_path)
+    assert r.decision == Decision.ASK, f"{args}: got {r.decision} ({r.reason})"
+    assert r.risk == "medium"
+    assert r.requires_explicit is False
+    assert "ask_claude" in r.summary
+
+
+@pytest.mark.parametrize("args,reason_kw", [
+    ({}, "string"),
+    ({"prompt": None}, "string"),
+    ({"prompt": 123}, "string"),
+    ({"prompt": ""}, "empty"),
+    ({"prompt": "   "}, "empty"),
+    ({"prompt": "x" * 200000}, "too large"),
+    ({"prompt": "ok", "system": 42}, "system must be string"),
+    ({"prompt": "ok", "system": "x" * 100000}, "system too large"),
+    ({"prompt": "ok", "max_tokens": "abc"}, "integer"),
+    ({"prompt": "ok", "max_tokens": True}, "bool"),
+    ({"prompt": "ok", "max_tokens": False}, "bool"),
+    ({"prompt": "ok", "max_tokens": 0}, "range"),
+    ({"prompt": "ok", "max_tokens": -1}, "range"),
+    ({"prompt": "ok", "max_tokens": 999999}, "range"),
+])
+def test_ask_claude_deny(tmp_path: Path, args: dict, reason_kw: str):
+    r = decide("ask_claude", args, tmp_path)
+    assert r.decision == Decision.DENY, f"{args}: got {r.decision} ({r.reason})"
+    assert reason_kw.lower() in r.reason.lower(), f"{args}: reason={r.reason}"

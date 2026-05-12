@@ -987,3 +987,115 @@ def _cls_web_search(args: dict, workdir: Path) -> PermissionResult:
         summary=f'web_search: "{short}"',
         risk="low",
     )
+
+
+@register_classifier("ask_claude")
+def _cls_ask_claude(args: dict, workdir: Path) -> PermissionResult:
+    """ask_claude(prompt, system?, max_tokens?) — ASK medium.
+
+    Volá Anthropic Messages API (paid, external network). Defaultně přes
+    approval flow (ne AUTO), protože:
+      1) každý volání = cost
+      2) odesílá LLM-controlled obsah na třetí stranu
+      3) odpověď není FS/shell side-effect, ale ovlivní následující agent reasoning
+    """
+    from voice.agent.config import (
+        CLAUDE_MAX_PROMPT_BYTES,
+        CLAUDE_MAX_SYSTEM_BYTES,
+        CLAUDE_MAX_TOKENS_LIMIT,
+    )
+
+    prompt_arg = args.get("prompt", None)
+    if not isinstance(prompt_arg, str):
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason="prompt must be string",
+            summary="ask_claude: prompt není string",
+            risk="high",
+        )
+    prompt = prompt_arg.strip()
+    if not prompt:
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason="empty prompt",
+            summary="ask_claude: prázdný prompt",
+            risk="high",
+        )
+    # Byte size check (UTF-8) — defense proti gigantickému promptu = cost blow-up.
+    try:
+        prompt_bytes = len(prompt.encode("utf-8"))
+    except UnicodeEncodeError:
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason="prompt is not valid utf-8",
+            summary="ask_claude: prompt není UTF-8",
+            risk="high",
+        )
+    if prompt_bytes > CLAUDE_MAX_PROMPT_BYTES:
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason=f"prompt too large ({prompt_bytes} > {CLAUDE_MAX_PROMPT_BYTES} bytes)",
+            summary=f"ask_claude: prompt > {CLAUDE_MAX_PROMPT_BYTES // 1024} KiB",
+            risk="high",
+        )
+
+    system_arg = args.get("system", None)
+    if system_arg is not None:
+        if not isinstance(system_arg, str):
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason="system must be string",
+                summary="ask_claude: system není string",
+                risk="high",
+            )
+        try:
+            system_bytes = len(system_arg.encode("utf-8"))
+        except UnicodeEncodeError:
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason="system is not valid utf-8",
+                summary="ask_claude: system není UTF-8",
+                risk="high",
+            )
+        if system_bytes > CLAUDE_MAX_SYSTEM_BYTES:
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason=f"system too large ({system_bytes} > {CLAUDE_MAX_SYSTEM_BYTES} bytes)",
+                summary=f"ask_claude: system > {CLAUDE_MAX_SYSTEM_BYTES // 1024} KiB",
+                risk="high",
+            )
+
+    max_tokens_arg = args.get("max_tokens", None)
+    if max_tokens_arg is not None:
+        # bool je int subclass — odmítnout explicit, jinak True/False projde jako 1/0.
+        if isinstance(max_tokens_arg, bool):
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason="max_tokens must be int, not bool",
+                summary="ask_claude: max_tokens není int",
+                risk="high",
+            )
+        try:
+            max_tokens = int(max_tokens_arg)
+        except (TypeError, ValueError):
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason="max_tokens must be integer",
+                summary="ask_claude: max_tokens není int",
+                risk="high",
+            )
+        if max_tokens < 1 or max_tokens > CLAUDE_MAX_TOKENS_LIMIT:
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason=f"max_tokens out of range 1..{CLAUDE_MAX_TOKENS_LIMIT}",
+                summary=f"ask_claude: max_tokens mimo 1..{CLAUDE_MAX_TOKENS_LIMIT}",
+                risk="high",
+            )
+
+    short = prompt if len(prompt) <= 60 else prompt[:57] + "…"
+    return PermissionResult(
+        decision=Decision.ASK,
+        reason="external paid LLM call (Anthropic API)",
+        summary=f'ask_claude: "{short}"',
+        risk="medium",
+    )

@@ -1299,3 +1299,116 @@ async def test_e2e_agent_light_set_invalid_color_denied(client):
     assert any(t["ok"] is False for t in trs)
     types = [e["type"] for e in events]
     assert "approval_required" not in types
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Claude bridge tool (ask_claude)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_ask_claude_ask_then_approve(client):
+    """Agent calls ask_claude → ASK medium → user approves → tool runs."""
+    from voice.agent.tools import claude as claude_mod
+
+    captured = {}
+
+    async def fake_ask(args, ctx):
+        captured["args"] = args
+        return {
+            "ok": True,
+            "model": "claude-opus-4-7",
+            "text": "Tady je expert odpověď.",
+            "stop_reason": "end_turn",
+            "input_tokens": 12,
+            "output_tokens": 8,
+            "duration_ms": 500,
+        }
+
+    _orig, restore = _swap_tool_execute(claude_mod.ASK_CLAUDE_TOOL, fake_ask)
+    try:
+        script = [
+            [_mk_lines(
+                tool_calls=[{"function": {"name": "ask_claude",
+                                          "arguments": {"prompt": "Vysvětli vrz",
+                                                        "max_tokens": 256}}}],
+                done=True,
+            )],
+            [_mk_lines(content="Hotovo."), _mk_lines(done=True)],
+        ]
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "zeptej se Clauda"}],
+                "want_tts": False,
+            }
+
+            approved_event = asyncio.Event()
+            approval_id_holder: dict = {}
+            events: list[dict] = []
+            tid_holder: dict = {}
+
+            async def consume():
+                async with client.stream("POST", "/api/turn", json=payload) as r:
+                    assert r.status_code == 200
+                    tid_holder["tid"] = r.headers["x-turn-id"]
+                    async for line in r.aiter_lines():
+                        if not line.strip():
+                            continue
+                        ev = json.loads(line)
+                        events.append(ev)
+                        if ev["type"] == "approval_required":
+                            approval_id_holder["aid"] = ev["approval_id"]
+                            approved_event.set()
+
+            async def approver():
+                await approved_event.wait()
+                r = await client.post(
+                    f"/api/turn/{tid_holder['tid']}/approval/{approval_id_holder['aid']}",
+                    json={"decision": "approve"},
+                )
+                assert r.status_code == 200
+
+            await asyncio.gather(consume(), approver())
+
+            types = [e["type"] for e in events]
+            assert "approval_required" in types
+            assert "tool_result" in types
+            tc = next(e for e in events if e["type"] == "tool_call")
+            assert tc["name"] == "ask_claude"
+            tr = next(e for e in events if e["type"] == "tool_result")
+            assert tr["ok"] is True
+            out = json.loads(tr["content"])
+            assert out["ok"] is True
+            assert out["text"] == "Tady je expert odpověď."
+            assert captured["args"]["prompt"] == "Vysvětli vrz"
+            assert captured["args"]["max_tokens"] == 256
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_ask_claude_empty_prompt_denied(client):
+    """Empty prompt → classifier DENY → no execute, no approval."""
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "ask_claude",
+                                      "arguments": {"prompt": "   "}}}],
+            done=True,
+        )],
+        [_mk_lines(content="nevykonáno"), _mk_lines(done=True)],
+    ]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "?"}],
+            "want_tts": False,
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            events = await _stream_ndjson(r)
+    types = [e["type"] for e in events]
+    assert "approval_required" not in types
+    trs = [e for e in events if e["type"] == "tool_result"]
+    assert any(t["ok"] is False for t in trs)
