@@ -1112,9 +1112,10 @@ def _sanitize_agent_history(messages: list[dict]) -> list[dict]:
     - Drop neznámé role (`function`, `developer`, atd.).
 
     Bezpečnostně kritické: `tool_call.function.arguments` se MUSÍ canonicalizovat
-    přes `canonicalize_arguments` — klient může poslat truncated/malformed JSON
-    string (přímé editace localStorage, nebo restored history s historickým
-    bugem). Bez canonicalize by Ollama na další round vrátila HTTP 400
+    přes `canonicalize_arguments` na **dict** (object) — Ollama native `/api/chat`
+    chce arguments jako objekt, ne JSON string. Klient navíc může poslat
+    truncated/malformed data (přímé editace localStorage, nebo restored history
+    z bugged session). Bez canonicalize by Ollama vrátila HTTP 400
     `Value looks like object, but can't find closing '}' symbol`.
     """
     from voice.agent.messages import canonicalize_arguments
@@ -1137,16 +1138,20 @@ def _sanitize_agent_history(messages: list[dict]) -> list[dict]:
                 for tc in tcs:
                     if not isinstance(tc, dict):
                         continue
-                    fn = tc.get("function") or {}
-                    name = (fn.get("name") or "").strip()
+                    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    # `name` může být truthy non-string (`123`, `[]`) z forged
+                    # klientské history — `.strip()` by spadl. Vyžadujeme str.
+                    name_raw = fn.get("name")
+                    name = (name_raw if isinstance(name_raw, str) else "").strip()
                     tcid = tc.get("id")
                     if not name or not isinstance(tcid, str) or not tcid:
                         continue
-                    args_str = canonicalize_arguments(fn.get("arguments"))
+                    # arguments → dict (Ollama chce object, ne JSON string)
+                    args = canonicalize_arguments(fn.get("arguments"))
                     clean_tcs.append({
                         "id": tcid,
                         "type": "function",
-                        "function": {"name": name, "arguments": args_str},
+                        "function": {"name": name, "arguments": args},
                     })
                     pending_ids.add(tcid)
                 if clean_tcs:
@@ -1161,13 +1166,22 @@ def _sanitize_agent_history(messages: list[dict]) -> list[dict]:
             # Consume id — klient nemůže poslat 2× stejný tool výsledek za jedním
             # assistant.tool_calls (model by jinak viděl duplikát).
             pending_ids.discard(tcid)
+            # `name` může být truthy non-string z forged history — slice `[:64]`
+            # na int/list by spadl. Vyžadujeme str.
+            tool_name_raw = m.get("name")
+            tool_name = tool_name_raw[:64] if isinstance(tool_name_raw, str) else ""
             out.append({
                 "role": "tool",
                 "tool_call_id": tcid,
-                "name": (m.get("name") or "")[:64],
+                "name": tool_name,
                 "content": m.get("content") if isinstance(m.get("content"), str) else "",
             })
         else:  # user
+            # Reset pending_ids — `tool` zpráva musí následovat BEZPROSTŘEDNĚ
+            # po svém `assistant.tool_calls`. Sekvence assistant(tc_1) → user →
+            # tool(tc_1) je forged: bez resetu by tool proklouzl, i když mezi
+            # ním a párovým assistantem je user zpráva.
+            pending_ids = set()
             content = m.get("content")
             if not isinstance(content, str):
                 continue

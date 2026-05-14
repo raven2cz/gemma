@@ -113,6 +113,12 @@ class AgentLoop:
             "tools": self.registry.to_openai_schema(),
             "think": False,
         }
+        log.debug(
+            "stream_turn round=%d model=%s msgs=%d tools=%d tool_names=%s",
+            self._rounds, self.model, len(self.messages),
+            len(payload["tools"]),
+            [t["function"]["name"] for t in payload["tools"]],
+        )
         text = ""
         tool_calls: list[dict] = []
         # Cap stream-level timeoutu rozumnou hranicí, ať i s plným 10min budgetem
@@ -127,8 +133,9 @@ class AgentLoop:
                     if r.status_code != 200:
                         body = (await r.aread()).decode(errors="ignore")[:500]
                         log.error(
-                            "ollama /api/chat non-200: status=%d body=%s payload_keys=%s msgs=%d",
-                            r.status_code, body, sorted(payload.keys()), len(payload.get("messages", [])),
+                            "ollama /api/chat non-200: status=%d body=%s payload_keys=%s msgs=%d model=%s",
+                            r.status_code, body, sorted(payload.keys()),
+                            len(payload.get("messages", [])), self.model,
                         )
                         return text, tool_calls, f"ollama {r.status_code}: {body}"
                     async for line in r.aiter_lines():
@@ -151,6 +158,10 @@ class AgentLoop:
                             await self._emit_text(tok)
                         tc = msg.get("tool_calls") or []
                         if tc:
+                            log.debug(
+                                "raw tool_calls chunk: %s",
+                                json.dumps(tc, ensure_ascii=False)[:1000],
+                            )
                             # Ollama native /api/chat emituje tool_calls až v
                             # done-chunku jako kompletní pole (žádné partial
                             # arguments deltas). Pokud by se to v budoucí
@@ -172,6 +183,10 @@ class AgentLoop:
         except Exception as e:
             log.exception("agent loop: ollama stream failed")
             return text, tool_calls, f"{type(e).__name__}: {e}"
+        log.debug(
+            "stream_turn done: text_len=%d raw_tool_calls=%d",
+            len(text), len(tool_calls),
+        )
         return text, tool_calls, None
 
     async def _emit_text(self, delta: str) -> None:
@@ -219,6 +234,11 @@ class AgentLoop:
                         return
 
                     tcs = normalize_tool_calls(raw_tcs)
+                    log.debug(
+                        "normalize_tool_calls: raw=%d → normalized=%d names=%s",
+                        len(raw_tcs), len(tcs),
+                        [t["function"]["name"] for t in tcs],
+                    )
                     if not tcs:
                         # All chunks malformed/empty — treat as no-tool round.
                         if text:
@@ -323,6 +343,10 @@ class AgentLoop:
         tcid: str = tc["id"]
         name: str = tc["function"]["name"]
         args: dict = parse_tool_args(tc)
+        log.debug(
+            "execute_one tcid=%s name=%s args=%s",
+            tcid, name, json.dumps(args, ensure_ascii=False)[:500],
+        )
         await self._out_queue.put(
             {"type": "tool_call", "id": tcid, "name": name, "args": args}
         )
@@ -363,6 +387,12 @@ class AgentLoop:
             return
 
         perm = decide(name, args, self.workdir)
+        log.debug(
+            "permission tcid=%s name=%s decision=%s risk=%s reason=%s",
+            tcid, name,
+            perm.decision.value if hasattr(perm.decision, "value") else perm.decision,
+            perm.risk, perm.reason,
+        )
         approved: bool
         approval_outcome: str | None  # "approved" | "denied" | None (= nebylo soliciováno)
         deny_reason: str | None = None
@@ -510,6 +540,7 @@ class AgentLoop:
             return
         # Happy path: nejdřív zruš watchdog (žádný další await mezi nimi).
         filler_task.cancel()
+        log.debug("tool %s executed OK, output_type=%s", name, type(out).__name__)
 
         if isinstance(out, str):
             content = out

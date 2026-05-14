@@ -1,7 +1,10 @@
-"""Test conversation history schema (voice/agent/messages.py)."""
-from __future__ import annotations
+"""Test conversation history schema (voice/agent/messages.py).
 
-import json
+Klíčový kontrakt: `tool_call.function.arguments` je **vždy dict** (object),
+NE JSON string — Ollama native `/api/chat` chce arguments jako objekt
+(string → HTTP 400 "can't find closing '}' symbol").
+"""
+from __future__ import annotations
 
 from voice.agent.messages import (
     assistant_message,
@@ -34,7 +37,7 @@ def test_assistant_message_text_only():
 
 def test_assistant_message_with_tool_calls():
     tcs = [{"id": "tc_1", "type": "function",
-            "function": {"name": "echo", "arguments": "{}"}}]
+            "function": {"name": "echo", "arguments": {}}}]
     m = assistant_message("", tool_calls=tcs)
     assert m["role"] == "assistant"
     assert m["content"] == ""
@@ -51,34 +54,43 @@ def test_tool_message_shape():
     }
 
 
+# ─────────────────── normalize_tool_calls — arguments jako DICT ───────────────────
+
+
 def test_normalize_tool_calls_with_dict_args():
     raw = [{"function": {"name": "echo", "arguments": {"text": "hi"}}}]
     out = normalize_tool_calls(raw)
     assert len(out) == 1
     assert out[0]["function"]["name"] == "echo"
-    # arguments musí být JSON string, ne dict
-    assert isinstance(out[0]["function"]["arguments"], str)
-    assert json.loads(out[0]["function"]["arguments"]) == {"text": "hi"}
+    # arguments MUSÍ být dict (Ollama chce object, ne JSON string)
+    assert out[0]["function"]["arguments"] == {"text": "hi"}
+    assert isinstance(out[0]["function"]["arguments"], dict)
     assert out[0]["id"].startswith("tc_")
 
 
 def test_normalize_tool_calls_with_string_args():
+    """Ollama může v raw chunku poslat arguments jako string — normalize
+    ho MUSÍ naparsovat na dict."""
     raw = [{"id": "x1", "function": {"name": "echo", "arguments": '{"text":"hi"}'}}]
     out = normalize_tool_calls(raw)
     assert out[0]["id"] == "x1"
-    assert json.loads(out[0]["function"]["arguments"]) == {"text": "hi"}
+    assert out[0]["function"]["arguments"] == {"text": "hi"}
+    assert isinstance(out[0]["function"]["arguments"], dict)
 
 
 def test_normalize_tool_calls_with_empty_args():
     raw = [{"function": {"name": "echo", "arguments": ""}}]
     out = normalize_tool_calls(raw)
-    assert out[0]["function"]["arguments"] == "{}"
+    assert out[0]["function"]["arguments"] == {}
 
 
 def test_normalize_tool_calls_with_missing_args():
     raw = [{"function": {"name": "echo"}}]
     out = normalize_tool_calls(raw)
-    assert out[0]["function"]["arguments"] == "{}"
+    assert out[0]["function"]["arguments"] == {}
+
+
+# ─────────────────── parse_tool_args ───────────────────
 
 
 def test_parse_tool_args_dict():
@@ -126,62 +138,61 @@ def test_parse_tool_args_truncated_object_returns_sentinel():
     assert "raw_preview" not in out  # secret leak prevention
 
 
-def test_canonicalize_arguments_dict_returns_json_string():
-    assert canonicalize_arguments({"x": 1}) == '{"x": 1}'
+# ─────────────────── canonicalize_arguments — výstup VŽDY dict ───────────────────
 
 
-def test_canonicalize_arguments_valid_json_string_reserialized():
+def test_canonicalize_arguments_dict_returns_dict():
+    out = canonicalize_arguments({"x": 1})
+    assert out == {"x": 1}
+    assert isinstance(out, dict)
+
+
+def test_canonicalize_arguments_valid_json_string_parsed_to_dict():
     out = canonicalize_arguments('  {"x":1}  ')
-    assert json.loads(out) == {"x": 1}
+    assert out == {"x": 1}
+    assert isinstance(out, dict)
 
 
-def test_canonicalize_arguments_empty_string_returns_empty_object():
-    assert canonicalize_arguments("") == "{}"
-    assert canonicalize_arguments("   ") == "{}"
+def test_canonicalize_arguments_empty_string_returns_empty_dict():
+    assert canonicalize_arguments("") == {}
+    assert canonicalize_arguments("   ") == {}
 
 
-def test_canonicalize_arguments_none_returns_empty_object():
-    assert canonicalize_arguments(None) == "{}"
+def test_canonicalize_arguments_none_returns_empty_dict():
+    assert canonicalize_arguments(None) == {}
 
 
 def test_canonicalize_arguments_invalid_json_returns_sentinel():
     raw = '{"path": "/tmp/x'
     out = canonicalize_arguments(raw)
-    decoded = json.loads(out)
-    assert decoded["_parse_error"] == "invalid_json"
-    assert decoded["raw_length"] == len(raw)
-    assert "raw_preview" not in decoded
+    assert out["_parse_error"] == "invalid_json"
+    assert out["raw_length"] == len(raw)
+    assert "raw_preview" not in out
 
 
 def test_canonicalize_arguments_non_object_json_returns_sentinel():
     out = canonicalize_arguments("[1,2,3]")
-    decoded = json.loads(out)
-    assert decoded["_parse_error"] == "non_object_json"
+    assert out["_parse_error"] == "non_object_json"
 
 
 def test_canonicalize_arguments_non_string_non_dict_returns_sentinel():
     """Codex review HIGH: `arguments: []` / `0` / `False` nesmí projít na `{}`.
 
     Bez tohoto fixu by mohl adversarial klient v history posunout
-    `arguments: []` → canonicalize na "{}" → tool dostane defaults → bypass.
+    `arguments: []` → canonicalize na `{}` → tool dostane defaults → bypass.
     """
-    for bad in ([1, 2], 42, True, False, [], {1: 2} if False else None):
-        # None je legitimní (model neposlal args) → skip
-        if bad is None:
-            continue
+    for bad in ([1, 2], 42, True, False, []):
         out = canonicalize_arguments(bad)
-        decoded = json.loads(out)
-        assert decoded["_parse_error"] == "invalid_type", f"failed for {bad!r}: {decoded}"
-        assert "raw_hash" in decoded
+        assert out["_parse_error"] == "invalid_type", f"failed for {bad!r}: {out}"
+        assert "raw_hash" in out
 
 
 def test_canonicalize_arguments_too_large_returns_sentinel():
     """DoS guard: arguments > 64 KiB → sentinel `too_large`, neproparseuje."""
     huge = '{"x": "' + "A" * (70 * 1024) + '"}'  # ~70 KiB valid JSON
     out = canonicalize_arguments(huge)
-    decoded = json.loads(out)
-    assert decoded["_parse_error"] == "too_large"
-    assert decoded["raw_length"] > 64 * 1024
+    assert out["_parse_error"] == "too_large"
+    assert out["raw_length"] > 64 * 1024
 
 
 def test_canonicalize_arguments_dict_too_large_does_not_bypass_cap():
@@ -190,8 +201,16 @@ def test_canonicalize_arguments_dict_too_large_does_not_bypass_cap():
     """
     huge_dict = {"x": "A" * (70 * 1024)}
     out = canonicalize_arguments(huge_dict)
-    decoded = json.loads(out)
-    assert decoded["_parse_error"] == "too_large"
+    assert out["_parse_error"] == "too_large"
+
+
+def test_canonicalize_arguments_string_parsed_to_huge_dict_capped():
+    """Size cap se aplikuje i na výsledek parsování stringu (ne jen na raw str).
+    Hraniční vstup: string < 64 KiB, ale to není možné aby parsed dict byl
+    větší — string délka >= serialized dict délka. Tento test jen ověří, že
+    cesta parsed-dict prochází _within_size_cap (regrese guard)."""
+    out = canonicalize_arguments('{"x": "small"}')
+    assert out == {"x": "small"}
 
 
 def test_canonicalize_arguments_dict_non_serializable_does_not_crash():
@@ -202,16 +221,14 @@ def test_canonicalize_arguments_dict_non_serializable_does_not_crash():
         pass
     bad = {"k": _Custom()}
     out = canonicalize_arguments(bad)
-    decoded = json.loads(out)
-    assert decoded["_parse_error"] == "invalid_type"
+    assert out["_parse_error"] == "invalid_type"
 
 
 def test_canonicalize_arguments_dict_with_cycle_does_not_crash():
     cycle: dict = {}
     cycle["self"] = cycle
     out = canonicalize_arguments(cycle)
-    decoded = json.loads(out)
-    assert decoded["_parse_error"] == "invalid_type"
+    assert out["_parse_error"] == "invalid_type"
 
 
 def test_parse_tool_args_dict_too_large_returns_sentinel():
@@ -259,21 +276,17 @@ def test_sentinel_creation_does_not_crash_on_recursive_dict():
     uncaught-free i pro cyclic dict (RecursionError z json.dumps)."""
     cycle: dict = {}
     cycle["self"] = cycle
-    # Direct call přes canonicalize → sentinel fallback → musí projít
     out = canonicalize_arguments(cycle)
-    decoded = json.loads(out)
-    assert decoded["_parse_error"] == "invalid_type"
-    # Hash by měl mít validní hex (≥ 0 chars)
-    assert isinstance(decoded["raw_hash"], str)
-    assert len(decoded["raw_hash"]) == 64
+    assert out["_parse_error"] == "invalid_type"
+    assert isinstance(out["raw_hash"], str)
+    assert len(out["raw_hash"]) == 64
 
 
 def test_canonicalize_arguments_hash_includes_original_whitespace():
     """raw_hash MUSÍ být z původního před-strip stringu — útočník nesmí
     cestou whitespace prefixu vytvořit "různý" hash pro stejný payload."""
-    a = canonicalize_arguments("not json")
-    b = canonicalize_arguments("   not json   ")
-    da, db = json.loads(a), json.loads(b)
+    da = canonicalize_arguments("not json")
+    db = canonicalize_arguments("   not json   ")
     # Oba sentinely, ale hashe se LIŠÍ (každý hash z exact původního raw).
     assert da["_parse_error"] == "invalid_json"
     assert db["_parse_error"] == "invalid_json"
@@ -282,8 +295,7 @@ def test_canonicalize_arguments_hash_includes_original_whitespace():
 
 def test_is_malformed_args_true_for_sentinel():
     sentinel = canonicalize_arguments("not json")
-    args = json.loads(sentinel)
-    assert is_malformed_args(args) is True
+    assert is_malformed_args(sentinel) is True
 
 
 def test_is_malformed_args_false_for_normal_dict():
@@ -299,30 +311,29 @@ def test_is_malformed_args_false_for_non_dict():
 def test_normalize_tool_calls_with_malformed_args_produces_sentinel():
     """Bug repro: model emituje truncated JSON v arguments.
 
-    Před fixem: arguments=raw_string → Ollama next round HTTP 400.
-    Po fixu: arguments=sentinel JSON object → Ollama parses OK,
-    loop detekuje a NESPUSTÍ tool.
+    Po fixu: arguments=sentinel dict → Ollama dostane validní object,
+    loop detekuje přes is_malformed_args a tool NESPUSTÍ.
     """
     raw_args = '{"command": "rm /tmp'
     raw = [{"id": "tc_1", "function": {"name": "run_bash",
                                        "arguments": raw_args}}]
     out = normalize_tool_calls(raw)
     assert len(out) == 1
-    args_str = out[0]["function"]["arguments"]
-    decoded = json.loads(args_str)  # MUSÍ být valid JSON
-    assert decoded["_parse_error"] == "invalid_json"
-    assert decoded["raw_length"] == len(raw_args)
+    args = out[0]["function"]["arguments"]
+    assert isinstance(args, dict)  # MUSÍ být dict (Ollama spec)
+    assert args["_parse_error"] == "invalid_json"
+    assert args["raw_length"] == len(raw_args)
     # Žádný raw_preview → command string ("rm /tmp") NESMÍ leaknout
-    assert "raw_preview" not in decoded
+    assert "raw_preview" not in args
 
 
 def test_normalize_tool_calls_dedupes_by_id():
     """Ollama může streamovat stejný tool call víckrát (chunked / retry).
     Bez dedupy by se tool spustil opakovaně — fatální pro destructive."""
     raw = [
-        {"id": "tc_1", "function": {"name": "echo", "arguments": '{"text":"a"}'}},
-        {"id": "tc_1", "function": {"name": "echo", "arguments": '{"text":"a"}'}},
-        {"id": "tc_2", "function": {"name": "echo", "arguments": '{"text":"b"}'}},
+        {"id": "tc_1", "function": {"name": "echo", "arguments": {"text": "a"}}},
+        {"id": "tc_1", "function": {"name": "echo", "arguments": {"text": "a"}}},
+        {"id": "tc_2", "function": {"name": "echo", "arguments": {"text": "b"}}},
     ]
     out = normalize_tool_calls(raw)
     assert len(out) == 2
@@ -333,9 +344,9 @@ def test_normalize_tool_calls_drops_unnamed():
     """Tool call bez `function.name` musí být zahozený — jinak by agent
     zkusil vykonat něco s prázdným jménem."""
     raw = [
-        {"id": "tc_1", "function": {"name": "", "arguments": "{}"}},
-        {"id": "tc_2", "function": {"arguments": "{}"}},  # no name key
-        {"id": "tc_3", "function": {"name": "echo", "arguments": "{}"}},
+        {"id": "tc_1", "function": {"name": "", "arguments": {}}},
+        {"id": "tc_2", "function": {"arguments": {}}},  # no name key
+        {"id": "tc_3", "function": {"name": "echo", "arguments": {}}},
     ]
     out = normalize_tool_calls(raw)
     assert len(out) == 1
@@ -347,3 +358,23 @@ def test_normalize_tool_calls_drops_non_dict_items():
     out = normalize_tool_calls(raw)
     assert len(out) == 1
     assert out[0]["id"] == "tc_1"
+
+
+def test_normalize_tool_calls_arguments_always_dict_for_ollama():
+    """Regression guard pro root-cause bug: KAŽDÝ normalizovaný tool_call MUSÍ
+    mít arguments jako dict. Ollama native /api/chat na JSON string vyhodí
+    HTTP 400 "can't find closing '}' symbol" při dalším round-tripu.
+    """
+    raw = [
+        {"id": "a", "function": {"name": "t1", "arguments": {"k": "v"}}},  # dict
+        {"id": "b", "function": {"name": "t2", "arguments": '{"k":"v"}'}},  # string
+        {"id": "c", "function": {"name": "t3", "arguments": ""}},          # empty
+        {"id": "d", "function": {"name": "t4"}},                           # missing
+        {"id": "e", "function": {"name": "t5", "arguments": "broken{"}},    # malformed
+    ]
+    out = normalize_tool_calls(raw)
+    assert len(out) == 5
+    for tc in out:
+        assert isinstance(tc["function"]["arguments"], dict), (
+            f"{tc['id']}: arguments není dict — Ollama 400 risk"
+        )

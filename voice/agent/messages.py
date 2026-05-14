@@ -1,16 +1,28 @@
 """Conversation history schema pro agent mode.
 
-Používáme OpenAI / Ollama format (kompatibilní s `tools` parametrem):
+Formát Ollama native `/api/chat` (kompatibilní s `tools` parametrem)::
 
     {"role": "system", "content": "..."}
     {"role": "user", "content": "..."}
     {"role": "assistant", "content": "...", "tool_calls": [
         {"id": "tc_1", "type": "function",
-         "function": {"name": "echo", "arguments": "{\"text\":\"hi\"}"}}
+         "function": {"name": "echo", "arguments": {"text": "hi"}}}
     ]}
     {"role": "tool", "tool_call_id": "tc_1", "name": "echo", "content": "<result>"}
 
-`arguments` je vždy JSON STRING (ne object) — tak to chce Ollama i OpenAI.
+**`arguments` je vždy JSON OBJECT (dict), NE string.**
+
+Toto je zásadní — Ollama native `/api/chat` při renderování `tool_calls` zpět
+do promptu (chat template) očekává `arguments` jako objekt. Pokud pošleme
+JSON string, Ollama vyhodí HTTP 400 `Value looks like object, but can't find
+closing '}' symbol` (template parser narazí na string-escaped `{` a zmate se).
+Ověřeno reálným during-development testem s qwen2.5:14b:
+  - arguments={"path": "..."}  → 200 OK
+  - arguments='{"path": "..."}' → 400
+
+(Pozn.: OpenAI Chat Completions API naopak chce `arguments` jako string —
+pokud by se přidal OpenAI backend, konverze patří do jeho adapteru, ne sem.)
+
 `content` v tool message je vždy string (často JSON-encoded result).
 """
 from __future__ import annotations
@@ -22,8 +34,8 @@ from typing import Any
 
 
 _PARSE_ERROR_KEY = "_parse_error"
-_MAX_ARGS_BYTES = 64 * 1024  # 64 KiB strop pro raw arguments string (DoS guard
-# + Ollama context budget). Větší input → sentinel `too_large`, hash & length
+_MAX_ARGS_BYTES = 64 * 1024  # 64 KiB strop pro raw arguments (DoS guard +
+# Ollama context budget). Větší input → sentinel `too_large`, hash & length
 # zachovány pro forensics.
 
 
@@ -63,6 +75,10 @@ def _make_parse_error_sentinel(raw: Any, reason: str = "invalid_json") -> dict:
                   malicious payload "schovat" za leading/trailing whitespace
                   a vytvořit duplikát s jiným hashem.
 
+    Sentinel je validní JSON object → bezpečně se pošle do Ollamy jako
+    `arguments`. Loop ho v `_execute_one` detekuje přes `is_malformed_args`
+    a tool NESPUSTÍ.
+
     **NEZAHRNUJEME raw_preview**: model může do args zakódovat secret
     (vyhalucinovaný API token z paměti) nebo cílený exfil text. Preview
     by tento secret přešel z LLM contextu do history + audit logu +
@@ -77,10 +93,10 @@ def _make_parse_error_sentinel(raw: Any, reason: str = "invalid_json") -> dict:
     else:
         # Pro non-string typy (list, int, None) reprezentujeme JSON-style
         # ať hash zachytí přesný typ ("[1,2,3]" vs "null" vs "false").
-        # Codex+Gemini iter-3 HIGH: i sentinel-tvorba musí být uncaught-free.
-        # `RecursionError` (cyklický dict) a libovolná další exception z
-        # json.dumps musí dopadnout na `repr` fallback — sentinel nesmí spadnout,
-        # protože je to záchranná cesta untrusted vstupu.
+        # I sentinel-tvorba musí být uncaught-free: `RecursionError`
+        # (cyklický dict) i libovolná další exception z json.dumps musí
+        # dopadnout na `repr` fallback — sentinel je záchranná cesta
+        # untrusted vstupu a nesmí spadnout.
         try:
             raw_bytes = json.dumps(raw, ensure_ascii=False).encode("utf-8")
         except Exception:
@@ -95,83 +111,77 @@ def _make_parse_error_sentinel(raw: Any, reason: str = "invalid_json") -> dict:
     }
 
 
-def canonicalize_arguments(raw: Any) -> str:
-    """Vrátí GARANTOVANĚ validní JSON object string pro `tool_call.function.arguments`.
+def _within_size_cap(d: dict) -> tuple[bool, dict | None]:
+    """Ověří, že dict je JSON-serializable a vejde se do `_MAX_ARGS_BYTES`.
 
-    Při invalid vstupu (truncated JSON, non-object JSON, non-string non-dict
-    typ, příliš velký payload) vrátí serialized sentinel s `_parse_error` key.
-    Ollama tak dostane parseable JSON a nevyhodí 400; loop pak v `_execute_one`
-    detekuje sentinel přes `is_malformed_args` a tool NESPUSTÍ.
+    Vrací `(ok, sentinel)`:
+      - `(True, None)`  — dict je v pořádku
+      - `(False, sentinel)` — non-serializable / cyklus → sentinel `invalid_type`,
+                              nebo příliš velký → sentinel `too_large`
+    """
+    try:
+        serialized = json.dumps(d, ensure_ascii=False)
+    except (TypeError, ValueError, RecursionError):
+        return False, _make_parse_error_sentinel(d, reason="invalid_type")
+    if len(serialized.encode("utf-8", errors="replace")) > _MAX_ARGS_BYTES:
+        return False, _make_parse_error_sentinel(serialized, reason="too_large")
+    return True, None
+
+
+def canonicalize_arguments(raw: Any) -> dict:
+    """Vrátí GARANTOVANĚ validní JSON object (dict) pro `tool_call.function.arguments`.
+
+    **Výstup je vždy dict** — Ollama native `/api/chat` chce `arguments` jako
+    objekt (viz module docstring). Při invalid vstupu vrací sentinel dict
+    s `_parse_error` klíčem; loop pak v `_execute_one` přes `is_malformed_args`
+    detekuje a tool NESPUSTÍ.
 
     Bezpečnostně kritické: bez canonicalize by model mohl `{"command": "rm -rf /"`
-    (bez `}`) → parse_tool_args fallback `{}` → permission classifier vidí
-    prázdné args → tool dostane defaults → destructive akce mimo audit.
-    Stejně tak `arguments: []` nebo `arguments: 0` (non-string types) musí
-    NEPROJÍT na prázdný `{}` — místo toho sentinel `invalid_type`.
+    (bez `}`) → fallback `{}` → permission classifier vidí prázdné args → tool
+    dostane defaults → destructive akce mimo audit. Stejně tak `arguments: []`
+    nebo `arguments: 0` (non-object types) NESMÍ projít na prázdný `{}` — místo
+    toho sentinel `invalid_type`.
 
     Typové chování:
-    - `dict`               → reserializovaný JSON object string (cap + try-safe)
-    - `str` empty / blank  → `"{}"` (model neposlal args; defaults expected)
+    - `dict`               → validovaný dict (cap + serializable check) / sentinel
+    - `str` empty / blank  → `{}` (model neposlal args; defaults expected)
     - `str` > 64 KiB       → sentinel `too_large` (DoS guard)
+    - `str` valid JSON obj → parsed dict
     - `str` invalid JSON   → sentinel `invalid_json`
-    - `str` non-object JSON (`[1]`, `"x"`, `123`)  → sentinel `non_object_json`
-    - `None` / missing     → `"{}"` (model neposlal args; required-fields
+    - `str` non-object JSON (`[1]`, `"x"`, `123`) → sentinel `non_object_json`
+    - `None` / missing     → `{}` (model neposlal args; required-fields
                               validace probíhá v Ollama tool schema)
     - jiný typ (`list`, `int`, `bool`, …) → sentinel `invalid_type`
     """
     if isinstance(raw, dict):
-        # Codex iter-2 HIGH: dict path NESMÍ bypassovat size cap ani spadnout
-        # na uncaught exception při non-JSON-serializable hodnotách / cyklech.
-        try:
-            serialized = json.dumps(raw, ensure_ascii=False)
-        except (TypeError, ValueError, RecursionError):
-            return json.dumps(
-                _make_parse_error_sentinel(raw, reason="invalid_type"),
-                ensure_ascii=False,
-            )
-        if len(serialized.encode("utf-8", errors="replace")) > _MAX_ARGS_BYTES:
-            return json.dumps(
-                _make_parse_error_sentinel(serialized, reason="too_large"),
-                ensure_ascii=False,
-            )
-        return serialized
+        ok, sentinel = _within_size_cap(raw)
+        return raw if ok else sentinel  # type: ignore[return-value]
     if raw is None:
-        return "{}"
+        return {}
     if isinstance(raw, str):
         # Size cap: před parsováním ať velký payload nevybuchne v json.loads.
         if len(raw.encode("utf-8", errors="replace")) > _MAX_ARGS_BYTES:
-            return json.dumps(
-                _make_parse_error_sentinel(raw, reason="too_large"),
-                ensure_ascii=False,
-            )
+            return _make_parse_error_sentinel(raw, reason="too_large")
         s = raw.strip()
         if not s:
-            return "{}"
+            return {}
         try:
             parsed = json.loads(s)
         except (json.JSONDecodeError, RecursionError, ValueError):
             # `raw` (NE `s`) → hash je z původního před-trim payloadu
             # (forensic integrity: whitespace-only diff nesmí kolidovat).
-            return json.dumps(
-                _make_parse_error_sentinel(raw, reason="invalid_json"),
-                ensure_ascii=False,
-            )
+            return _make_parse_error_sentinel(raw, reason="invalid_json")
         if not isinstance(parsed, dict):
-            # `arguments` musí být JSON object per OpenAI/Ollama spec; array,
-            # number, string atd. jsou malformed → sentinel.
-            return json.dumps(
-                _make_parse_error_sentinel(raw, reason="non_object_json"),
-                ensure_ascii=False,
-            )
-        # Validní JSON object — re-serializuj kanonicky (drop whitespace).
-        return json.dumps(parsed, ensure_ascii=False)
+            # `arguments` musí být JSON object; array, number, string atd.
+            # jsou malformed → sentinel.
+            return _make_parse_error_sentinel(raw, reason="non_object_json")
+        # Validní JSON object — ověř ještě size cap na parsovaném výsledku.
+        ok, sentinel = _within_size_cap(parsed)
+        return parsed if ok else sentinel  # type: ignore[return-value]
     # Non-string, non-dict, non-None: list, int, bool, …
-    # NESMÍ projít na "{}" — to by umožnilo `arguments: []` skrýt skutečný
+    # NESMÍ projít na `{}` — to by umožnilo `arguments: []` skrýt skutečný
     # malicious obsah (např. arguments serializovaný adversarialním klientem).
-    return json.dumps(
-        _make_parse_error_sentinel(raw, reason="invalid_type"),
-        ensure_ascii=False,
-    )
+    return _make_parse_error_sentinel(raw, reason="invalid_type")
 
 
 def is_malformed_args(args: dict | Any) -> bool:
@@ -182,8 +192,8 @@ def is_malformed_args(args: dict | Any) -> bool:
 def normalize_tool_calls(raw: list[dict]) -> list[dict]:
     """Ollama vrací tool_calls jako list[{function: {name, arguments}}].
 
-    Sjednocujeme na OpenAI tvar: arguments JSON string (vždy validní —
-    invalid input → sentinel přes `canonicalize_arguments`), povinný name,
+    Sjednocujeme na kanonický tvar: `arguments` jako **dict** (vždy validní —
+    invalid input → sentinel přes `canonicalize_arguments`), povinný `name`,
     deduplikace podle `id` (Ollama může v rámci streamování poslat stejný
     call víckrát, případně inkrementálně po chunkách — bez dedupy by se
     tool spustil 2×).
@@ -196,22 +206,22 @@ def normalize_tool_calls(raw: list[dict]) -> list[dict]:
     for tc in raw:
         if not isinstance(tc, dict):
             continue
-        # Codex iter-3 HIGH: `function` může být truthy non-dict (model či
-        # adversarial chunk) — `.get` by spadl na AttributeError. Vyžadujeme dict.
+        # `function` může být truthy non-dict (model či adversarial chunk) —
+        # `.get` by spadl na AttributeError. Vyžadujeme dict.
         fn_raw = tc.get("function")
         fn = fn_raw if isinstance(fn_raw, dict) else {}
         name_raw = fn.get("name")
         name = (name_raw if isinstance(name_raw, str) else "").strip()
         if not name:
             continue  # malformed — drop
-        args_str = canonicalize_arguments(fn.get("arguments"))
+        args = canonicalize_arguments(fn.get("arguments"))
         tcid = tc.get("id")
         if not isinstance(tcid, str) or not tcid:
             tcid = new_tool_call_id()
         entry = {
             "id": tcid,
             "type": "function",
-            "function": {"name": name, "arguments": args_str},
+            "function": {"name": name, "arguments": args},
         }
         if tcid in seen:
             # Dedup: nejnovější chunk přepíše args/name (typicky stejné).
@@ -225,46 +235,15 @@ def normalize_tool_calls(raw: list[dict]) -> list[dict]:
 def parse_tool_args(tool_call: dict) -> dict:
     """Vrátí args jako dict, nehledě na jejich formát v history.
 
-    Při invalid JSON / non-object JSON / non-string non-dict typu / příliš
-    velkém payloadu vrací sentinel s `_parse_error` klíčem (NE prázdný `{}`
-    — to by umožnilo modelu schovat malicious args za malformed JSON:
-    classifier by viděl `{}` místo `{"command":"rm -rf /"` a tool by se
-    spustil s defaults).
+    Tenký wrapper nad `canonicalize_arguments` — přijme jak well-formed
+    history (kde `arguments` už je dict), tak raw Ollama tool_call (kde může
+    být string). Vrací vždy dict; při malformed vstupu sentinel s `_parse_error`.
 
     Callsite v `_execute_one` musí `is_malformed_args(args)` detekovat
     a tool NESPUSTIT.
-
-    Mapování typů viz `canonicalize_arguments` — chování je symetrické,
-    jen vrací dict místo serialized stringu.
     """
-    # Codex iter-3 HIGH: `function` může být truthy non-dict (`[1]`, `123`,
-    # custom object) — `.get(...)` by spadl na AttributeError. Vyžadujeme dict.
+    # `function` může být truthy non-dict (`[1]`, `123`, custom object) —
+    # `.get(...)` by spadl na AttributeError. Vyžadujeme dict.
     fn_raw = tool_call.get("function")
     fn = fn_raw if isinstance(fn_raw, dict) else {}
-    raw = fn.get("arguments")
-    if isinstance(raw, dict):
-        # Codex iter-2 HIGH: dict path NESMÍ bypassovat size cap.
-        # Serialize-and-measure (pokud non-serializable → sentinel).
-        try:
-            serialized = json.dumps(raw, ensure_ascii=False)
-        except (TypeError, ValueError, RecursionError):
-            return _make_parse_error_sentinel(raw, reason="invalid_type")
-        if len(serialized.encode("utf-8", errors="replace")) > _MAX_ARGS_BYTES:
-            return _make_parse_error_sentinel(serialized, reason="too_large")
-        return raw
-    if raw is None:
-        return {}
-    if isinstance(raw, str):
-        if len(raw.encode("utf-8", errors="replace")) > _MAX_ARGS_BYTES:
-            return _make_parse_error_sentinel(raw, reason="too_large")
-        s = raw.strip()
-        if not s:
-            return {}
-        try:
-            parsed = json.loads(s)
-        except (json.JSONDecodeError, RecursionError, ValueError):
-            return _make_parse_error_sentinel(raw, reason="invalid_json")
-        if isinstance(parsed, dict):
-            return parsed
-        return _make_parse_error_sentinel(raw, reason="non_object_json")
-    return _make_parse_error_sentinel(raw, reason="invalid_type")
+    return canonicalize_arguments(fn.get("arguments"))

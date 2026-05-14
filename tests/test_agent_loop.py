@@ -655,12 +655,12 @@ async def test_loop_malformed_args_short_circuits_execution(tmp_path: Path):
     find closing '}' symbol`.
 
     Po fixu (defense in depth):
-    1. `normalize_tool_calls` přepíše arguments na sentinel JSON
+    1. `normalize_tool_calls` přepíše arguments na sentinel dict
        (validní object → Ollama nevyhodí 400),
     2. `_execute_one` detekuje sentinel přes `is_malformed_args` a tool
        NESPUSTÍ (security: prevence schování destruktivních args za malformed JSON),
     3. emit paired `tool_result` ok=False s `_parse_error` + `raw_hash`,
-    4. history obsahuje validní JSON arguments → další round projde.
+    4. history obsahuje validní dict arguments → další round projde.
     """
     # Echo tool by execute když bychom dostali args. Pokud test selže
     # (short-circuit nefunguje), echo by vrátil `{"echoed":"","length":0}`
@@ -706,12 +706,12 @@ async def test_loop_malformed_args_short_circuits_execution(tmp_path: Path):
     assert payload["raw_hash"] == tc_ev["args"]["raw_hash"]
     assert "malformed" in payload["error"]
 
-    # History: assistant.tool_calls arguments MUSÍ být validní JSON
-    # (sentinel object), jinak by Ollama na další round vyhodila 400.
+    # History: assistant.tool_calls arguments MUSÍ být dict (sentinel object),
+    # jinak by Ollama na další round vyhodila 400.
     asst = next(m for m in loop.messages if m["role"] == "assistant" and "tool_calls" in m)
-    args_str = asst["tool_calls"][0]["function"]["arguments"]
-    decoded = json.loads(args_str)  # MUSÍ být parsable
-    assert decoded["_parse_error"] == "invalid_json"
+    args = asst["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(args, dict)  # Ollama chce object, ne JSON string
+    assert args["_parse_error"] == "invalid_json"
 
     # Tool message taky validní JSON (per spec).
     tool_msg = next(m for m in loop.messages if m["role"] == "tool")

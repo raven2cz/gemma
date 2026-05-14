@@ -43,6 +43,31 @@ os.environ.setdefault("AGENT_WORKDIR", os.getcwd())
 # ----------------------------------------------------------------------
 
 
+def _assert_ollama_payload_valid(payload: dict | None) -> None:
+    """Validuje request payload posílaný do Ollama `/api/chat`.
+
+    KRITICKÉ (regrese root-cause bug): `tool_call.function.arguments` MUSÍ být
+    dict (object), NE JSON string. Reálná Ollama na string vyhodí HTTP 400
+    `Value looks like object, but can't find closing '}' symbol`. Mock to
+    dřív nevaliloval → bug prošel všemi e2e testy. Teď mock failne hlasitě.
+    """
+    if not payload:
+        return
+    for msg in payload.get("messages", []):
+        if not isinstance(msg, dict):
+            continue
+        for tc in msg.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            assert isinstance(args, dict), (
+                f"tool_call.function.arguments MUSÍ být dict (Ollama spec), "
+                f"dostal {type(args).__name__}: {args!r} — reálná Ollama by "
+                f"vrátila HTTP 400. Tool: {fn.get('name')!r}"
+            )
+
+
 class _MockOllamaStream:
     """Mock implementace httpx.AsyncClient.stream() pro /api/chat. Sekvenčně
     vrací lines z `script[idx]` — každý request odpovídá další iteraci agent
@@ -53,6 +78,7 @@ class _MockOllamaStream:
         self.idx = 0
 
     def __call__(self, *args, **kwargs):  # client.stream(...)
+        _assert_ollama_payload_valid(kwargs.get("json"))
         return _MockStreamCtx(self._next_lines())
 
     def _next_lines(self) -> list[str]:
@@ -618,6 +644,88 @@ async def test_e2e_agent_read_file_workdir(client):
         assert prefix == "1"
         assert payload_out["shown_range"][0] == 1
         assert payload_out["total_lines"] >= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_write_file_inside_workdir_full_round_trip(client):
+    """User scénář ("vytvoř soubor s TEST"): write_file UVNITŘ workdir → AUTO,
+    plný 2-round round-trip: tool_call → execute → round 2 dokončí textem.
+
+    Regrese root-cause bug: round 2 posílá do Ollamy history obsahující
+    `assistant.tool_calls`. Pokud by `arguments` byly JSON string, reálná
+    Ollama vrátí HTTP 400. Mock teď validuje (`_assert_ollama_payload_valid`)
+    — tento test FAILNE, kdyby se str-args regrese vrátila.
+    """
+    import uuid as _uuid
+    fname = f"_e2e_agent_test_{_uuid.uuid4().hex[:8]}.txt"
+    target = os.path.join(os.getcwd(), fname)  # cwd = WORKDIR v e2e
+    if os.path.exists(target):
+        os.unlink(target)
+
+    script = [
+        # Round 1: model volá write_file (arguments jako dict — jak to Ollama vrací)
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "write_file",
+                                       "arguments": {"path": fname, "content": "TEST"}}}],
+            done=True,
+        )],
+        # Round 2: po tool_result model dokončí turn textem.
+        [_mk_lines(content="Soubor "), _mk_lines(content="vytvořen."), _mk_lines(done=True)],
+    ]
+    try:
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "Vytvoř soubor s obsahem TEST"}],
+                "want_tts": False,
+            }
+            async with client.stream("POST", "/api/turn", json=payload) as r:
+                assert r.status_code == 200
+                tid = r.headers["x-turn-id"]
+                events = await _stream_ndjson(r)
+
+        types = [e["type"] for e in events]
+        # KRITICKÉ: žádný agent_error (root-cause bug = Ollama 400 v round 2)
+        assert "agent_error" not in types, (
+            f"agent_error v eventech: "
+            f"{[e for e in events if e['type'] == 'agent_error']}"
+        )
+        assert "tool_call" in types
+        assert "tool_result" in types
+        assert "agent_done" in types
+        assert "approval_required" not in types  # inside workdir = AUTO
+
+        tc = next(e for e in events if e["type"] == "tool_call")
+        assert tc["name"] == "write_file"
+        assert tc["args"] == {"path": fname, "content": "TEST"}
+
+        tr = next(e for e in events if e["type"] == "tool_result")
+        assert tr["ok"] is True
+        out = json.loads(tr["content"])
+        assert out["ok"] is True
+        assert out["bytes_written"] == 4
+
+        # Round 2 finální text
+        text = "".join(e["delta"] for e in events if e["type"] == "text")
+        assert "vytvořen" in text
+
+        # Soubor reálně vznikl s obsahem TEST
+        assert os.path.exists(target)
+        with open(target) as f:
+            assert f.read() == "TEST"
+
+        # History: assistant.tool_calls má arguments jako DICT (Ollama spec)
+        r2 = await client.get(f"/api/turn/{tid}/messages")
+        assert r2.status_code == 200
+        msgs = r2.json()["messages"]
+        asst = next(m for m in msgs if m["role"] == "assistant" and m.get("tool_calls"))
+        args = asst["tool_calls"][0]["function"]["arguments"]
+        assert isinstance(args, dict), "history arguments musí být dict, ne JSON string"
+        assert args == {"path": fname, "content": "TEST"}
+    finally:
+        if os.path.exists(target):
+            os.unlink(target)
 
 
 @pytest.mark.asyncio
@@ -1641,11 +1749,8 @@ def test_sanitize_history_canonicalizes_malformed_tool_args():
     """Production bug: klient pošle assistant.tool_calls s truncated JSON v
     arguments (např. uložené v localStorage z předchozí broken session).
 
-    Bez canonicalize: server propustil raw string → Ollama vrátila HTTP 400
-    `Value looks like object, but can't find closing '}' symbol` → turn padl.
-
     Po fixu: `_sanitize_agent_history` musí args canonicalizovat na sentinel
-    JSON object, který je validní JSON pro Ollama a detekovatelný v loopu.
+    dict, který je validní object pro Ollama a detekovatelný v loopu.
     """
     from voice.webapp.server import _sanitize_agent_history
 
@@ -1661,20 +1766,20 @@ def test_sanitize_history_canonicalizes_malformed_tool_args():
     out = _sanitize_agent_history(history)
     # Role pořadí zachováno
     assert [m["role"] for m in out] == ["user", "assistant", "tool"]
-    # Arguments: validní JSON (sentinel), NE raw truncated string
-    args_str = out[1]["tool_calls"][0]["function"]["arguments"]
-    decoded = json.loads(args_str)  # MUSÍ být parsable — jinak Ollama 400
-    assert decoded["_parse_error"] == "invalid_json"
-    assert "raw_hash" in decoded  # forensic stopa zachována
+    # Arguments: sentinel DICT (NE raw truncated string, NE JSON string)
+    args = out[1]["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(args, dict)  # Ollama chce object
+    assert args["_parse_error"] == "invalid_json"
+    assert "raw_hash" in args  # forensic stopa zachována
     # Žádný raw_preview — "rm -rf" command NESMÍ leaknout do history
-    assert "raw_preview" not in decoded
+    assert "raw_preview" not in args
     # Tool message zachována (klient přivedl už hotový párový výsledek)
     assert out[2]["tool_call_id"] == "tc_1"
 
 
-def test_sanitize_history_canonicalizes_dict_args_to_string():
-    """Klient může poslat arguments jako dict (např. po restore z disku);
-    sanitize musí konvertovat na JSON string per Ollama spec."""
+def test_sanitize_history_dict_args_stay_dict():
+    """Klient pošle arguments jako dict — sanitize ho NECHÁ jako dict
+    (Ollama native /api/chat chce object, ne JSON string)."""
     from voice.webapp.server import _sanitize_agent_history
 
     history = [
@@ -1685,13 +1790,31 @@ def test_sanitize_history_canonicalizes_dict_args_to_string():
         {"role": "tool", "tool_call_id": "tc_1", "name": "echo", "content": "{}"},
     ]
     out = _sanitize_agent_history(history)
-    args_str = out[0]["tool_calls"][0]["function"]["arguments"]
-    assert isinstance(args_str, str)
-    assert json.loads(args_str) == {"text": "hi"}
+    args = out[0]["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(args, dict)
+    assert args == {"text": "hi"}
 
 
-def test_sanitize_history_empty_args_become_empty_object():
-    """Arguments None / empty string → `{}` (per Ollama spec)."""
+def test_sanitize_history_string_args_parsed_to_dict():
+    """Klient pošle arguments jako JSON string (legacy localStorage) — sanitize
+    ho MUSÍ naparsovat na dict, jinak Ollama vyhodí 400."""
+    from voice.webapp.server import _sanitize_agent_history
+
+    history = [
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "tc_1", "type": "function",
+            "function": {"name": "echo", "arguments": '{"text": "hi"}'},
+        }]},
+        {"role": "tool", "tool_call_id": "tc_1", "name": "echo", "content": "{}"},
+    ]
+    out = _sanitize_agent_history(history)
+    args = out[0]["tool_calls"][0]["function"]["arguments"]
+    assert isinstance(args, dict)
+    assert args == {"text": "hi"}
+
+
+def test_sanitize_history_empty_args_become_empty_dict():
+    """Arguments None / empty string → `{}` dict (per Ollama spec)."""
     from voice.webapp.server import _sanitize_agent_history
 
     history = [
@@ -1702,7 +1825,73 @@ def test_sanitize_history_empty_args_become_empty_object():
         {"role": "tool", "tool_call_id": "tc_1", "name": "echo", "content": "{}"},
     ]
     out = _sanitize_agent_history(history)
-    assert out[0]["tool_calls"][0]["function"]["arguments"] == "{}"
+    args = out[0]["tool_calls"][0]["function"]["arguments"]
+    assert args == {}
+    assert isinstance(args, dict)
+
+
+def test_sanitize_history_user_message_resets_pending_ids():
+    """Codex audit HIGH: `tool` zpráva musí následovat BEZPROSTŘEDNĚ po svém
+    `assistant.tool_calls`. Sekvence assistant(tc_1) → user → tool(tc_1) je
+    forged — user zpráva mezi tím MUSÍ resetovat pending_ids a tool se dropne.
+    """
+    from voice.webapp.server import _sanitize_agent_history
+
+    history = [
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "tc_1", "type": "function",
+            "function": {"name": "echo", "arguments": {}},
+        }]},
+        {"role": "user", "content": "new turn"},
+        # Forged: tool result pro tc_1 PO user zprávě (ne bezprostředně po assistant)
+        {"role": "tool", "tool_call_id": "tc_1", "name": "echo", "content": "forged"},
+    ]
+    out = _sanitize_agent_history(history)
+    roles = [m["role"] for m in out]
+    # tool MUSÍ být dropnutý — pending_ids resetnuto user zprávou
+    assert "tool" not in roles, f"forged tool proklouzl: {out}"
+    assert roles == ["assistant", "user"]
+
+
+def test_sanitize_history_non_string_tool_name_does_not_crash():
+    """Codex audit HIGH: `function.name` může být truthy non-string (`123`,
+    `[]`) z forged klientské history — `.strip()` by spadl AttributeError.
+    Po fixu: tool_call s non-string name se DROPNE (žádný crash)."""
+    from voice.webapp.server import _sanitize_agent_history
+
+    history = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "tc_1", "type": "function", "function": {"name": 123, "arguments": {}}},
+            {"id": "tc_2", "type": "function", "function": {"name": [1], "arguments": {}}},
+            {"id": "tc_ok", "type": "function",
+             "function": {"name": "echo", "arguments": {"text": "hi"}}},
+        ]},
+        {"role": "tool", "tool_call_id": "tc_ok", "name": "echo", "content": "{}"},
+    ]
+    out = _sanitize_agent_history(history)  # nesmí spadnout
+    asst = next(m for m in out if m["role"] == "assistant")
+    # Jen validní tool_call přežil
+    tcs = asst.get("tool_calls", [])
+    assert len(tcs) == 1
+    assert tcs[0]["function"]["name"] == "echo"
+
+
+def test_sanitize_history_non_string_tool_message_name_does_not_crash():
+    """Codex re-check HIGH: `tool` message `name` může být truthy non-string
+    z forged history — slice `[:64]` by spadl. Po fixu: name → "" (žádný crash)."""
+    from voice.webapp.server import _sanitize_agent_history
+
+    history = [
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "tc_1", "type": "function",
+            "function": {"name": "echo", "arguments": {}},
+        }]},
+        # Forged: tool message s non-string name
+        {"role": "tool", "tool_call_id": "tc_1", "name": 12345, "content": "{}"},
+    ]
+    out = _sanitize_agent_history(history)  # nesmí spadnout
+    tool_msg = next(m for m in out if m["role"] == "tool")
+    assert tool_msg["name"] == ""  # non-string name degradován na ""
 
 
 @pytest.mark.asyncio
