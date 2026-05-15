@@ -1,127 +1,98 @@
-# Gemma — Lokální český hlasový asistent + agent
+# Gemma
 
-**Plně lokální stack pro hlasový chat **i agentní akce** v češtině: Gemma 4 (LLM) + whisper.cpp (STT) + Chatterbox-TTS-Czech (TTS) + voice webapp s 13 nástroji pro práci se soubory, shellem, webem, Philips Hue a Claude API.**
+Lokální český hlasový asistent s agentním režimem. LLM přes Ollama, STT přes whisper.cpp, TTS přes Chatterbox. Vše běží na jednom GPU.
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.11%2B-blue.svg" alt="Python 3.11+"></a>
   <img src="https://img.shields.io/badge/CUDA-13.2-green.svg" alt="CUDA 13.2">
   <img src="https://img.shields.io/badge/GPU-RTX%205070%20Ti-76b900.svg" alt="RTX 5070 Ti">
-  <img src="https://img.shields.io/badge/lang-čeština%20%2B%20english-red.svg" alt="CS + EN">
-  <img src="https://img.shields.io/badge/tests-852%20passing-brightgreen.svg" alt="852 tests">
+  <img src="https://img.shields.io/badge/lang-cs%20%2B%20en-red.svg" alt="CS + EN">
 </p>
 
----
+## Co umí
 
-## Co to je
+Webová aplikace ve které mluvíš na mikrofon (nebo píšeš), model ti odpoví hlasem. Tři režimy:
 
-Čtyři vrstvy, vše běží lokálně bez cloudu (Claude bridge je volitelný):
+- **chat** klasická konverzace, žádné tooly
+- **agent** model má 13 nástrojů (soubory, shell, web, Philips Hue, Claude API). Před destruktivními akcemi se ptá. Schvaluje se kliknutím, napsáním fráze, nebo hlasem.
+- **claude** přepošle dotaz na Anthropic Claude API (pokud máš `ANTHROPIC_API_KEY`).
 
-| Vrstva | Komponenta | Účel |
-|--------|-----------|------|
-| **LLM** | Gemma 4 e4b / 26b / 31b přes Ollama (qwen3 fallback) | Konverzace + agentní úlohy + tool calling |
-| **STT** | whisper.cpp (large-v3 + Silero VAD) | Mic → text |
-| **TTS** | Chatterbox-TTS-Czech (per-věta streaming) | Text → hlas, CS i EN |
-| **Webapp** | FastAPI + WebGL orb avatar | Mic ↔ LLM ↔ TTS pipeline, chat/agent/Claude režimy, 13 toolů |
+## Nástroje v agent módu
 
-## Featury
-
-### 🤖 Agent mode (hotový)
-
-Plnohodnotná tool-calling smyčka s permission gating, hlasovou approval frází a TTS výstupem na finální odpověď.
-
-**13 toolů:**
-
-| Tool | Použití |
+| Tool | Co dělá |
 |------|---------|
-| `read_file`, `list_files`, `glob`, `grep` | Sandboxed FS read (cat-n format, line numbers, paging) |
-| `write_file`, `edit_file` | Atomic write / exact-substring replace; mimo workdir vyžaduje „ano povoluju" |
-| `run_bash` | Shell s root-cmd allowlist (AUTO) + ASK pro pipes/redirecty + destruktivní guard (`rm`/`sudo`/`chmod` vyžaduje frázi) |
-| `fetch_url`, `web_search` | HTTP GET (SSRF defense: blokované RFC1918/loopback) + Brave Search API |
-| `light_list`, `light_set` | Philips Hue smart-home (per-room/light state) |
-| `ask_claude` | Bridge na Anthropic API pro tasky kde lokální LLM nestačí |
+| `read_file` | Přečte soubor s čísly řádků |
+| `list_files` | Vypíše adresář |
+| `glob` | Najde soubory podle vzoru (`**/*.py`) |
+| `grep` | Hledá regex v souborech (ripgrep když je) |
+| `write_file` | Atomicky zapíše. Mimo workdir vyžaduje frázi |
+| `edit_file` | Přepíše přesný substring |
+| `run_bash` | Pustí shell příkaz. Bezpečné (`ls`, `git status`) auto, jinak ptá |
+| `fetch_url` | HTTP GET. Blokuje RFC1918 a loopback (SSRF) |
+| `web_search` | Brave Search API |
+| `light_list` | Vypíše Hue světla |
+| `light_set` | Změní stav světla (jméno, barva, jas) |
+| `ask_claude` | Delegace na Claude API |
 | `echo` | Test pipeline |
 
-**Bezpečnost:**
-- **Permission classifier per tool**: `AUTO` (safe + uvnitř workdir), `ASK` (modal approval), `DENY` (policy violation)
-- **Destruktivní akce vyžadují frázi „ano povoluju"** — buď psanou v modalu, nebo **vyslovenou hlasem** přes Whisper STT
-- **Sandbox** pro FS: path resolution + `is_inside_workdir` + `is_special_file` (drop `/proc/*`, `/sys/*`, `/dev/*`)
-- **Wall-time bounded** (10 min cap), tool-call cap per turn
-- **Append-only audit log** (JSONL) — každý tool call s permission decision, args hash, duration, outcome
-- **Prompt injection defense** — tool výstupy jsou data, ne instrukce
-- **Server-side history sanitization** — drop forged tool messages, canonicalize tool_call args na dict (Ollama spec)
+## Bezpečnost agenta
 
-**Agent TTS:**
-- Konfigurovatelný `tts_scope`: `final` (default — jen finální odpověď po toolech) / `off`
-- Code bloky **nikdy** nečteny nahlas (jdou jako `chunk` event v UI)
-- Sdílený synth pipeline s chat módem (žádná duplikace) — `_synth_chunk_and_emit` helper
-- Per-tool latency: audio filler („moment…") během dlouhých toolů via Web Speech API
-- OOM-resistant: LLM se uvolní z VRAM před TTS synth (gemma4-26b 10 GB + Chatterbox 3 GB se na 16 GB RTX nepomestí současně při activations peak)
+Každý tool má klasifikátor který vrátí jedno ze tří:
 
-**Voice approval:**
-- Tlačítko 🎤 přímo v approval modalu (kvůli `<dialog>` inert problému, mic v hlavním composeru je nedostupný)
-- Whisper transcribe → `classifyApprovalUtterance(text, requiresExplicit)`:
-  - **DENY priority** v konfliktu (safer)
-  - Destructive = **strict equal match** (`"ano povoluju"` přesně, ne substring — žádné false positive z citací)
-  - Non-destructive = intent (libovolná z `APPROVE_PHRASES`/`DENY_PHRASES`)
-- Race guard: snapshot `{turnId, approvalId}` při startu nahrávky; mismatch při finishi → discard
-- Server `/api/approval_config` = single source of truth pro fráze (žádný drift mezi server/client)
+- **AUTO** projde bez ptaní (čtení v workdir, `git status`, ...).
+- **ASK** UI ukáže modal s tlačítky Allow/Deny. Lze taky odpovědět hlasem nebo napsat.
+- **DENY** zamítnuto okamžitě (cesty mimo workdir, `/proc`, `/sys`, syntax error).
 
-### 🎙️ Voice webapp (`voice/webapp/`)
+Destruktivní akce (`rm`, `sudo`, `chmod`, write mimo workdir) vyžadují **explicitní frázi „ano povoluju"**. Stačí ji říct hlasem, modal má vlastní 🎤 tlačítko (hlavní mikrofon je v té chvíli inert kvůli `<dialog>::showModal()`). Match je přísný: čistá rovnost na normalizovaném textu, žádné „tak jsem řekl ano povoluju nikdy" false positive. V konfliktu vyhrává deny.
 
-- Hlasový a textový vstup s NDJSON streamingem
-- Auto-VAD nahrávání (1.5 s ticho = stop) i push-to-talk
-- TTS streaming po větách (`voice/sentence_chunker.py`)
-- Stop tlačítko atomicky přeruší recording / LLM / TTS / tool execution
-- Per-turn cancel + tmpdir, nezasahuje souběžné turny
-- WebGL orb avatar reaguje na audio level
-- Detekce jazyka + lang lock (po odpovědi se model drží zvoleného jazyka)
-- Mode toggle (chat ↔ agent ↔ claude) hlasem („přepni do agentního módu") i tlačítkem
-- Collapsible tool karty v transkriptu (status: running / OK / denied / error)
+Každý tool call jde do append-only JSONL audit logu (decision, args hash, duration, výsledek).
 
-### 🧠 Modely (Ollama tagy)
+## TTS v agent módu
 
-| Tag | Velikost | Kontext | Použití |
-|-----|----------|---------|---------|
-| `gemma4-e4b-32k` | ~9.6 GB | 32K | **default**, rychlé, tool-calling, plně v VRAM |
-| `gemma4-26b-32k` | ~17 GB | 32K | nejlepší kvalita pro programování, MoE |
-| `gemma4-31b-8k` | ~20 GB | 8K | maximální kvalita, CPU offload |
-| `gemma4-31b-gguf` | ~18.8 GB | 8K | Unsloth Dynamic 2.0 quant |
-| `qwen3-14b-32k` | ~9.3 GB | 32K | fallback (tool-calling kompatibilní) |
+Default `tts_scope=final`: nahlas se přečte jen finální odpověď po všech toolech. Mezikola jsou ticho, během dlouhých toolů hraje krátký filler („moment...") přes Web Speech API. Lze přepnout na `off`.
 
-Modelfiles jsou v [`modelfiles/`](modelfiles/).
+Code bloky se nikdy nečtou nahlas. Sentence chunker je vyseparuje a pošle do UI jako text-only chunk.
 
-## Hardware baseline
+Před TTS synth se uvolní Ollama LLM z VRAM (`keep_alive=0` na `/api/generate`). Bez toho gemma4-26b (10 GB) + Chatterbox TTS (3 GB) přetlačí 16 GB RTX 5070 Ti při activations peak a první synth OOM-ne. Cena: další turn re-loadne LLM (3-5 s).
 
-- NVIDIA RTX 5070 Ti (16 GB VRAM, Blackwell SM_120, CC 12.0)
-- 64 GB RAM, CUDA 13.2, Arch Linux
-- Ollama 0.21+ (Gemma 4 tool-calling fix nutný)
-
-## Rychlý start
+## Spuštění
 
 ```bash
-# 1) Naklonuj a připrav modely (Ollama už musí běžet jako systemd)
-ollama create gemma4-e4b-32k  -f modelfiles/gemma4-e4b-32k.Modelfile
-ollama create gemma4-26b-32k  -f modelfiles/gemma4-26b-32k.Modelfile
-# (volitelně další varianty z modelfiles/)
+# Ollama už musí běžet (systemd)
+ollama create gemma4-e4b-32k -f modelfiles/gemma4-e4b-32k.Modelfile
 
-# 2) Voice webapp — spouštěč
-./scripts/agent.sh                # WORKDIR = $PWD, port 8080
-./scripts/agent.sh --port 9000    # vlastní port
-./scripts/agent.sh --dangerous    # ASK rozhodnutí → AUTO (destructive stále vyžaduje frázi)
+# Spouštěč. WORKDIR = aktuální adresář (sandbox root pro agenta).
+./scripts/agent.sh
 
-# Wrapper z libovolného PWD (symlink do PATH):
+# Nebo symlink do PATH a pak `gemma` z libovolného PWD:
 ln -s $PWD/scripts/gemma ~/bin/gemma
-gemma                             # WORKDIR = aktuální adresář, agent dostane sandbox root tady
-
-# Skript sám detekuje a zabije starou zombie webapp na portu; cizí proces odmítne.
+gemma                # port 8080
+gemma --port 9000
+gemma --dangerous    # ASK -> AUTO (destructive stále vyžaduje frázi)
 ```
 
-Webapp běží na `http://127.0.0.1:8080`. Default model `gemma4-e4b-32k`, výchozí TTS scope `final` (čte jen finální odpověď agenta po toolech).
+Webapp na `http://127.0.0.1:8080`. Skript sám detekuje a zabije starou zombie webapp na portu (`/proc/$pid/stat` race-guard přes starttime). Cizí proces na portu odmítne s chybou.
 
-## Systemd konfigurace (již nasazena)
+## Modely
 
-Drop-in v `/etc/systemd/system/ollama.service.d/override.conf`:
+| Tag | Velikost | Kontext | Poznámka |
+|-----|----------|---------|----------|
+| `gemma4-e4b-32k` | 9.6 GB | 32K | default, rychlé |
+| `gemma4-26b-32k` | 17 GB | 32K | MoE, dobré na kód |
+| `gemma4-31b-8k` | 20 GB | 8K | nejvyšší kvalita, CPU offload |
+| `gemma4-31b-gguf` | 18.8 GB | 8K | Unsloth Dynamic 2.0 quant |
+| `qwen3-14b-32k` | 9.3 GB | 32K | fallback, tool calling kompatibilní |
+
+Všechny Modelfiles jsou v `modelfiles/`.
+
+## Hardware
+
+RTX 5070 Ti (16 GB, Blackwell SM_120, CC 12.0), 64 GB RAM, CUDA 13.2, Arch Linux. Ollama 0.21+ (kvůli tool calling fixu v Gemma 4).
+
+## Konfigurace Ollamy
+
+V `/etc/systemd/system/ollama.service.d/override.conf`:
 
 ```ini
 [Service]
@@ -133,65 +104,50 @@ ProtectHome=no
 ReadWritePaths=/home/box/git/github/gemma
 ```
 
-## Struktura repa
+## Struktura
 
 ```
 gemma/
-├── modelfiles/              # Ollama Modelfile (gemma4 e4b/26b/31b + qwen3)
-├── plans/                   # Design dokumenty per feature
-│   ├── voice_chat_webapp.md
-│   ├── agent_mode.md
-│   ├── bilingual_tts.md
-│   └── text_input.md
-├── prompts/                 # System prompty (cs/en)
-├── scripts/                 # gemma, agent.sh (s auto port-free), smoke_test.sh, …
+├── modelfiles/        Ollama Modelfile (gemma4 + qwen3)
+├── plans/             Design dokumenty per feature
+├── prompts/           System prompty
+├── scripts/           gemma, agent.sh
 ├── voice/
-│   ├── agent/               # Tool-calling: loop, permissions, messages, audit
-│   │   ├── loop.py          # AgentLoop — main driver
-│   │   ├── permissions.py   # AUTO/ASK/DENY classifier per tool
-│   │   ├── messages.py      # tool_calls canonicalize (dict args pro Ollama)
-│   │   ├── audit.py         # JSONL audit log
-│   │   ├── router.py        # Pre-flight heuristic (claude/local/smart-home)
-│   │   └── tools/           # 13 toolů (fs, shell, web, hue, claude, echo)
-│   ├── webapp/              # FastAPI server + frontend
-│   ├── sentence_chunker.py  # TTS sentence chunking (code blocky non-speakable)
-│   └── *.wav                # TTS voice reference
-├── tests/                   # pytest suite: 852 unit/E2E + integration proti reálné Ollamě
-│   └── integration/         # `pytest -m integration` (vyžaduje běžící Ollama)
-├── PLAN.md                  # Top-level baseline plán
-└── README.md
+│   ├── agent/         Agent loop, permissions, audit, 13 toolů
+│   ├── webapp/        FastAPI + frontend
+│   └── *.wav          Voice reference
+└── tests/             852 testů + integration suite
 ```
 
 ## Testy
 
 ```bash
-# Default (rychlé, ~17 s, mocked Ollama + TTS)
+# Default (mocked Ollama, mocked TTS)
 ./voice/.venv-tts/bin/python -m pytest tests/ -m "not integration"
 
-# Integration testy proti reálné Ollamě (vyžaduje běžící server + tool-capable model)
+# Integration proti reálné Ollamě (musí běžet + tool-capable model)
 ./voice/.venv-tts/bin/python -m pytest tests/integration/ -m integration
 ```
 
-**852 testů** (unit + E2E přes reálný uvicorn server na náhodném portu — ne ASGITransport, ten bufferuje streamy a způsobuje hangy). TTS preload je v testech stubbován.
+Mocked test suite ověří kontrakt s Ollamou (arguments jako dict, ne string, jinak HTTP 400 na další round-tripu). E2E testy běží proti reálnému uvicornu na náhodném portu, ne ASGITransport, protože ten bufferuje streamy.
 
-E2E pokrytí: agent loop (text/tool/approval/cancel), per-tool permission classification, audit log, full round-trips (write_file/run_bash/light_set/ask_claude), mocked Ollama validates arguments-as-dict kontrakt (regrese guard pro Ollama 400 bug).
+## Pár věcí které je dobré vědět
 
-## Klíčová architektonická rozhodnutí
+`tool_call.function.arguments` se interně drží jako **dict**, ne JSON string. Ollama native `/api/chat` chce objekt, string způsobí 400 „can't find closing '}' symbol" na druhém round-tripu po každém tool callu. (OpenAI API naopak chce string, takže pokud někdy přibude OpenAI backend, konverze patří do adapteru.)
 
-- **`tool_call.function.arguments` je vždy DICT** v interní historii, ne JSON string. Ollama native `/api/chat` chce object; string způsobí HTTP 400 „can't find closing '}' symbol" při round-tripu po každém tool callu. (OpenAI Chat Completions naopak chce string — pokud někdy přibude OpenAI backend, konverze patří do adapteru.)
-- **Sdílený TTS synth helper** mezi chat a agent módem (`_synth_chunk_and_emit`) — jedna funkce, dvě cesty volání (per-sentence streaming pro chat, one-shot final-only pro agent). Žádná duplikace.
-- **Single source of truth pro fráze**: server endpoint `/api/approval_config` vrací `APPROVE_PHRASES`, `DENY_PHRASES`, `DESTRUCTIVE_APPROVAL_PHRASE` z `voice/agent/config.py`. Frontend má fallback constants jen pro init před prvním fetchem.
-- **Codex review cyklus per fáze**: po každé větší změně review přes `codex exec` (a `gemini` když je dostupný), iterovat dokud critical/high = 0.
+Synth pipeline je sdílená mezi chat a agent módem. Chat ji volá per-sentence během streamingu, agent ji volá jednou po `agent_done` s celým finálním textem. Helper `_synth_chunk_and_emit` v `voice/webapp/server.py`.
+
+Fráze pro approval (APPROVE_PHRASES, DENY_PHRASES, DESTRUCTIVE_APPROVAL_PHRASE) žijí v `voice/agent/config.py`. Frontend si je tahá přes `GET /api/approval_config`, fallback constants jsou v `app.js` jen pro init před prvním fetchem. Žádný drift.
 
 ## Plány
 
-- [`plans/voice_chat_webapp.md`](plans/voice_chat_webapp.md) — voice webapp (hotovo)
-- [`plans/bilingual_tts.md`](plans/bilingual_tts.md) — bilingual TTS (hotovo)
-- [`plans/text_input.md`](plans/text_input.md) — text input + mode toggle (hotovo)
-- [`plans/agent_mode.md`](plans/agent_mode.md) — agent mode (hotovo, vč. TTS, voice approval, 13 toolů)
+- `plans/voice_chat_webapp.md` voice webapp
+- `plans/agent_mode.md` agent mode s 13 tools a voice approval
+- `plans/bilingual_tts.md` cs/en TTS swap
+- `plans/text_input.md` textový vstup, mode toggle
 
-Top-level baseline + hardware audit → [`PLAN.md`](PLAN.md).
+Top-level baseline v `PLAN.md`.
 
 ## Licence
 
-MIT (viz [LICENSE](LICENSE), bude doplněn).
+MIT.
