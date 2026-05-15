@@ -20,7 +20,6 @@ from __future__ import annotations
 
 from voice.agent.claude_bridge import ask_claude_oneshot
 from voice.agent.config import (
-    ANTHROPIC_API_KEY,
     CLAUDE_CLI_BIN,
     CLAUDE_DEFAULT_MODEL,
     CLAUDE_MAX_PROMPT_BYTES,
@@ -87,7 +86,6 @@ async def _ask_claude_exec(args: dict, ctx: ExecuteContext) -> dict:
         model=CLAUDE_DEFAULT_MODEL,
         timeout_sec=CLAUDE_TIMEOUT_SEC,
         output_cap_bytes=CLAUDE_OUTPUT_CAP_BYTES,
-        api_key=ANTHROPIC_API_KEY,
         claude_bin=CLAUDE_CLI_BIN,
         cancel_event=cancel_event,
     )

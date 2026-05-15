@@ -235,8 +235,9 @@ async def test_max_tokens_out_of_range():
 
 @pytest.mark.asyncio
 async def test_happy_path(monkeypatch):
-    """Validní prompt → subprocess úspěch → JSON parsed → ok=True + text."""
-    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
+    """Validní prompt → subprocess úspěch → JSON parsed → ok=True + text.
+    Auth si Claude CLI řeší sám (OAuth/keychain/API key) - bridge se na to
+    nedívá. Pokud `claude` v terminálu funguje, funguje i tady."""
 
     response_json = json.dumps({
         "type": "result", "subtype": "success",
@@ -263,8 +264,9 @@ async def test_happy_path(monkeypatch):
     # Argv security: prompt MUSÍ NE být v argv (`ps` leak)
     argv_joined = " ".join(captured["argv"])
     assert "Hi Claude" not in argv_joined, "prompt leak v argv!"
-    # Bezpečnostní flagy MUSÍ být přítomné
-    assert "--bare" in captured["argv"]
+    # Bezpečnostní flagy MUSÍ být přítomné. NE `--bare` (zakazuje OAuth/
+    # keychain auth, vynucuje API klíč - user by ho jinak nepotřeboval).
+    assert "--bare" not in captured["argv"]
     assert "--no-session-persistence" in captured["argv"]
     assert "--permission-mode" in captured["argv"]
     assert "plan" in captured["argv"]
@@ -281,7 +283,6 @@ async def test_happy_path(monkeypatch):
 @pytest.mark.asyncio
 async def test_system_via_argv(monkeypatch):
     """System prompt jde přes --append-system-prompt argv (CLI 2.1.x nemá file flag)."""
-    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
     response = json.dumps({"result": "ok", "is_error": False})
     proc = _FakeProcess(stdout_chunks=[response.encode()], stderr_chunks=[])
     captured = _patch_subprocess(monkeypatch, proc)
@@ -300,18 +301,8 @@ async def test_system_via_argv(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_no_api_key(monkeypatch):
-    """Bez API klíče → fail fast, žádný subprocess spawn."""
-    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "")
-    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
-    assert r["ok"] is False
-    assert "ANTHROPIC_API_KEY" in r["error"]
-
-
-@pytest.mark.asyncio
 async def test_cli_not_found(monkeypatch):
     """`claude` binary chybí → FileNotFoundError → user-facing error."""
-    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
     _patch_subprocess(monkeypatch, proc=None, raises=FileNotFoundError)
     _patch_killpg(monkeypatch)
 
@@ -323,7 +314,6 @@ async def test_cli_not_found(monkeypatch):
 @pytest.mark.asyncio
 async def test_nonzero_exit(monkeypatch):
     """Exit != 0 → ok=False + stderr_preview."""
-    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
     proc = _FakeProcess(
         stdout_chunks=[b""],
         stderr_chunks=[b"Error: rate limit exceeded\n"],
@@ -341,7 +331,6 @@ async def test_nonzero_exit(monkeypatch):
 @pytest.mark.asyncio
 async def test_invalid_json_output(monkeypatch):
     """CLI vrátil garbled output → invalid JSON error."""
-    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
     proc = _FakeProcess(
         stdout_chunks=[b"not valid json {{"],
         stderr_chunks=[],
@@ -358,7 +347,6 @@ async def test_invalid_json_output(monkeypatch):
 @pytest.mark.asyncio
 async def test_is_error_flag(monkeypatch):
     """JSON má is_error=True → ok=False s message z result."""
-    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
     response = json.dumps({
         "result": "API quota exceeded", "is_error": True,
     })
@@ -377,7 +365,6 @@ async def test_is_error_flag(monkeypatch):
 @pytest.mark.asyncio
 async def test_timeout(monkeypatch):
     """Subprocess nedokončí v timeout_sec → killpg + ok=False."""
-    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
     monkeypatch.setattr("voice.agent.tools.claude.CLAUDE_TIMEOUT_SEC", 0.2)
     proc = _FakeProcess(
         stdout_chunks=[b""], stderr_chunks=[],
@@ -396,7 +383,6 @@ async def test_timeout(monkeypatch):
 @pytest.mark.asyncio
 async def test_cancel_event(monkeypatch):
     """`cancel_event.set()` během běhu → killpg + ok=False canceled."""
-    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
     proc = _FakeProcess(
         stdout_chunks=[b""], stderr_chunks=[],
         returncode=0, wait_delay=2.0,
@@ -425,7 +411,6 @@ async def test_cancel_event(monkeypatch):
 @pytest.mark.asyncio
 async def test_output_cap_kills_process(monkeypatch):
     """Stdout > cap_bytes → on_overflow zavolá killpg, buffer truncated."""
-    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
     monkeypatch.setattr("voice.agent.tools.claude.CLAUDE_OUTPUT_CAP_BYTES", 1024)
     # 2 KiB chunk = překročí 1 KiB cap
     huge = b"X" * (2 * 1024)
@@ -443,8 +428,8 @@ async def test_output_cap_kills_process(monkeypatch):
 
 
 def test_env_scrubbed_keeps_safe_vars(monkeypatch):
-    """Env passed to subprocess obsahuje JEN allowlist + ANTHROPIC_API_KEY,
-    NIC z AGENT_*/BRAVE_*/GH_*/*_TOKEN."""
+    """Env passed to subprocess obsahuje JEN allowlist (HOME/USER/PATH/LANG/
+    XDG_*/ANTHROPIC_API_KEY když je), NIC z AGENT_*/BRAVE_*/GH_*/*_TOKEN."""
     monkeypatch.setenv("AGENT_INTERNAL_FLAG", "yes")
     monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brv-secret")
     monkeypatch.setenv("GITHUB_TOKEN", "gh_secret")
@@ -452,21 +437,35 @@ def test_env_scrubbed_keeps_safe_vars(monkeypatch):
     monkeypatch.setenv("HOME", "/home/user")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
-    env = claude_bridge._build_subprocess_env("sk-claude")
+    env = claude_bridge._build_subprocess_env()
 
-    # MUSÍ obsahovat
-    assert env["ANTHROPIC_API_KEY"] == "sk-claude"
+    # MUSÍ obsahovat (allowlist)
     assert env["HOME"] == "/home/user"
     assert env["PATH"] == "/usr/bin:/bin"
-    # NESMÍ obsahovat
+    # NESMÍ obsahovat (citlivá data jiných služeb)
     assert "AGENT_INTERNAL_FLAG" not in env
     assert "BRAVE_SEARCH_API_KEY" not in env
     assert "GITHUB_TOKEN" not in env
     assert "MY_API_KEY" not in env
 
 
+def test_env_passes_anthropic_key_when_in_env(monkeypatch):
+    """Pokud user má ANTHROPIC_API_KEY v env (alternativa k OAuth/keychain),
+    projde do subprocess. Bridge ho nikdy NEPRIDÁVÁ - jen propustí, když je."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    env = claude_bridge._build_subprocess_env()
+    assert env.get("ANTHROPIC_API_KEY") == "sk-test"
+
+
+def test_env_no_anthropic_key_when_not_in_env(monkeypatch):
+    """Bez klíče v env taky OK - CLI použije OAuth/keychain."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    env = claude_bridge._build_subprocess_env()
+    assert "ANTHROPIC_API_KEY" not in env
+
+
 def test_env_lc_prefix_passed(monkeypatch):
     """LC_* vars passnou (locale)."""
     monkeypatch.setenv("LC_TIME", "cs_CZ.UTF-8")
-    env = claude_bridge._build_subprocess_env("k")
+    env = claude_bridge._build_subprocess_env()
     assert env.get("LC_TIME") == "cs_CZ.UTF-8"

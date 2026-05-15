@@ -4,23 +4,32 @@ Spawnuje `claude -p` jako subprocess, posílá prompt přes stdin, čte JSON
 výstup. **Není to REST API call.** Vzor je `avatar-engine/avatar_engine/
 bridges/claude.py` (zjednodušeno, oneshot místo persistentního).
 
+Auth: Claude CLI si řeší autentizaci sám přes `claude auth` (OAuth /
+keychain / API key, dle setupu uživatele). Bridge nepotřebuje ANTHROPIC_API_KEY
+explicitně - pokud user má funkční `claude` v terminálu, funguje i tady.
+
 Bezpečnostní model:
 - Prompt se NEPOSÍLÁ přes argv (leak přes `ps`). Stdin only.
-- `--bare`: skip hooks, LSP, plugin sync, auto-memory, keychain reads,
-  CLAUDE.md auto-discovery. Auth je striktně přes `ANTHROPIC_API_KEY` env.
 - `--tools ""`: žádné built-in Claude Code tools (Read/Edit/Bash). Sub-agent
   jen odpoví textem, žádné FS/shell side-effects. Naše tooly se přes tohle
   obejít nedají.
 - `--no-session-persistence`: žádný session state na disku.
 - `--permission-mode plan`: Claude plánuje, needituje (defense in depth).
 - `cwd` = prázdný temp dir → Claude nemá kde číst project config, CLAUDE.md.
-- Env scrub: keep jen needed (HOME/USER/PATH/LANG) + ANTHROPIC_API_KEY,
-  drop AGENT_*/BRAVE_*/GH_*/*_SECRET/*_TOKEN atd.
+- Env scrub: keep jen needed (HOME/USER/PATH/LANG/XDG_*) pro CLI auth flow,
+  drop AGENT_*/BRAVE_*/GH_*/*_SECRET/*_TOKEN/MY_API_KEY/etc. Pokud user má
+  ANTHROPIC_API_KEY v env, projde (CLI to honoruje stejně jako keychain).
 - `start_new_session=True` (process group) + `os.killpg` cleanup. Claude CLI
   spawnuje child procesy (MCP servery, hooks); single PID kill nestačí.
 - Per-chunk output cap během streaming reading. Při překročení killpg
   okamžitě, ne až po `communicate()` (jinak by CLI sežrala RAM).
 - Stderr drain async task - bez něj plný stderr pipe zamrzne proces.
+
+Caveats bez `--bare`:
+- User hooks z `~/.claude/hooks/` se spustí. To je user-controlled, ne
+  attack surface (vlastník stroje = vlastník hooks).
+- CLAUDE.md auto-discovery: cwd je prázdný temp dir, takže nic nenajde.
+- Plugin sync: může dělat krátký network call k registry. Akceptovatelný overhead.
 
 Cancel:
 - Bridge přijímá `cancel_event` (asyncio.Event z turn_state). Race proti
@@ -42,26 +51,28 @@ from typing import Any
 log = logging.getLogger("agent-claude-bridge")
 
 
-# Env vars které Claude CLI legitimně potřebuje. ANTHROPIC_API_KEY přidáme
-# explicitně. Vše ostatní z parent env je drop (žádné AGENT_*, GH_*, *_SECRET).
+# Env vars které Claude CLI legitimně potřebuje pro auth flow + běh.
+# XDG_* a HOME jsou kritické - tam má keychain/config. ANTHROPIC_API_KEY
+# pustíme jen pokud user ho v env explicitně má (alternativa k OAuth/keychain).
+# Vše ostatní z parent env je drop (žádné AGENT_*, GH_*, BRAVE_*, *_SECRET).
 _ENV_ALLOWLIST = frozenset({
     "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TZ", "TERM",
     "PATH", "PWD", "TMPDIR",
-    # Claude CLI honoruje:
-    "CLAUDE_CODE_SIMPLE",  # nastaví ho samo přes --bare, ale necháme passthrough
+    # Claude CLI auth a config:
+    "ANTHROPIC_API_KEY",   # volitelný, OAuth/keychain je primární
     "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+    "XDG_RUNTIME_DIR",     # keychain pod systemd-user může čerpat z tohohle
 })
 
 
-def _build_subprocess_env(api_key: str) -> dict[str, str]:
-    """Filtruj parent env na allowlist + přidej ANTHROPIC_API_KEY."""
+def _build_subprocess_env() -> dict[str, str]:
+    """Filtruj parent env na allowlist. Claude CLI si auth řeší sám
+    (OAuth/keychain/API key). Bridge sám ANTHROPIC_API_KEY nenastavuje -
+    nechá CLI rozhodnout, co je nakonfigurované."""
     out: dict[str, str] = {}
     for k, v in os.environ.items():
         if k in _ENV_ALLOWLIST or k.startswith("LC_"):
             out[k] = v
-    out["ANTHROPIC_API_KEY"] = api_key
-    # --bare už nastavuje CLAUDE_CODE_SIMPLE=1 sám, ale explicit doesn't hurt.
-    out.setdefault("CLAUDE_CODE_SIMPLE", "1")
     return out
 
 
@@ -133,7 +144,6 @@ async def ask_claude_oneshot(
     model: str,
     timeout_sec: float,
     output_cap_bytes: int,
-    api_key: str,
     claude_bin: str = "claude",
     cancel_event: asyncio.Event | None = None,
 ) -> dict[str, Any]:
@@ -150,17 +160,10 @@ async def ask_claude_oneshot(
       "stderr_preview": str? # první ~500 bytů stderr při errorech
     }
 
-    Žádné FS side-effects, žádné network calls z naší strany (Claude CLI
-    si dělá HTTPS na Anthropic API sám).
+    Auth: Claude CLI si řeší sám (OAuth/keychain/API key dle setupu).
+    Bridge nemusí ANTHROPIC_API_KEY ručně podávat. Žádné FS side-effects,
+    žádné network calls z naší strany (Claude CLI si dělá HTTPS sám).
     """
-    if not api_key:
-        return {
-            "ok": False,
-            "error": (
-                "ANTHROPIC_API_KEY není nastavený. Env var nebo "
-                "~/.anthropic-api-key (chmod 0600)."
-            ),
-        }
     if not prompt or not prompt.strip():
         return {"ok": False, "error": "empty prompt"}
 
@@ -168,7 +171,6 @@ async def ask_claude_oneshot(
     argv = [
         claude_bin,
         "-p",                            # --print, non-interactive
-        "--bare",                        # skip hooks/LSP/plugins/keychain/CLAUDE.md
         "--no-session-persistence",      # žádný state na disku
         "--permission-mode", "plan",     # plan only, žádné edits (defense in depth)
         "--output-format", "json",       # single JSON result
@@ -182,7 +184,7 @@ async def ask_claude_oneshot(
         # prompt. Pokud user dá secrets do system, je to jeho rozhodnutí.
         argv += ["--append-system-prompt", system]
 
-    env = _build_subprocess_env(api_key)
+    env = _build_subprocess_env()
 
     # Empty temp dir as cwd - Claude nemá kde najít project config / CLAUDE.md.
     with tempfile.TemporaryDirectory(prefix="claude_bridge_") as tmp:

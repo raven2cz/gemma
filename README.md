@@ -74,14 +74,14 @@ gemma --dangerous    # ASK -> AUTO (destructive stále vyžaduje frázi)
 
 Webapp na `http://127.0.0.1:8080`. Skript sám detekuje a zabije starou zombie webapp na portu (`/proc/$pid/stat` race-guard přes starttime). Cizí proces na portu odmítne s chybou.
 
-## API klíče
+## Externí služby
 
-Dvě věci potřebují klíče k externím službám. Bez nich daný tool prostě vrátí error a agent o tom ví.
+**`ask_claude`** spawne `claude -p` jako subprocess (Claude Code CLI). Auth si CLI řeší sám: pokud máš `claude auth login` udělaný, funguje. Pokud preferuješ API klíč, dej `ANTHROPIC_API_KEY` do env. Server tu žádný klíč sám nenastavuje, jen pasivně pasuje env do subprocesu. Sub-agent běží s `--tools "" --no-session-persistence --permission-mode plan` v prázdném temp dir, takže nemá přístup k FS ani shellu, jen vrátí text. Default model `claude-opus-4-7`, override `AGENT_CLAUDE_MODEL`. CLI binary lze přepsat přes `CLAUDE_CLI_BIN`. Implementace v `voice/agent/claude_bridge.py` (vzor `avatar-engine/avatar_engine/bridges/claude.py`).
 
-**Brave Search** (pro `web_search`). Účet zdarma má 2000 dotazů měsíčně:
+**`web_search`** volá Brave Search API přímo (REST), takže klíč potřebuje. Účet zdarma má 2000 dotazů měsíčně:
 
 ```bash
-# Buď env var:
+# Env var:
 export BRAVE_SEARCH_API_KEY="BSA-..."
 
 # Nebo soubor 0600 (server ho přečte při startu):
@@ -89,16 +89,7 @@ echo "BSA-..." > ~/.brave-search-api
 chmod 600 ~/.brave-search-api
 ```
 
-**Anthropic API** (pro `ask_claude`). Tool spawne `claude -p` jako subprocess (Claude Code CLI, ne přímý REST call). Sub-agent běží s `--bare --tools "" --no-session-persistence --permission-mode plan` v prázdném temp dir, takže nemá přístup k FS ani shellu, jen vrátí text. Default model `claude-opus-4-7`, override `AGENT_CLAUDE_MODEL`. Účtuje se vstupní + výstupní tokeny podle Anthropic ceníku. CLI binary lze přepsat přes `CLAUDE_CLI_BIN`.
-
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-# nebo
-echo "sk-ant-..." > ~/.anthropic-api-key
-chmod 600 ~/.anthropic-api-key
-```
-
-Server v obou případech odmítne načíst soubor, který je world/group readable (`mode & 0o077`). Override cesty jdou přes `BRAVE_SEARCH_API_KEY_FILE` a `ANTHROPIC_API_KEY_FILE`. Implementace bridge je v `voice/agent/claude_bridge.py` (vzor `avatar-engine/avatar_engine/bridges/claude.py`).
+Server odmítne načíst soubor, který je world/group readable (`mode & 0o077`). Override cesty přes `BRAVE_SEARCH_API_KEY_FILE`.
 
 ## Modely
 
