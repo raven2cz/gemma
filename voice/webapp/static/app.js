@@ -13,6 +13,17 @@ const AVATARS = {
 // ──────────── DOM
 const $ = (id) => document.getElementById(id);
 const modelSelect = $('model-select');
+const brandModel = $('brand-model');
+
+/** Synchronizuj brand badge v topbaru s aktuálně zvoleným modelem. Voláno
+ * po loadModels() a po každé change události na dropdownu. Badge má title
+ * = celý model string (pro hover, pokud je text useknutý ellipsis). */
+function syncBrandModel() {
+  if (!brandModel) return;
+  const m = modelSelect.value || '(none)';
+  brandModel.textContent = m;
+  brandModel.title = `Model: ${m} (změníš v ⚙ Konfigurace → model)`;
+}
 const voiceSelect = $('voice-select');
 const refSelect = $('ref-select');
 const refField = $('ref-field');
@@ -390,6 +401,7 @@ async function loadModels() {
       // Persistuj rozhodnutí, aby další load nemusel resolve-ovat znova.
       localStorage.setItem('model', resolved);
     }
+    syncBrandModel();
     console.info(`[model] resolved=${resolved} (saved=${JSON.stringify(saved)})`);
   } catch (e) {
     showError(`Nelze načíst modely: ${e.message}`);
@@ -1737,7 +1749,11 @@ textInput.addEventListener('input', () => {
   updateSendButton();
 });
 
-modelSelect.addEventListener('change', () => localStorage.setItem('model', modelSelect.value));
+modelSelect.addEventListener('change', () => {
+  localStorage.setItem('model', modelSelect.value);
+  syncBrandModel();
+  console.info(`[model] changed → ${modelSelect.value}`);
+});
 voiceSelect.addEventListener('change', () => localStorage.setItem('voice', voiceSelect.value));
 refSelect.addEventListener('change', () => {
   localStorage.setItem('refExplicit', refSelect.value);

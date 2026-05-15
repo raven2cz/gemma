@@ -79,6 +79,19 @@ body {
   font-size: 14px;
   color: var(--fg-dim);
 }
+.brand-model {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.25);
+  color: var(--fg);
+  white-space: nowrap;
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .brand-dot {
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--accent);
