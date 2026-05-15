@@ -623,6 +623,28 @@ async def health():
     return await _health_report()
 
 
+# Single source of truth pro voice approval fráze. Frontend si je natáhne při
+# startu — fallback constants v app.js, ale primárně server (žádný drift).
+@app.get("/api/approval_config")
+async def approval_config():
+    """Vrátí seznam frází, které frontend mapuje na approve/deny rozhodnutí
+    při hlasovém approval, a canonical destructive frázi pro `requires_explicit`
+    operace.
+
+    Frontend volá při startu UI; výsledek se cachuje pro životnost stránky.
+    """
+    from voice.agent.config import (
+        APPROVE_PHRASES,
+        DENY_PHRASES,
+        DESTRUCTIVE_APPROVAL_PHRASE,
+    )
+    return {
+        "approve_phrases": list(APPROVE_PHRASES),
+        "deny_phrases": list(DENY_PHRASES),
+        "destructive_phrase": DESTRUCTIVE_APPROVAL_PHRASE,
+    }
+
+
 # --------------------------------------------------------------------- models
 
 @app.get("/api/models")

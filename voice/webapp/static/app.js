@@ -51,6 +51,8 @@ const approvalExplicit = $('approval-explicit');
 const approvalPhraseInput = $('approval-phrase-input');
 const approvalAllowBtn = $('approval-allow-btn');
 const approvalDenyBtn = $('approval-deny-btn');
+const approvalMicBtn = $('approval-mic-btn');
+const approvalForm = $('approval-form');
 
 // ──────────── State
 const state = {
@@ -137,6 +139,7 @@ const PHASE_LABELS = {
   recording: 'poslouchám…',
   transcribing: 'přepisuji…',
   thinking: 'přemýšlím…',
+  approval: 'čekám na potvrzení…',
   synthesizing: 'syntetizuji hlas…',
   speaking: 'mluvím…',
   error: 'chyba',
@@ -146,7 +149,8 @@ function setPhase(phase) {
   state.phase = phase;
 
   const avatarPhase =
-    phase === 'transcribing' || phase === 'synthesizing' ? 'thinking' : phase;
+    phase === 'transcribing' || phase === 'synthesizing' || phase === 'approval'
+      ? 'thinking' : phase;
   avatar.setPhase(avatarPhase);
 
   phaseLabel.textContent = phase;
@@ -155,7 +159,10 @@ function setPhase(phase) {
   const busy = phase !== 'idle' && phase !== 'error';
 
   composer.classList.toggle('busy', busy);
-  textInput.disabled = busy;
+  // V `approval` fázi VYŽADUJEME aktivní mic + text input, aby user mohl říct
+  // / napsat "ano povoluju" / "ne". Bez toho by setPhase('approval') zablokoval
+  // jediné cesty, jak voice/text intercept spustit (mic + text submit handler).
+  textInput.disabled = busy && phase !== 'approval';
   // Send ↔ Stop swap: v busy fázi (recording / transcribing / thinking /
   // synthesizing / speaking) schováme Send a ukážeme Stop na stejném slotu.
   // `hidden` attr odstraní z tab orderu i a11y stromu (nejen display:none).
@@ -163,7 +170,7 @@ function setPhase(phase) {
   stopBtn.hidden = !busy;
   sendBtn.hidden = busy;
   micBtn.classList.toggle('recording', phase === 'recording');
-  micBtn.disabled = busy && phase !== 'recording';
+  micBtn.disabled = busy && phase !== 'recording' && phase !== 'approval';
   updateSendButton();
   // Keyboard UX: když fokus byl na Send a ten zmizí, přesuň ho na Stop,
   // ať user může Stop odpálit Enterem bez mouse/tab navigace.
@@ -173,10 +180,9 @@ function setPhase(phase) {
 }
 
 function updateSendButton() {
-  sendBtn.disabled =
-    state.phase !== 'idle' && state.phase !== 'error'
-      ? true
-      : textInput.value.trim().length === 0;
+  const submittable = state.phase === 'idle' || state.phase === 'error'
+                      || state.phase === 'approval';
+  sendBtn.disabled = !submittable || textInput.value.trim().length === 0;
 }
 
 // ──────────── Error UI
@@ -520,6 +526,12 @@ async function beginRecording({ auto }) {
     mr.ondataavailable = (e) => { if (e.data && e.data.size) state.recordedChunks.push(e.data); };
     mr.onstop = () => finishRecording();
     state.mediaRecorder = mr;
+    // Snapshot pending approval (turnId + approvalId) — pokud se mezitím modal
+    // zavře/změní, finishRecording() to detekuje a discard-ne transkripci místo
+    // toho, aby ji omylem poslal na neaktivní approval nebo do nového turnu.
+    state.recordingApprovalSnap = _pendingApproval
+      ? { turnId: _pendingApproval.turnId, approvalId: _pendingApproval.approvalId }
+      : null;
     mr.start(250);
 
     setPhase('recording');
@@ -579,17 +591,51 @@ async function finishRecording() {
     userText = (text || '').trim();
   } catch (e) {
     showError(`Přepis selhal: ${e.message}`);
-    setPhase('idle');
+    // Pokud běží approval modal, drž fázi 'approval' (user může zkusit znovu).
+    setPhase(_pendingApproval !== null ? 'approval' : 'idle');
     return;
   }
 
   if (!userText) {
     showError('Nic se nerozpoznalo.');
-    setPhase('idle');
+    setPhase(_pendingApproval !== null ? 'approval' : 'idle');
     return;
   }
 
   state.inputMode = 'mic';
+
+  // Voice approval intercept: pokud běží modal čekající na phrase, route
+  // tam místo do /api/turn. Race-guard: snapshot ID na startu recordingu
+  // a při finishi STRIKTNĚ ověř shodu (snap může být null pokud recording
+  // začal PŘED otevřením modalu — taky discard, jinak by neúmyslná
+  // transkripce poslala approve nahodile do právě otevřeného modalu).
+  if (_pendingApproval !== null) {
+    const snap = state.recordingApprovalSnap;
+    const matches = snap
+      && snap.turnId === _pendingApproval.turnId
+      && snap.approvalId === _pendingApproval.approvalId;
+    if (!matches) {
+      showError(
+        'Mikrofon byl spuštěn před schvalovacím modalem — transkripci ignoruji. '
+        + 'Stiskni mic znovu a řekni „ano povoluju" / „ne".',
+        { sticky: true }
+      );
+      setPhase('approval');
+      return;
+    }
+    handleVoiceApproval(userText);
+    return;
+  }
+  // Pokud recording začal pro approval ALE modal mezitím zavřel (user kliknul
+  // Allow/Deny/Esc během recording), zahoď transkripci — jinak by šla jako
+  // nový chat turn. Codex audit HIGH: defense in depth nad běžným resetem
+  // `recordingApprovalSnap` až v beginRecording.
+  if (state.recordingApprovalSnap !== null) {
+    state.recordingApprovalSnap = null;
+    showError('Modal byl mezitím zavřen — nahrávku ignoruji.');
+    setPhase('idle');
+    return;
+  }
 
   // Voice intent: "agent mód" / "chat mód" → přepne mode bez LLM kola.
   if (handleModeSwitchIntent(userText)) return;
@@ -599,6 +645,38 @@ async function finishRecording() {
 
   // Next: LLM (mic vstup → chceme TTS pokud není globálně vypnutý)
   await runTurn();
+}
+
+/** Voice approval handler — mapuje transcript na approve/deny rozhodnutí.
+ * No-match: ukáže transcript v modal phrase inputu + toast, user může opravit
+ * ručně nebo nahrát znovu. Transcript se NEPŘIDÁVÁ do chat historie. */
+function handleVoiceApproval(userText) {
+  if (_pendingApproval === null) {
+    setPhase('idle');
+    return;
+  }
+  const result = classifyApprovalUtterance(userText, _pendingApproval.requiresExplicit);
+  if (result === null) {
+    // No-match: ukaž transcript v modal inputu + toast.
+    if (_pendingApproval.requiresExplicit && approvalPhraseInput) {
+      approvalPhraseInput.value = userText;
+      // Re-evaluate allow button enable state (delegováno na onPhraseInput).
+      approvalPhraseInput.dispatchEvent(new Event('input'));
+    }
+    showError(
+      _pendingApproval.requiresExplicit
+        ? `Nerozumím, řekni „ano povoluju" pro povolení nebo „ne" pro zamítnutí. (transcript: „${userText}")`
+        : `Nerozumím, řekni „ano" / „ne". (transcript: „${userText}")`,
+      { sticky: true }
+    );
+    // Modal pořád otevřený — phase zpátky na approval, ať mic/text input
+    // zůstanou aktivní pro další pokus.
+    setPhase('approval');
+    return;
+  }
+  // Atomic resolve — finish() volá cleanup + resolve, nuluje _pendingApproval.
+  // setPhase přepne caller v stream loop ('approval' → 'thinking').
+  _pendingApproval.finish(result);
 }
 
 // Měkký cap: posledních 40 tahů (20 párů). Všechny naše modely mají num_ctx=32768,
@@ -805,10 +883,15 @@ async function runTurn() {
             // vyrobí novou (currentAssistantEl už je null po appendToolCard).
             break;
           case 'approval_required': {
-            // Agent mode: schvalování. UI modal blokuje další interakci dokud
-            // user neresolve. Voice integration přijde v Phase 3.
+            // Agent mode: schvalování. UI modal + povolený mic/text submit pro
+            // hlasovou nebo textovou approval frázi (intercept v finishRecording
+            // a handleTextSubmit).
             setToolCardAwaiting(ev.tool_call_id);
+            setPhase('approval');
             const { decision, phrase } = await showApprovalModal(ev, ctx.id);
+            // Po resolve modal: vrátit phase zpět na thinking (server pokračuje
+            // tool execution / dalším round).
+            setPhase('thinking');
             const ok = await sendApprovalDecision(ctx.id, ev.approval_id, decision, phrase);
             // Pokud server odmítl (např. destruktivní bez správné fráze),
             // nahlas to a abortni turn — server čeká na další POST a nic
@@ -1229,7 +1312,75 @@ function fillToolResult(ev) {
 }
 
 // ──────────── Approval modal
-let _pendingApproval = null;  // { resolve(decision: 'approve'|'deny'), requiresExplicit }
+// Approval phrase config — fetchnuto z `/api/approval_config` při startu UI,
+// fallback constants (musí být v sync s voice/agent/config.py). Server je
+// authoritative; tyto fallbacky kryjí init před prvním fetchem.
+let _approvalConfig = {
+  approve_phrases: ['ano', 'jo', 'ok', 'okej', 'okay', 'povol', 'povoluju',
+                    'jasně', 'jasne', 'fajn', 'yes'],
+  deny_phrases: ['ne', 'stop', 'zruš', 'zrus', 'nepovoluju', 'nechci', 'no'],
+  destructive_phrase: 'ano povoluju',
+};
+fetch('/api/approval_config').then(r => r.ok ? r.json() : null).then(cfg => {
+  if (cfg && cfg.approve_phrases && cfg.deny_phrases && cfg.destructive_phrase) {
+    _approvalConfig = cfg;
+  }
+}).catch(() => {/* keep fallback */});
+
+// Normalizace transkripce z Whisperu pro phrase match: lowercase, strip
+// interpunkce, collapse whitespace. ZACHOVÁVÁ diakritiku ("zruš", "jasně").
+function _normalizeVoicePhrase(text) {
+  return (text || '')
+    .toLowerCase()
+    .replace(/[.,!?;:()"„""'`]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Najde whole-word match v normalized textu (boundary = whitespace nebo začátek/konec).
+function _containsWord(normalized, phrase) {
+  const padded = ` ${normalized} `;
+  return padded.indexOf(` ${phrase} `) !== -1;
+}
+
+// Najde substring (pro multi-word phrase typu "ano povoluju").
+function _containsPhrase(normalized, phrase) {
+  return normalized.includes(phrase);
+}
+
+/**
+ * Mapuje voice/text input na approval rozhodnutí. Konflikt (approve i deny)
+ * vyhrává DENY (codex: safer). Destructive vyžaduje phrase-match, ne intent.
+ *
+ * @return {{decision: 'approve'|'deny', phrase: string} | null} null = no match
+ */
+function classifyApprovalUtterance(text, requiresExplicit) {
+  const norm = _normalizeVoicePhrase(text);
+  if (!norm) return null;
+
+  const hasDeny = _approvalConfig.deny_phrases.some(p => _containsWord(norm, p));
+  if (hasDeny) return { decision: 'deny', phrase: '' };
+
+  if (requiresExplicit) {
+    // Destructive: STRICT match — normalized text musí být přesně rovný
+    // canonical frázi. Codex audit HIGH: contains/substring chytí false
+    // positive jako "tak jsem řekl 'ano povoluju' nikdy", což by povolilo
+    // destruktivní akci ze špatného kontextu. Pokud whisper přidá prefix
+    // ("říkám ano povoluju"), no-match → fallback do input fieldu pro
+    // ruční kontrolu, ne automatický approve.
+    if (norm === _approvalConfig.destructive_phrase) {
+      // Posíláme SERVERY očekávanou canonical formu, ne user text.
+      return { decision: 'approve', phrase: _approvalConfig.destructive_phrase };
+    }
+    return null;
+  }
+  // Non-destructive: intent based, libovolná approve fráze.
+  const hasApprove = _approvalConfig.approve_phrases.some(p => _containsWord(norm, p));
+  if (hasApprove) return { decision: 'approve', phrase: '' };
+  return null;
+}
+
+let _pendingApproval = null;  // { finish(result), requiresExplicit, turnId, approvalId }
 
 function showApprovalModal(ev, turnId) {
   return new Promise((resolve) => {
@@ -1260,20 +1411,85 @@ function showApprovalModal(ev, turnId) {
     };
     const onCancel = (e) => { e.preventDefault(); cleanup(); resolve({ decision: 'deny', phrase: '' }); };
 
+    // Mic listener cleanup se přiřadí později (po jeho registraci níž).
+    let onMicClick = null;
     function cleanup() {
       approvalAllowBtn.removeEventListener('click', onAllow);
       approvalDenyBtn.removeEventListener('click', onDeny);
       approvalPhraseInput.removeEventListener('input', onPhraseInput);
       approvalModal.removeEventListener('cancel', onCancel);
+      approvalForm?.removeEventListener('submit', onFormSubmit);
+      if (onMicClick && approvalMicBtn) {
+        approvalMicBtn.removeEventListener('click', onMicClick);
+        approvalMicBtn.classList.remove('recording');
+      }
+      // Codex audit HIGH: pokud user kliknul Allow/Deny/Esc během approval
+      // recordingu, modal zavřeme; mic by ale jinak doběhl (push-to-talk)
+      // a triggernul finishRecording() už mimo intercept, NEBO by zůstal
+      // viset s otevřenými tracks. Unconditional discard pokrývá i stav
+      // race kdy stop() už proběhl ale onstop event čeká ve frontě
+      // (mediaRecorder.state === 'inactive', ale onstop dorazí). Snap=null
+      // garantuje, že iter-5 guard ve `finishRecording()` cokoli protlačeného
+      // taky zahodí.
+      if (state.mediaRecorder) {
+        try { state.mediaRecorder.onstop = null; } catch {}
+        if (state.mediaRecorder.state === 'recording') {
+          try { state.mediaRecorder.stop(); } catch {}
+        }
+        state.recordedChunks = [];
+        stopMicTracks();
+        avatar.setAnalyser(null);
+        if (state.vad) { state.vad.stop(); state.vad = null; }
+      }
+      state.recordingApprovalSnap = null;
       if (approvalModal.open) approvalModal.close();
       _pendingApproval = null;
     }
+
+    // Enter v phrase inputu spustí form submit. Bez explicitního handleru by
+    // default dialog form behavior modal zavřel bez resolve → promise hangne,
+    // turn se zasekne. Codex audit HIGH: preventDefault + delegace na onAllow.
+    const onFormSubmit = (e) => {
+      e.preventDefault();
+      onAllow();  // honoruje requires_explicit + phrase match check uvnitř
+    };
 
     approvalAllowBtn.addEventListener('click', onAllow);
     approvalDenyBtn.addEventListener('click', onDeny);
     approvalPhraseInput.addEventListener('input', onPhraseInput);
     approvalModal.addEventListener('cancel', onCancel);
-    _pendingApproval = { resolve, requiresExplicit, turnId, approvalId: ev.approval_id };
+    approvalForm?.addEventListener('submit', onFormSubmit);
+
+    // Mic UVNITŘ modalu — `<dialog>::showModal()` udělá zbytek stránky inert,
+    // takže mic v hlavním composeru by nešel kliknout. Tlačítko v modalu má
+    // vlastní recording lifecycle; finishRecording() routuje přes
+    // _pendingApproval do classifyApprovalUtterance.
+    onMicClick = async () => {
+      if (state.phase === 'recording') {
+        stopRecording();
+        return;
+      }
+      if (state.phase === 'approval' || state.phase === 'idle') {
+        approvalMicBtn?.classList.add('recording');
+        try {
+          await beginRecording({ auto: vadToggle.checked });
+        } catch (e) {
+          approvalMicBtn?.classList.remove('recording');
+          showError(`Mikrofon: ${e.message}`);
+        }
+      }
+    };
+    if (approvalMicBtn) approvalMicBtn.addEventListener('click', onMicClick);
+
+    // `finish` umožní voice/text handlerům vyřešit modal bez prokliku tlačítek.
+    // Cleanup nuluje _pendingApproval atomicky před resolve (žádný double-submit).
+    const finish = (result) => { cleanup(); resolve(result); };
+    _pendingApproval = {
+      finish,
+      requiresExplicit,
+      turnId,
+      approvalId: ev.approval_id,
+    };
 
     approvalModal.showModal();
     setTimeout(() => approvalDenyBtn.focus(), 0);
@@ -1333,7 +1549,9 @@ function autoGrowTextarea() {
 async function handleTextSubmit() {
   const text = textInput.value.trim();
   if (!text) return;
-  if (state.phase !== 'idle' && state.phase !== 'error') return;
+  // 'approval' phase: text submit povolen pro textovou approval frázi
+  // (intercept přebírá _pendingApproval handler níž).
+  if (state.phase !== 'idle' && state.phase !== 'error' && state.phase !== 'approval') return;
 
   // Předběžně resume AudioContext — pokud bude TTS hrát, autoplay policy
   // vyžaduje gesto před prvním AudioContext.resume(). Submit click je
@@ -1344,6 +1562,13 @@ async function handleTextSubmit() {
   autoGrowTextarea();
 
   state.inputMode = 'text';
+
+  // Approval intercept: pokud běží modal čekající na rozhodnutí, route text
+  // tam místo do /api/turn (jinak by nový turn rozbil starý waiting).
+  if (_pendingApproval !== null) {
+    handleVoiceApproval(text);
+    return;
+  }
 
   // Text intent: "agent mód" / "chat mód" → přepne mode bez LLM kola.
   if (handleModeSwitchIntent(text)) return;

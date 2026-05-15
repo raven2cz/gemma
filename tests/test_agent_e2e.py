@@ -774,6 +774,28 @@ async def test_e2e_agent_write_file_inside_workdir_full_round_trip(client):
             os.unlink(target)
 
 
+# ─────────────── Voice approval config endpoint ───────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(5)
+async def test_e2e_approval_config_endpoint(client):
+    """`/api/approval_config` vrací seznam frází z `voice.agent.config` —
+    jediný zdroj pravdy pro frontend hlasové approval handlery (žádný drift
+    mezi server/client constants)."""
+    r = await client.get("/api/approval_config")
+    assert r.status_code == 200
+    cfg = r.json()
+    # Schema sanity
+    assert isinstance(cfg["approve_phrases"], list)
+    assert isinstance(cfg["deny_phrases"], list)
+    assert isinstance(cfg["destructive_phrase"], str)
+    # Klíčové fráze musí být přítomné
+    assert "ano" in cfg["approve_phrases"]
+    assert "ne" in cfg["deny_phrases"]
+    assert cfg["destructive_phrase"] == "ano povoluju"
+
+
 # ─────────────── Agent TTS (final-only scope) ───────────────
 
 

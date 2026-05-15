@@ -176,7 +176,7 @@
   <div id="error-toast" class="error-toast" hidden></div>
 
   <dialog id="approval-modal" class="approval-modal" aria-labelledby="approval-title">
-    <form method="dialog" class="approval-card">
+    <form id="approval-form" class="approval-card">
       <h3 id="approval-title" class="approval-title">Schválit akci</h3>
       <p class="approval-summary" id="approval-summary"></p>
       <div class="approval-risk" id="approval-risk"></div>
@@ -185,8 +185,14 @@
         <pre class="approval-args" id="approval-args"></pre>
       </details>
       <div class="approval-explicit" id="approval-explicit" hidden>
-        <p class="approval-explicit-hint">Tato akce je destruktivní. Napiš <code>ano povoluju</code> pro potvrzení.</p>
+        <p class="approval-explicit-hint">Tato akce je destruktivní. Napiš nebo řekni <code>ano povoluju</code> pro potvrzení.</p>
         <input type="text" id="approval-phrase-input" placeholder="ano povoluju" autocomplete="off" />
+      </div>
+      <div class="approval-voice" id="approval-voice">
+        <button type="button" class="approval-btn approval-mic" id="approval-mic-btn" title="Stiskni a řekni &quot;ano povoluju&quot; / &quot;ne&quot;">
+          🎤 <span id="approval-mic-label">Hlasem</span>
+        </button>
+        <span class="approval-voice-hint">řekni „ano povoluju" pro povolení nebo „ne" pro zamítnutí</span>
       </div>
       <div class="approval-actions">
         <button type="button" class="approval-btn approval-deny" id="approval-deny-btn">Deny</button>

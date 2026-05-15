@@ -776,10 +776,22 @@ body {
   border-radius: var(--radius-md);
   font-size: 13px;
   max-width: 680px;
+  white-space: pre-wrap;
+  word-break: break-word;
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
   animation: toast-in 400ms var(--ease);
   z-index: 100;
+}
+.error-toast.sticky {
+  cursor: pointer;
+  border-color: rgba(255, 92, 122, 0.85);
+  background: rgba(255, 92, 122, 0.18);
+}
+.error-toast.sticky::after {
+  content: " (klik = zavřít)";
+  opacity: 0.6;
+  font-size: 11px;
 }
 @keyframes toast-in {
   from { opacity: 0; transform: translate(-50%, 10px); }
@@ -1032,6 +1044,25 @@ body {
   box-shadow: 0 0 10px var(--speaking);
 }
 
+.dangerous-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 70, 70, 0.55);
+  background: rgba(255, 40, 40, 0.16);
+  color: #ff8585;
+  border-radius: 11px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: help;
+  box-shadow: 0 0 10px rgba(255, 40, 40, 0.25);
+}
+.dangerous-badge[hidden] { display: none; }
+
 /* ───────── Tool card (agent mode) ───────── */
 .tool-card {
   display: flex;
@@ -1120,6 +1151,45 @@ body {
   color: var(--fg);
   max-width: 480px;
   width: 90vw;
+  /* Native <dialog>::showModal() default: position:fixed; inset:0; margin:auto.
+     Reset stylů (border/background/padding) některé prohlížeče interpretují
+     tak, že přepíšou i inset → modal pak skočí do levého horního rohu.
+     Explicitní inset:0 + margin:auto = horizontálně i vertikálně střed. */
+  position: fixed;
+  inset: 0;
+  margin: auto;
+}
+.approval-voice {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+}
+.approval-voice-hint {
+  font-size: 12px;
+  color: var(--muted, rgba(255, 255, 255, 0.55));
+  flex: 1;
+}
+.approval-btn.approval-mic {
+  background: rgba(59, 130, 246, 0.18);
+  border: 1px solid rgba(59, 130, 246, 0.45);
+  color: var(--fg);
+  cursor: pointer;
+  padding: 8px 14px;
+  border-radius: var(--radius-md, 6px);
+  font-size: 14px;
+}
+.approval-btn.approval-mic:hover {
+  background: rgba(59, 130, 246, 0.28);
+}
+.approval-btn.approval-mic.recording {
+  background: rgba(239, 68, 68, 0.25);
+  border-color: rgba(239, 68, 68, 0.6);
+  animation: approval-mic-pulse 1.2s infinite;
+}
+@keyframes approval-mic-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  50%      { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
 }
 .approval-modal::backdrop {
   background: rgba(0, 0, 0, 0.65);
