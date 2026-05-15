@@ -866,3 +866,73 @@ def test_auto_degrade_remaining_time_in_reason(tmp_path: Path):
         assert 250 <= sec <= 300, f"unexpected remaining: {sec}"
     finally:
         perm.clear_degrade_state()
+
+
+# ─────────────────── Dangerous mode (opt-in ASK → AUTO bypass) ───────────────────
+
+
+def test_dangerous_mode_upgrades_ask_to_auto(tmp_path: Path, monkeypatch):
+    """Dangerous mode: ASK rozhodnutí (non-destructive) → AUTO."""
+    from voice.agent import config as cfg
+    # Read mimo workdir = ASK
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("hi")
+    r_normal = decide("read_file", {"path": str(outside)}, tmp_path)
+    assert r_normal.decision == Decision.ASK
+
+    monkeypatch.setattr(cfg, "DANGEROUS_MODE", True)
+    r_dang = decide("read_file", {"path": str(outside)}, tmp_path)
+    assert r_dang.decision == Decision.AUTO
+    assert r_dang.reason.startswith("[DANGEROUS]")
+
+
+def test_dangerous_mode_preserves_destructive_ask(tmp_path: Path, monkeypatch):
+    """Dangerous mode NESMÍ bypassovat requires_explicit (rm/sudo/...)."""
+    from voice.agent import config as cfg
+    monkeypatch.setattr(cfg, "DANGEROUS_MODE", True)
+    r = decide("run_bash", {"command": "rm -rf foo"}, tmp_path)
+    assert r.decision == Decision.ASK
+    assert r.requires_explicit is True
+    # reason NESMÍ být přepsán „[DANGEROUS] …" pro destructive
+    assert not r.reason.startswith("[DANGEROUS]")
+
+
+def test_dangerous_mode_preserves_deny(tmp_path: Path, monkeypatch):
+    """Dangerous mode NESMÍ obejít DENY (special files, syntax err)."""
+    from voice.agent import config as cfg
+    monkeypatch.setattr(cfg, "DANGEROUS_MODE", True)
+    # neznámý tool = DENY
+    r = decide("neznamy_xyz", {}, tmp_path)
+    assert r.decision == Decision.DENY
+
+
+def test_dangerous_mode_off_no_effect(tmp_path: Path, monkeypatch):
+    """Když DANGEROUS_MODE=False, decide() chování beze změny."""
+    from voice.agent import config as cfg
+    monkeypatch.setattr(cfg, "DANGEROUS_MODE", False)
+    outside = tmp_path.parent / "off_test.txt"
+    outside.write_text("x")
+    r = decide("read_file", {"path": str(outside)}, tmp_path)
+    assert r.decision == Decision.ASK
+    assert "[DANGEROUS]" not in r.reason
+
+
+def test_dangerous_mode_overrides_auto_degrade(tmp_path: Path, monkeypatch):
+    """Dangerous mode přebíjí auto-degradaci: degrade ASK → dangerous AUTO."""
+    from voice.agent import config as cfg
+    from voice.agent import permissions as perm
+    perm.clear_degrade_state()
+    try:
+        perm.mark_destructive_approval(tmp_path)
+        # bez dangerous: AUTO → degraded ASK
+        r1 = decide("echo", {"text": "x"}, tmp_path)
+        assert r1.decision == Decision.ASK
+        assert "auto-degradace" in r1.reason
+
+        monkeypatch.setattr(cfg, "DANGEROUS_MODE", True)
+        r2 = decide("echo", {"text": "x"}, tmp_path)
+        # dangerous mode wins: degraded ASK → upgraded zpět na AUTO
+        assert r2.decision == Decision.AUTO
+        assert r2.reason.startswith("[DANGEROUS]")
+    finally:
+        perm.clear_degrade_state()

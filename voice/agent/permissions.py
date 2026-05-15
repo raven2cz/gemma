@@ -111,7 +111,7 @@ def decide(tool_name: str, args: dict, workdir: Path) -> PermissionResult:
     if result.decision == Decision.AUTO:
         remaining = _degrade_remaining_sec(workdir)
         if remaining > 0:
-            return replace(
+            result = replace(
                 result,
                 decision=Decision.ASK,
                 reason=(
@@ -120,6 +120,18 @@ def decide(tool_name: str, args: dict, workdir: Path) -> PermissionResult:
                 ),
                 risk="medium" if result.risk == "low" else result.risk,
             )
+    # Dangerous mode: po veškerých safety úpravách (degrade) opt-in upgrade
+    # ASK → AUTO. Destructive (`requires_explicit=True`) a DENY zůstávají.
+    if (
+        config.DANGEROUS_MODE
+        and result.decision == Decision.ASK
+        and not result.requires_explicit
+    ):
+        result = replace(
+            result,
+            decision=Decision.AUTO,
+            reason=f"[DANGEROUS] {result.reason}",
+        )
     return result
 
 

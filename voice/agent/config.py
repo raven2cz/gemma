@@ -352,5 +352,14 @@ AUTO_DEGRADE_AFTER_DESTRUCTIVE_SEC: int = int(
 AUDIO_FILLER_DELAY_SEC: float = float(
     os.environ.get("AGENT_AUDIO_FILLER_DELAY_SEC", "2.0")
 )
+
+
+# Dangerous mode (opt-in). Pokud zapnuto, všechny ASK rozhodnutí se přepnou
+# na AUTO — kromě `requires_explicit=True` (destruktivní akce: rm/sudo/chmod/...).
+# DENY (special files, syntax err) zůstává. Aktivuje se přes `--dangerous`
+# flag launcheru nebo `AGENT_DANGEROUS=1`. UI ukáže červený badge.
+DANGEROUS_MODE: bool = os.environ.get("AGENT_DANGEROUS", "0").strip() == "1"
+
+
 APPROVE_PHRASES: tuple[str, ...] = ("ano", "jo", "ok", "okej", "okay", "povol", "povoluju", "jasně", "jasne", "fajn", "yes")
 DENY_PHRASES: tuple[str, ...] = ("ne", "stop", "zruš", "zrus", "nepovoluju", "nechci", "no")
