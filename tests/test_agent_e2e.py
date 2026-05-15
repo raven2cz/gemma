@@ -242,13 +242,21 @@ def _patch_agent_tts(*, force_oom: bool = False, fail_with: Exception | None = N
             f.write(_empty_wav)
         return out_path
 
+    async def fake_unload_all_llms(*, verify=False):
+        # Mocked Ollama není dosažitelná přes httpx.get → simulace "VRAM prázdná".
+        # Vrací tuple ([], 0) protože verify cesta na produkci reportuje
+        # bytes; tady říkáme "nic v Ollamě, TTS může jet bez OOM rizika".
+        return [], 0
+
     class _Patcher:
         def __init__(self):
             self.original_synth = srv_mod._tts_synth_chunk_blocking
+            self.original_unload = srv_mod._unload_all_llms
             self.original_ready = srv_mod._TTS_READY
 
         def __enter__(self):
             srv_mod._tts_synth_chunk_blocking = fake_synth
+            srv_mod._unload_all_llms = fake_unload_all_llms
             # _TTS_READY je asyncio.Event — set ho, aby /api/turn readiness check
             # neblokoval na 60s timeout v testu.
             srv_mod._TTS_READY.set()
@@ -256,6 +264,7 @@ def _patch_agent_tts(*, force_oom: bool = False, fail_with: Exception | None = N
 
         def __exit__(self, *a):
             srv_mod._tts_synth_chunk_blocking = self.original_synth
+            srv_mod._unload_all_llms = self.original_unload
 
     return _Patcher()
 
@@ -1020,18 +1029,24 @@ async def test_e2e_agent_tts_mid_synth_cancel_no_agent_done(client):
     import voice.webapp.server as srv_mod
     tts_cs = srv_mod._import_tts_cs()
 
+    async def fake_unload(*, verify=False):
+        return [], 0  # Mocked Ollama není dosažitelná — "VRAM prázdná"
+
     class _CancelingPatcher:
         """Fake synth co raises TTSCanceled — simuluje cancel během synth."""
         def __init__(self):
             self.original = srv_mod._tts_synth_chunk_blocking
+            self.original_unload = srv_mod._unload_all_llms
         def __enter__(self):
             def fake(text, ref_str, fast, lang, out_path, turn_state):
                 raise tts_cs.TTSCanceled("simulated mid-synth cancel")
             srv_mod._tts_synth_chunk_blocking = fake
+            srv_mod._unload_all_llms = fake_unload
             srv_mod._TTS_READY.set()
             return self
         def __exit__(self, *a):
             srv_mod._tts_synth_chunk_blocking = self.original
+            srv_mod._unload_all_llms = self.original_unload
 
     script = [[_mk_lines(content="Hotovo."), _mk_lines(done=True)]]
     with _CancelingPatcher(), _patch_ollama(script):

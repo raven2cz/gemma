@@ -165,6 +165,50 @@ def _load_tts_blocking(lang: str = "cs"):
     log.info("Chatterbox TTS loaded (lang=%s, %.1f s, vram=%.0f MB)", lang, dt, vram_mb)
     _TTS_MODEL = model
     _TTS_CURRENT_LANG = lang
+
+    # Warmup — dummy synth alokuje activation buffers + zkompiluje CUDA kernely.
+    # První reálný synth pak nezvýší peak VRAM o extra ~100-300 MB, což může
+    # v kombinaci s velkým LLM v paměti dělat rozdíl mezi OK a OOM. Bezpečnostní
+    # guard: failure warmup NESHODÍ load (model je v paměti, warmup je
+    # optimalizace, ne korektnost).
+    # Codex audit: warmup musí pokrýt obě cfg_weight cesty (default 0.5 i fast
+    # 0.0), protože každá může mít jiné CUDA kernely / KV cache buffery.
+    try:
+        base_kwargs = {"language_id": LANG_TO_ID[lang]}
+        # Realistický mid-length text — alokuje activations pro několik gen
+        # kroků (ne jen 1-token edge case).
+        warmup_text = (
+            "Toto je krátký test pro nahřátí TTS modelu."
+            if lang == "cs"
+            else "This is a short warmup for the TTS model."
+        )
+        _ = model.generate(warmup_text, **base_kwargs)
+        # Druhý průchod s fast settings (cfg_weight=0.0) — jiná code path.
+        _ = model.generate(warmup_text, cfg_weight=0.0, exaggeration=0.3, **base_kwargs)
+        torch.cuda.synchronize()
+        warm_vram = torch.cuda.memory_allocated() / 1024**2
+        log.info("TTS warmup OK (lang=%s, vram=%.0f MB)", lang, warm_vram)
+    except Exception as e:
+        # Codex audit HIGH: torch.cuda.OutOfMemoryError zanechá GPU memory
+        # ve fragmentovaném stavu. empty_cache() pomůže defragmentaci pro
+        # další (real) synth. Non-OOM failures (corrupted model, wrong dtype,
+        # …) jsou OK jen warning — model se může pokusit reálný synth, který
+        # buď projde, nebo failne explicitně.
+        err_name = type(e).__name__
+        is_oom = (err_name in ("OutOfMemoryError", "CUDAOutOfMemoryError")
+                  or "out of memory" in str(e).lower())
+        if is_oom:
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            log.warning("TTS warmup OOM (lang=%s): %s — empty_cache spuštěn, "
+                        "model je v paměti ale první reálný synth riskuje OOM",
+                        lang, e)
+        else:
+            log.warning("TTS warmup selhal (lang=%s): %s — model je v paměti, "
+                        "první reálný synth může mít vyšší VRAM peak", lang, e)
     return model
 
 
@@ -738,9 +782,20 @@ async def voices():
 
 # ------------------------------------------------------------- vram unloading
 
-async def _unload_all_llms() -> list[str]:
+async def _unload_all_llms(*, verify: bool = False) -> tuple[list[str], int | None]:
     """Uvolni všechny LLM z Ollamy (keep_alive=0). Voláno před transcribe a tts,
-    aby whisper/TTS měly volnou VRAM. TTS singleton zůstává v paměti procesu."""
+    aby whisper/TTS měly volnou VRAM. TTS singleton zůstává v paměti procesu.
+
+    Vrátí `(unloaded_names, residual_vram_bytes_or_none)`:
+    - `unloaded_names` = list jmen modelů, jejichž unload request prošel (best-effort)
+    - `residual_vram_bytes` = pokud `verify=True`, re-check `/api/ps` po unloadu;
+      součet `size_vram` modelů které jsou STÁLE v paměti.
+      **`None` znamená NEZNÁMÝ stav** (Ollama /api/ps unreachable nebo verify
+      vypnutý). Caller MUSÍ rozlišit None od 0 — None = nevíme, fail safe.
+
+    `verify=False` (default) zachovává původní fire-and-forget chování pro
+    transcribe path (whisper) a vrací `(unloaded, None)`.
+    """
     unloaded: list[str] = []
     async with httpx.AsyncClient(timeout=5.0) as c:
         try:
@@ -749,7 +804,8 @@ async def _unload_all_llms() -> list[str]:
             models = r.json().get("models", [])
         except Exception as e:
             log.warning("unload: /api/ps selhalo: %s", e)
-            return unloaded
+            # Neznámý stav — neumíme říct, kolik VRAM Ollama drží.
+            return unloaded, None
 
         for m in models:
             name = m.get("name")
@@ -764,9 +820,24 @@ async def _unload_all_llms() -> list[str]:
             except Exception as e:
                 log.warning("unload %s: %s", name, e)
 
-    if unloaded:
-        await asyncio.sleep(UNLOAD_WAIT_MS / 1000)
-    return unloaded
+        if unloaded:
+            await asyncio.sleep(UNLOAD_WAIT_MS / 1000)
+
+        # Codex audit HIGH: best-effort unload nemá garanci. Při `verify=True`
+        # re-checkneme /api/ps. Pokud check selže, vracíme None — caller pak
+        # ví, že neumíme říct, jestli VRAM je volná. Toto je SAFER než vracet
+        # 0 (které by ho zmátlo do běhu synth při skrytém OOM riziku).
+        if not verify:
+            return unloaded, None
+        try:
+            r2 = await c.get(f"{OLLAMA}/api/ps")
+            r2.raise_for_status()
+            residual = sum(int(m.get("size_vram", 0))
+                           for m in r2.json().get("models", []))
+            return unloaded, residual
+        except Exception as e:
+            log.warning("unload verify: /api/ps re-check selhalo: %s", e)
+            return unloaded, None
 
 
 # --------------------------------------------------------------- transcribe
@@ -1528,14 +1599,45 @@ async def _run_agent_turn(
             if (synth_final and saw_agent_done
                     and not turn_state["canceled"]
                     and final_buf.strip()):
-                await _synth_agent_final_text(
-                    final_buf=final_buf,
-                    tid=tid,
-                    turn_state=turn_state,
-                    out_queue=out_queue,
-                    voice=voice, ref=ref, fast=fast,
-                    user_lang=user_lang, lang_override=lang_override,
-                )
+                # Uvolnit Ollama LLM z VRAM PŘED TTS synth — agent mode často
+                # běží na velkém modelu (gemma4-26b = ~10 GB) a Chatterbox TTS
+                # (3 GB) by na zbytku 15.9 GB RTX 5070 Ti OOM-nul při activations
+                # peak (potvrzeno reálným bug reportem: "po startu serveru první
+                # turn TTS nefunguje"). Trade-off: další turn re-loadne LLM
+                # (cca 3-5 s), ale audio první-turn proběhne.
+                # Codex audit HIGH: krátký retry loop — Ollama unload je async
+                # a /api/ps po-check chvíli ukazuje staré modely. Pokud po
+                # 5 pokusech (= 2.5s) VRAM nepuští, raději skip audio než OOM
+                # (TTS by stejně padl a tool_result text nepřišel by k user).
+                _vram_ok = False
+                for _attempt in range(5):
+                    _unloaded, _residual = await _unload_all_llms(verify=True)
+                    if _residual is not None and _residual <= 1024**3:
+                        _vram_ok = True
+                        break
+                    await asyncio.sleep(0.5)
+                if not _vram_ok:
+                    _res_str = (f"{_residual / 1024**3:.1f} GB"
+                                if _residual is not None else "neznámý stav")
+                    log.warning(
+                        "turn %s: Ollama nepustila VRAM po 5 pokusech "
+                        "(residual=%s) — skip TTS, kompletní text v UI",
+                        tid, _res_str,
+                    )
+                    await out_queue.put({
+                        "type": "audio_error", "seq": 0,
+                        "msg": "TTS přeskočen: Ollama drží VRAM. "
+                               "Restartuj Ollamu nebo zvol menší model.",
+                    })
+                else:
+                    await _synth_agent_final_text(
+                        final_buf=final_buf,
+                        tid=tid,
+                        turn_state=turn_state,
+                        out_queue=out_queue,
+                        voice=voice, ref=ref, fast=fast,
+                        user_lang=user_lang, lang_override=lang_override,
+                    )
 
             # Forward zadržený `agent_done` až po audio. Codex HIGH #2.
             # POZOR: mid-synth cancel (TTSCanceled) setne turn_state["canceled"]
