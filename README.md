@@ -33,7 +33,7 @@ Webová aplikace ve které mluvíš na mikrofon (nebo píšeš), model ti odpov�
 | `web_search` | Brave Search API |
 | `light_list` | Vypíše Hue světla |
 | `light_set` | Změní stav světla (jméno, barva, jas) |
-| `ask_claude` | Delegace na Claude API |
+| `ask_claude` | Spawne `claude -p` subprocess (Claude Code CLI) jako pure consult sub-agent. Žádné tooly, žádný FS přístup |
 | `echo` | Test pipeline |
 
 ## Bezpečnost agenta
@@ -89,7 +89,7 @@ echo "BSA-..." > ~/.brave-search-api
 chmod 600 ~/.brave-search-api
 ```
 
-**Anthropic API** (pro `ask_claude`). Tool je přímý REST call na `https://api.anthropic.com/v1/messages`, **není to vnořený Claude Code CLI subagent**. Default model `claude-opus-4-7`, lze přepsat přes `AGENT_CLAUDE_MODEL`. Účtuje se vstupní + výstupní tokeny podle Anthropic ceníku.
+**Anthropic API** (pro `ask_claude`). Tool spawne `claude -p` jako subprocess (Claude Code CLI, ne přímý REST call). Sub-agent běží s `--bare --tools "" --no-session-persistence --permission-mode plan` v prázdném temp dir, takže nemá přístup k FS ani shellu, jen vrátí text. Default model `claude-opus-4-7`, override `AGENT_CLAUDE_MODEL`. Účtuje se vstupní + výstupní tokeny podle Anthropic ceníku. CLI binary lze přepsat přes `CLAUDE_CLI_BIN`.
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
@@ -98,7 +98,7 @@ echo "sk-ant-..." > ~/.anthropic-api-key
 chmod 600 ~/.anthropic-api-key
 ```
 
-Server v obou případech odmítne načíst soubor, který je world/group readable (`mode & 0o077`). Override cesty jdou přes `BRAVE_SEARCH_API_KEY_FILE` a `ANTHROPIC_API_KEY_FILE`.
+Server v obou případech odmítne načíst soubor, který je world/group readable (`mode & 0o077`). Override cesty jdou přes `BRAVE_SEARCH_API_KEY_FILE` a `ANTHROPIC_API_KEY_FILE`. Implementace bridge je v `voice/agent/claude_bridge.py` (vzor `avatar-engine/avatar_engine/bridges/claude.py`).
 
 ## Modely
 

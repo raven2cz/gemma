@@ -160,11 +160,13 @@ MAX_TOOL_CALLS_PER_TURN: int = int(os.environ.get("AGENT_MAX_TOOL_CALLS", "32"))
 
 
 # Claude bridge (fáze 6)
-# `ask_claude` tool deleguje na Anthropic Messages API.
+# `ask_claude` tool deleguje na **Claude Code CLI subprocess** (`claude -p`),
+# ne přímo na REST API. Vzor: avatar-engine/avatar_engine/bridges/claude.py.
+# Implementace bridge je v voice/agent/claude_bridge.py.
 # Klíč: env `ANTHROPIC_API_KEY` → fallback soubor `~/.anthropic-api-key` (0600).
+# CLI passuje klíč svým HTTPS klientem.
+CLAUDE_CLI_BIN: str = os.environ.get("CLAUDE_CLI_BIN", "claude")
 CLAUDE_DEFAULT_MODEL: str = os.environ.get("AGENT_CLAUDE_MODEL", "claude-opus-4-7")
-CLAUDE_API_ENDPOINT: str = "https://api.anthropic.com/v1/messages"
-CLAUDE_API_VERSION: str = "2023-06-01"
 CLAUDE_TIMEOUT_SEC: float = float(os.environ.get("AGENT_CLAUDE_TIMEOUT_SEC", "60"))
 CLAUDE_MAX_TOKENS_DEFAULT: int = int(os.environ.get("AGENT_CLAUDE_MAX_TOKENS", "1024"))
 CLAUDE_MAX_TOKENS_LIMIT: int = int(os.environ.get("AGENT_CLAUDE_MAX_TOKENS_LIMIT", "4096"))

@@ -2,7 +2,7 @@
 
 Účel: PŘED spuštěním agent loopu prozkoumat poslední user message a vrátit
 doporučení, kterým modelem by se dotaz měl ideálně zpracovat (lokální Gemma
-vs. `ask_claude` na Anthropic API).
+vs. delegace na `ask_claude` přes Claude Code CLI subagent).
 
 DŮLEŽITÉ: tato fáze NEPŘEPÍNÁ klienta runtime — runtime stále jede přes Ollama
 (Gemma). Decision se vrací jako metadata `router_decision` event do NDJSON

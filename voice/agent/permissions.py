@@ -1068,9 +1068,10 @@ def _cls_web_search(args: dict, workdir: Path) -> PermissionResult:
 def _cls_ask_claude(args: dict, workdir: Path) -> PermissionResult:
     """ask_claude(prompt, system?, max_tokens?) — ASK medium.
 
-    Volá Anthropic Messages API (paid, external network). Defaultně přes
-    approval flow (ne AUTO), protože:
-      1) každý volání = cost
+    Deleguje na Claude Code CLI subprocess (`claude -p`, --bare, --tools '').
+    Sub-agent volá Anthropic backend, nepřímo, my spawnujeme jen CLI proces.
+    Defaultně přes approval flow (ne AUTO), protože:
+      1) každý volání = cost (Anthropic účtuje tokeny)
       2) odesílá LLM-controlled obsah na třetí stranu
       3) odpověď není FS/shell side-effect, ale ovlivní následující agent reasoning
     """
@@ -1170,7 +1171,7 @@ def _cls_ask_claude(args: dict, workdir: Path) -> PermissionResult:
     short = prompt if len(prompt) <= 60 else prompt[:57] + "…"
     return PermissionResult(
         decision=Decision.ASK,
-        reason="external paid LLM call (Anthropic API)",
+        reason="external paid LLM call (Claude Code CLI subagent)",
         summary=f'ask_claude: "{short}"',
         risk="medium",
     )

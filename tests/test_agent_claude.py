@@ -1,487 +1,472 @@
-"""Unit testy pro Claude bridge (voice/agent/tools/claude.py).
+"""Tests pro `ask_claude` tool a `claude_bridge` subprocess wrapper.
 
-Mock httpx přes httpx.MockTransport — žádná real Anthropic API. DNS resolve
-mockujeme pro SSRF guard backend (api.anthropic.com → veřejná IP).
+Mockujeme `asyncio.create_subprocess_exec` — žádný reálný `claude` CLI.
+Fake subprocess implementuje stdin/stdout/stderr/wait minimum pro bridge.
 """
 from __future__ import annotations
 
 import asyncio
-import gzip
 import json
-import socket
+import os
 from pathlib import Path
 
-import httpx
 import pytest
 
+from voice.agent import claude_bridge
 from voice.agent.tools.base import ExecuteContext
-from voice.agent.tools import claude as claude_mod
-from voice.agent.tools.claude import (
-    ASK_CLAUDE_TOOL,
-    _ask_claude_exec,
-    _extract_text,
-)
+from voice.agent.tools.claude import ASK_CLAUDE_TOOL
 
 
-def _ctx(workdir: Path, *, cancel_event: asyncio.Event | None = None) -> ExecuteContext:
-    return ExecuteContext(turn_id="t1", cancel_event=cancel_event, workdir=workdir)
+# ─────────────────────── Fake subprocess infrastructure ───────────────────────
 
 
-def _patch_dns(monkeypatch, addrs: list[str]):
-    async def fake(self, host, *args, **kwargs):
-        return [
-            (socket.AF_INET, socket.SOCK_STREAM, 0, "", (a, 0)) for a in addrs
-        ]
+class _FakeStreamReader:
+    """Async StreamReader fake — `await read(n)` vrací postupně dané chunky."""
 
-    from asyncio.unix_events import _UnixSelectorEventLoop  # type: ignore[attr-defined]
-    monkeypatch.setattr(_UnixSelectorEventLoop, "getaddrinfo", fake)
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = list(chunks)
+        self._closed = False
 
-
-def _install_mock_transport(monkeypatch, handler):
-    transport = httpx.MockTransport(handler)
-    original = httpx.AsyncClient.__init__
-
-    def patched_init(self, *args, **kwargs):
-        kwargs["transport"] = transport
-        return original(self, *args, **kwargs)
-
-    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+    async def read(self, n: int = -1) -> bytes:
+        if self._closed or not self._chunks:
+            self._closed = True
+            return b""
+        chunk = self._chunks.pop(0)
+        return chunk if n < 0 or len(chunk) <= n else chunk[:n]
 
 
-# ---------------------------------------------------------------------------
-# _extract_text helper
-# ---------------------------------------------------------------------------
+class _FakeStreamWriter:
+    """Async StreamWriter fake — sbírá zapsané bytes (nikdy neblokuje)."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self._closed = False
+
+    def write(self, data: bytes) -> None:
+        self.buffer.extend(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self._closed = True
+
+    async def wait_closed(self) -> None:
+        return None
 
 
-def test_extract_text_concatenates_blocks():
-    payload = {
-        "content": [
-            {"type": "text", "text": "hello "},
-            {"type": "text", "text": "world"},
-        ]
-    }
-    assert _extract_text(payload) == "hello world"
+class _FakeProcess:
+    """Mock pro `asyncio.subprocess.Process`."""
+
+    _next_pid = 100000
+
+    def __init__(
+        self,
+        *,
+        stdout_chunks: list[bytes],
+        stderr_chunks: list[bytes],
+        returncode: int = 0,
+        wait_delay: float = 0.0,
+    ):
+        _FakeProcess._next_pid += 1
+        self.pid = _FakeProcess._next_pid
+        self.stdin = _FakeStreamWriter()
+        self.stdout = _FakeStreamReader(stdout_chunks)
+        self.stderr = _FakeStreamReader(stderr_chunks)
+        self._returncode: int | None = None
+        self._final_returncode = returncode
+        self._wait_delay = wait_delay
+        self._terminated = False
+
+    @property
+    def returncode(self) -> int | None:
+        return self._returncode
+
+    async def wait(self) -> int:
+        if self._wait_delay > 0:
+            await asyncio.sleep(self._wait_delay)
+        if self._terminated:
+            self._returncode = -15  # SIGTERM
+        else:
+            self._returncode = self._final_returncode
+        return self._returncode
+
+    def terminate(self) -> None:
+        self._terminated = True
+        self._returncode = -15
 
 
-def test_extract_text_skips_non_text_blocks():
-    payload = {
-        "content": [
-            {"type": "tool_use", "name": "foo"},
-            {"type": "text", "text": "only this"},
-        ]
-    }
-    assert _extract_text(payload) == "only this"
+def _patch_subprocess(
+    monkeypatch,
+    proc: _FakeProcess | None = None,
+    *,
+    raises: type[BaseException] | None = None,
+) -> dict:
+    """Mockuj `asyncio.create_subprocess_exec` aby vrátil daný fake proc.
+    `raises=FileNotFoundError` simuluje že CLI binary chybí.
+
+    Vrací captured kwargs (argv, cwd, env) z volání pro asserce.
+    """
+    captured: dict = {}
+
+    async def fake_exec(*argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["cwd"] = kwargs.get("cwd")
+        captured["env"] = kwargs.get("env")
+        captured["start_new_session"] = kwargs.get("start_new_session")
+        if raises is not None:
+            raise raises("fake")
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    return captured
 
 
-def test_extract_text_missing_content():
-    assert _extract_text({}) == ""
-    assert _extract_text({"content": "not a list"}) == ""
-    assert _extract_text({"content": [None, 123, {"type": "text"}]}) == ""
+def _patch_killpg(monkeypatch) -> list:
+    """No-op os.killpg + os.getpgid → returns fake PGID. Vrací list volání."""
+    calls: list = []
+
+    def fake_killpg(pgid, sig):
+        calls.append(("killpg", pgid, sig))
+
+    def fake_getpgid(pid):
+        return pid  # pretend pid==pgid
+
+    monkeypatch.setattr(os, "killpg", fake_killpg)
+    monkeypatch.setattr(os, "getpgid", fake_getpgid)
+    return calls
 
 
-# ---------------------------------------------------------------------------
-# Tool schema metadata
-# ---------------------------------------------------------------------------
+def _make_ctx(cancel_event: asyncio.Event | None = None) -> ExecuteContext:
+    return ExecuteContext(
+        turn_id="test",
+        cancel_event=cancel_event,
+        workdir=Path("/tmp"),
+        resolved_path=None,
+    )
+
+
+# ──────────────────────────── Tool metadata ────────────────────────────
 
 
 def test_tool_metadata():
+    """Tool má správné jméno + schema kontrakt."""
     assert ASK_CLAUDE_TOOL.name == "ask_claude"
+    assert "Claude Code CLI subprocess" in ASK_CLAUDE_TOOL.description
     schema = ASK_CLAUDE_TOOL.parameters_schema
-    assert schema["required"] == ["prompt"]
-    assert schema["properties"]["prompt"]["type"] == "string"
-    assert schema["properties"]["max_tokens"]["type"] == "integer"
-    assert schema["additionalProperties"] is False
+    assert "prompt" in schema["required"]
+    assert "prompt" in schema["properties"]
+    assert "system" in schema["properties"]
+    assert "max_tokens" in schema["properties"]
 
 
-# ---------------------------------------------------------------------------
-# Happy path
-# ---------------------------------------------------------------------------
+# ──────────────────────────── Args validation ────────────────────────────
 
 
-def test_ask_claude_happy_path(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-
-    captured = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        captured["url"] = str(request.url)
-        captured["headers"] = dict(request.headers)
-        captured["body"] = json.loads(request.content.decode("utf-8"))
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            content=json.dumps({
-                "id": "msg_1",
-                "model": "claude-opus-4-7",
-                "content": [{"type": "text", "text": "Hi there!"}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 10, "output_tokens": 5},
-            }).encode("utf-8"),
-        )
-
-    _install_mock_transport(monkeypatch, handler)
-
-    r = asyncio.run(_ask_claude_exec(
-        {"prompt": "Hello"}, _ctx(tmp_path),
-    ))
-    assert r["ok"] is True, r
-    assert r["text"] == "Hi there!"
-    assert r["stop_reason"] == "end_turn"
-    assert r["input_tokens"] == 10
-    assert r["output_tokens"] == 5
-    assert captured["body"]["model"] == "claude-opus-4-7"
-    assert captured["body"]["messages"] == [{"role": "user", "content": "Hello"}]
-    assert captured["body"]["max_tokens"] == 1024  # default
-    assert "system" not in captured["body"]
-    assert captured["headers"]["x-api-key"] == "sk-ant-test"
-    assert captured["headers"]["anthropic-version"] == "2023-06-01"
-    assert captured["headers"]["accept-encoding"] == "identity"
+@pytest.mark.asyncio
+async def test_empty_prompt():
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": ""}, _make_ctx())
+    assert r["ok"] is False
+    assert "empty" in r["error"]
 
 
-def test_ask_claude_with_system_and_max_tokens(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
+@pytest.mark.asyncio
+async def test_whitespace_prompt():
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "   \n\t  "}, _make_ctx())
+    assert r["ok"] is False
 
-    captured = {}
 
-    def handler(request):
-        captured["body"] = json.loads(request.content.decode("utf-8"))
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            content=b'{"content":[{"type":"text","text":"ok"}]}',
-        )
+@pytest.mark.asyncio
+async def test_non_string_prompt():
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": 123}, _make_ctx())
+    assert r["ok"] is False
+    assert "string" in r["error"]
 
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec(
-        {"prompt": "Q", "system": "You are a pirate.", "max_tokens": 100},
-        _ctx(tmp_path),
-    ))
+
+@pytest.mark.asyncio
+async def test_oversized_prompt():
+    from voice.agent.config import CLAUDE_MAX_PROMPT_BYTES
+    r = await ASK_CLAUDE_TOOL.execute(
+        {"prompt": "x" * (CLAUDE_MAX_PROMPT_BYTES + 10)}, _make_ctx(),
+    )
+    assert r["ok"] is False
+    assert "too large" in r["error"]
+
+
+@pytest.mark.asyncio
+async def test_system_non_string():
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi", "system": 42}, _make_ctx())
+    assert r["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_system_oversized():
+    from voice.agent.config import CLAUDE_MAX_SYSTEM_BYTES
+    r = await ASK_CLAUDE_TOOL.execute(
+        {"prompt": "hi", "system": "x" * (CLAUDE_MAX_SYSTEM_BYTES + 10)}, _make_ctx(),
+    )
+    assert r["ok"] is False
+    assert "too large" in r["error"]
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_bool_rejected():
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi", "max_tokens": True}, _make_ctx())
+    assert r["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_invalid_type():
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi", "max_tokens": "abc"}, _make_ctx())
+    assert r["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_out_of_range():
+    from voice.agent.config import CLAUDE_MAX_TOKENS_LIMIT
+    r = await ASK_CLAUDE_TOOL.execute(
+        {"prompt": "hi", "max_tokens": CLAUDE_MAX_TOKENS_LIMIT + 1}, _make_ctx(),
+    )
+    assert r["ok"] is False
+
+
+# ───────────────────────── Bridge — happy path ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_happy_path(monkeypatch):
+    """Validní prompt → subprocess úspěch → JSON parsed → ok=True + text."""
+    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
+
+    response_json = json.dumps({
+        "type": "result", "subtype": "success",
+        "result": "Hello from Claude.",
+        "session_id": "abc-123",
+        "total_cost_usd": 0.0012,
+        "is_error": False,
+    })
+    proc = _FakeProcess(
+        stdout_chunks=[response_json.encode("utf-8")],
+        stderr_chunks=[],
+        returncode=0,
+    )
+    captured = _patch_subprocess(monkeypatch, proc)
+    _patch_killpg(monkeypatch)
+
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "Hi Claude"}, _make_ctx())
+
     assert r["ok"] is True
-    assert captured["body"]["system"] == "You are a pirate."
-    assert captured["body"]["max_tokens"] == 100
+    assert r["text"] == "Hello from Claude."
+    assert r["session_id"] == "abc-123"
+    assert r["total_cost_usd"] == 0.0012
+    assert r["duration_ms"] >= 0
+    # Argv security: prompt MUSÍ NE být v argv (`ps` leak)
+    argv_joined = " ".join(captured["argv"])
+    assert "Hi Claude" not in argv_joined, "prompt leak v argv!"
+    # Bezpečnostní flagy MUSÍ být přítomné
+    assert "--bare" in captured["argv"]
+    assert "--no-session-persistence" in captured["argv"]
+    assert "--permission-mode" in captured["argv"]
+    assert "plan" in captured["argv"]
+    assert "--tools" in captured["argv"]
+    assert "" in captured["argv"]  # --tools ""
+    assert captured["start_new_session"] is True
+    # Prompt poslán přes stdin
+    assert proc.stdin.buffer == b"Hi Claude"
+    # Empty cwd (temp dir, ne náš workdir)
+    assert captured["cwd"] is not None
+    assert "claude_bridge_" in captured["cwd"]
 
 
-# ---------------------------------------------------------------------------
-# Missing / bad API key
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_system_via_argv(monkeypatch):
+    """System prompt jde přes --append-system-prompt argv (CLI 2.1.x nemá file flag)."""
+    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
+    response = json.dumps({"result": "ok", "is_error": False})
+    proc = _FakeProcess(stdout_chunks=[response.encode()], stderr_chunks=[])
+    captured = _patch_subprocess(monkeypatch, proc)
+    _patch_killpg(monkeypatch)
+
+    r = await ASK_CLAUDE_TOOL.execute(
+        {"prompt": "Hi", "system": "You are a tester"}, _make_ctx(),
+    )
+
+    assert r["ok"] is True
+    assert "--append-system-prompt" in captured["argv"]
+    assert "You are a tester" in captured["argv"]
 
 
-def test_ask_claude_no_key(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "")
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
+# ───────────────────────── Bridge — error paths ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_no_api_key(monkeypatch):
+    """Bez API klíče → fail fast, žádný subprocess spawn."""
+    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "")
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
     assert r["ok"] is False
     assert "ANTHROPIC_API_KEY" in r["error"]
 
 
-def test_ask_claude_auth_error(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-bad")
+@pytest.mark.asyncio
+async def test_cli_not_found(monkeypatch):
+    """`claude` binary chybí → FileNotFoundError → user-facing error."""
+    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
+    _patch_subprocess(monkeypatch, proc=None, raises=FileNotFoundError)
+    _patch_killpg(monkeypatch)
 
-    def handler(request):
-        return httpx.Response(
-            401,
-            headers={"Content-Type": "application/json"},
-            content=b'{"error":{"message":"invalid x-api-key"}}',
-        )
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
     assert r["ok"] is False
-    assert r["status"] == 401
-    assert "auth error" in r["error"]
+    assert "claude CLI nenalezen" in r["error"]
 
 
-def test_ask_claude_rate_limit(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
+@pytest.mark.asyncio
+async def test_nonzero_exit(monkeypatch):
+    """Exit != 0 → ok=False + stderr_preview."""
+    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
+    proc = _FakeProcess(
+        stdout_chunks=[b""],
+        stderr_chunks=[b"Error: rate limit exceeded\n"],
+        returncode=1,
+    )
+    _patch_subprocess(monkeypatch, proc)
+    _patch_killpg(monkeypatch)
 
-    def handler(request):
-        return httpx.Response(429, content=b'{"error":{"message":"slow down"}}')
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
     assert r["ok"] is False
-    assert r["status"] == 429
-    assert "rate-limited" in r["error"]
-
-
-def test_ask_claude_api_error_400(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-
-    def handler(request):
-        return httpx.Response(
-            400,
-            headers={"Content-Type": "application/json"},
-            content=b'{"error":{"message":"max_tokens must be > 0"}}',
-        )
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
-    assert r["ok"] is False
-    assert r["status"] == 400
-    assert "max_tokens must be > 0" in r["error"]
-
-
-def test_ask_claude_api_error_message_truncated(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-    huge = "x" * 5000
-
-    def handler(request):
-        return httpx.Response(
-            400,
-            headers={"Content-Type": "application/json"},
-            content=json.dumps({"error": {"message": huge}}).encode("utf-8"),
-        )
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
-    assert r["ok"] is False
-    # error string is truncated to <=400 chars message body
-    assert len(r["error"]) < 500
-
-
-def test_ask_claude_api_error_without_json_body(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-
-    def handler(request):
-        return httpx.Response(500, content=b"<html>boom</html>")
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
-    assert r["ok"] is False
-    assert r["status"] == 500
-    assert "HTTP 500" in r["error"]
-
-
-# ---------------------------------------------------------------------------
-# Invalid input (defense in depth in execute)
-# ---------------------------------------------------------------------------
-
-
-def test_ask_claude_empty_prompt(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-    r = asyncio.run(_ask_claude_exec({"prompt": "   "}, _ctx(tmp_path)))
-    assert r["ok"] is False
-    assert "empty prompt" in r["error"]
-
-
-def test_ask_claude_non_string_prompt(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-    r = asyncio.run(_ask_claude_exec({"prompt": 123}, _ctx(tmp_path)))
-    assert r["ok"] is False
-    assert "must be string" in r["error"]
-
-
-def test_ask_claude_oversized_prompt(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-    monkeypatch.setattr(claude_mod, "CLAUDE_MAX_PROMPT_BYTES", 16)
-    r = asyncio.run(_ask_claude_exec(
-        {"prompt": "x" * 100}, _ctx(tmp_path),
-    ))
-    assert r["ok"] is False
-    assert "too large" in r["error"]
-
-
-def test_ask_claude_invalid_max_tokens(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-    r = asyncio.run(_ask_claude_exec(
-        {"prompt": "Hi", "max_tokens": "five"}, _ctx(tmp_path),
-    ))
-    assert r["ok"] is False
-    assert "max_tokens" in r["error"]
-
-
-def test_ask_claude_max_tokens_bool_rejected(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-    r = asyncio.run(_ask_claude_exec(
-        {"prompt": "Hi", "max_tokens": True}, _ctx(tmp_path),
-    ))
-    assert r["ok"] is False
-    assert "bool" in r["error"]
-
-
-def test_ask_claude_max_tokens_out_of_range(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-    r = asyncio.run(_ask_claude_exec(
-        {"prompt": "Hi", "max_tokens": 999999}, _ctx(tmp_path),
-    ))
-    assert r["ok"] is False
-    assert "out of range" in r["error"]
-
-
-def test_ask_claude_system_non_string(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-    r = asyncio.run(_ask_claude_exec(
-        {"prompt": "Hi", "system": 42}, _ctx(tmp_path),
-    ))
-    assert r["ok"] is False
-    assert "system" in r["error"]
-
-
-def test_ask_claude_system_oversized(tmp_path, monkeypatch):
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-    monkeypatch.setattr(claude_mod, "CLAUDE_MAX_SYSTEM_BYTES", 8)
-    r = asyncio.run(_ask_claude_exec(
-        {"prompt": "Hi", "system": "x" * 100}, _ctx(tmp_path),
-    ))
-    assert r["ok"] is False
-    assert "system too large" in r["error"]
-
-
-# ---------------------------------------------------------------------------
-# Network-level errors
-# ---------------------------------------------------------------------------
-
-
-def test_ask_claude_timeout(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-
-    def handler(request):
-        raise httpx.ReadTimeout("read timeout")
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
-    assert r["ok"] is False
-    assert "timeout" in r["error"]
-
-
-def test_ask_claude_request_error(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-
-    def handler(request):
-        raise httpx.ConnectError("boom")
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
-    assert r["ok"] is False
-    assert "request error" in r["error"]
-
-
-# ---------------------------------------------------------------------------
-# Response capping + compression defense
-# ---------------------------------------------------------------------------
-
-
-def test_ask_claude_response_truncated_at_cap(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-    monkeypatch.setattr(claude_mod, "CLAUDE_OUTPUT_CAP_BYTES", 64)
-
-    # Posíláme víc než 64 B
-    big_body = json.dumps({
-        "content": [{"type": "text", "text": "x" * 1000}]
-    }).encode("utf-8")
-
-    def handler(request):
-        return httpx.Response(
-            200,
-            # Žádný content-length → padá do per-chunk capu
-            headers={"Content-Type": "application/json"},
-            content=big_body,
-        )
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
-    assert r["ok"] is False
-    assert "truncated" in r["error"] or "too large" in r["error"]
-
-
-def test_ask_claude_response_content_length_precheck(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-    monkeypatch.setattr(claude_mod, "CLAUDE_OUTPUT_CAP_BYTES", 64)
-
-    def handler(request):
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json", "Content-Length": "10000"},
-            content=b'{"content":[]}',
-        )
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
-    assert r["ok"] is False
-    assert "too large" in r["error"]
-
-
-def test_ask_claude_rejects_gzip_response(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-
-    valid_gzipped = gzip.compress(b'{"content":[]}')
-
-    def handler(request):
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json", "Content-Encoding": "gzip"},
-            content=valid_gzipped,
-        )
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
-    assert r["ok"] is False
-    assert "content-encoding" in r["error"].lower() or "encoding" in r["error"].lower()
-
-
-def test_ask_claude_accepts_identity_encoding(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-
-    def handler(request):
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json", "Content-Encoding": "identity"},
-            content=b'{"content":[{"type":"text","text":"ok"}]}',
-        )
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
-    assert r["ok"] is True
-    assert r["text"] == "ok"
-
-
-def test_ask_claude_invalid_json_response(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", "sk-ant-test")
-
-    def handler(request):
-        return httpx.Response(
-            200,
-            headers={"Content-Type": "application/json"},
-            content=b"not-json",
-        )
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
+    assert r["exit_code"] == 1
+    assert "rate limit" in r["stderr_preview"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_output(monkeypatch):
+    """CLI vrátil garbled output → invalid JSON error."""
+    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
+    proc = _FakeProcess(
+        stdout_chunks=[b"not valid json {{"],
+        stderr_chunks=[],
+        returncode=0,
+    )
+    _patch_subprocess(monkeypatch, proc)
+    _patch_killpg(monkeypatch)
+
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
     assert r["ok"] is False
     assert "invalid JSON" in r["error"]
 
 
-# ---------------------------------------------------------------------------
-# Key leak prevention
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_is_error_flag(monkeypatch):
+    """JSON má is_error=True → ok=False s message z result."""
+    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
+    response = json.dumps({
+        "result": "API quota exceeded", "is_error": True,
+    })
+    proc = _FakeProcess(stdout_chunks=[response.encode()], stderr_chunks=[])
+    _patch_subprocess(monkeypatch, proc)
+    _patch_killpg(monkeypatch)
 
-
-def test_no_key_in_error_messages(tmp_path, monkeypatch):
-    _patch_dns(monkeypatch, ["8.8.8.8"])
-    secret = "sk-ant-supersecret-XYZ-1234567890"
-    monkeypatch.setattr(claude_mod, "ANTHROPIC_API_KEY", secret)
-
-    def handler(request):
-        return httpx.Response(
-            401,
-            content=b'{"error":{"message":"unauthorized"}}',
-        )
-
-    _install_mock_transport(monkeypatch, handler)
-    r = asyncio.run(_ask_claude_exec({"prompt": "Hi"}, _ctx(tmp_path)))
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
     assert r["ok"] is False
-    full = json.dumps(r)
-    assert secret not in full
+    assert "quota" in r["error"]
+
+
+# ─────────────────────── Bridge — timeout / cancel ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_timeout(monkeypatch):
+    """Subprocess nedokončí v timeout_sec → killpg + ok=False."""
+    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setattr("voice.agent.tools.claude.CLAUDE_TIMEOUT_SEC", 0.2)
+    proc = _FakeProcess(
+        stdout_chunks=[b""], stderr_chunks=[],
+        returncode=0, wait_delay=5.0,  # >> timeout
+    )
+    _patch_subprocess(monkeypatch, proc)
+    killpg_calls = _patch_killpg(monkeypatch)
+
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
+    assert r["ok"] is False
+    assert "timeout" in r["error"]
+    # killpg byl zavolán
+    assert any(c[0] == "killpg" for c in killpg_calls)
+
+
+@pytest.mark.asyncio
+async def test_cancel_event(monkeypatch):
+    """`cancel_event.set()` během běhu → killpg + ok=False canceled."""
+    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
+    proc = _FakeProcess(
+        stdout_chunks=[b""], stderr_chunks=[],
+        returncode=0, wait_delay=2.0,
+    )
+    _patch_subprocess(monkeypatch, proc)
+    killpg_calls = _patch_killpg(monkeypatch)
+
+    cancel_event = asyncio.Event()
+    ctx = _make_ctx(cancel_event=cancel_event)
+
+    async def trigger_cancel():
+        await asyncio.sleep(0.1)
+        cancel_event.set()
+
+    asyncio.create_task(trigger_cancel())
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, ctx)
+
+    assert r["ok"] is False
+    assert "canceled" in r["error"]
+    assert any(c[0] == "killpg" for c in killpg_calls)
+
+
+# ───────────────────────── Bridge — output cap ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_output_cap_kills_process(monkeypatch):
+    """Stdout > cap_bytes → on_overflow zavolá killpg, buffer truncated."""
+    monkeypatch.setattr("voice.agent.tools.claude.ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setattr("voice.agent.tools.claude.CLAUDE_OUTPUT_CAP_BYTES", 1024)
+    # 2 KiB chunk = překročí 1 KiB cap
+    huge = b"X" * (2 * 1024)
+    proc = _FakeProcess(stdout_chunks=[huge], stderr_chunks=[])
+    _patch_subprocess(monkeypatch, proc)
+    killpg_calls = _patch_killpg(monkeypatch)
+
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
+    assert r["ok"] is False
+    assert "exceeded" in r["error"]
+    assert any(c[0] == "killpg" for c in killpg_calls)
+
+
+# ─────────────────── Env scrubbing (security: no secret leak) ───────────────────
+
+
+def test_env_scrubbed_keeps_safe_vars(monkeypatch):
+    """Env passed to subprocess obsahuje JEN allowlist + ANTHROPIC_API_KEY,
+    NIC z AGENT_*/BRAVE_*/GH_*/*_TOKEN."""
+    monkeypatch.setenv("AGENT_INTERNAL_FLAG", "yes")
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brv-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "gh_secret")
+    monkeypatch.setenv("MY_API_KEY", "my-secret")
+    monkeypatch.setenv("HOME", "/home/user")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    env = claude_bridge._build_subprocess_env("sk-claude")
+
+    # MUSÍ obsahovat
+    assert env["ANTHROPIC_API_KEY"] == "sk-claude"
+    assert env["HOME"] == "/home/user"
+    assert env["PATH"] == "/usr/bin:/bin"
+    # NESMÍ obsahovat
+    assert "AGENT_INTERNAL_FLAG" not in env
+    assert "BRAVE_SEARCH_API_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "MY_API_KEY" not in env
+
+
+def test_env_lc_prefix_passed(monkeypatch):
+    """LC_* vars passnou (locale)."""
+    monkeypatch.setenv("LC_TIME", "cs_CZ.UTF-8")
+    env = claude_bridge._build_subprocess_env("k")
+    assert env.get("LC_TIME") == "cs_CZ.UTF-8"
