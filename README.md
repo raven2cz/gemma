@@ -74,6 +74,32 @@ gemma --dangerous    # ASK -> AUTO (destructive stále vyžaduje frázi)
 
 Webapp na `http://127.0.0.1:8080`. Skript sám detekuje a zabije starou zombie webapp na portu (`/proc/$pid/stat` race-guard přes starttime). Cizí proces na portu odmítne s chybou.
 
+## API klíče
+
+Dvě věci potřebují klíče k externím službám. Bez nich daný tool prostě vrátí error a agent o tom ví.
+
+**Brave Search** (pro `web_search`). Účet zdarma má 2000 dotazů měsíčně:
+
+```bash
+# Buď env var:
+export BRAVE_SEARCH_API_KEY="BSA-..."
+
+# Nebo soubor 0600 (server ho přečte při startu):
+echo "BSA-..." > ~/.brave-search-api
+chmod 600 ~/.brave-search-api
+```
+
+**Anthropic API** (pro `ask_claude`). Tool je přímý REST call na `https://api.anthropic.com/v1/messages`, **není to vnořený Claude Code CLI subagent**. Default model `claude-opus-4-7`, lze přepsat přes `AGENT_CLAUDE_MODEL`. Účtuje se vstupní + výstupní tokeny podle Anthropic ceníku.
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+# nebo
+echo "sk-ant-..." > ~/.anthropic-api-key
+chmod 600 ~/.anthropic-api-key
+```
+
+Server v obou případech odmítne načíst soubor, který je world/group readable (`mode & 0o077`). Override cesty jdou přes `BRAVE_SEARCH_API_KEY_FILE` a `ANTHROPIC_API_KEY_FILE`.
+
 ## Modely
 
 | Tag | Velikost | Kontext | Poznámka |
@@ -138,15 +164,6 @@ Mocked test suite ověří kontrakt s Ollamou (arguments jako dict, ne string, j
 Synth pipeline je sdílená mezi chat a agent módem. Chat ji volá per-sentence během streamingu, agent ji volá jednou po `agent_done` s celým finálním textem. Helper `_synth_chunk_and_emit` v `voice/webapp/server.py`.
 
 Fráze pro approval (APPROVE_PHRASES, DENY_PHRASES, DESTRUCTIVE_APPROVAL_PHRASE) žijí v `voice/agent/config.py`. Frontend si je tahá přes `GET /api/approval_config`, fallback constants jsou v `app.js` jen pro init před prvním fetchem. Žádný drift.
-
-## Plány
-
-- `plans/voice_chat_webapp.md` voice webapp
-- `plans/agent_mode.md` agent mode s 13 tools a voice approval
-- `plans/bilingual_tts.md` cs/en TTS swap
-- `plans/text_input.md` textový vstup, mode toggle
-
-Top-level baseline v `PLAN.md`.
 
 ## Licence
 
