@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Tenký launcher pro Gemma webapp z libovolného adresáře.
+#
+# Instalace (symlink do PATH):
+#   ln -s /home/box/git/github/gemma/scripts/gemma ~/bin/gemma
+#
+# Použití (z libovolného PWD):
+#   gemma                # WORKDIR = $PWD, port 8080
+#   gemma --dangerous    # ASK → AUTO (destructive stále vyžaduje frázi)
+#   gemma --port 9000    # vlastní port
+#
+# WORKDIR se vždy bere z $PWD wrapperu (kde jsi prikaz spustil), ne
+# z umístění skriptu — to umožňuje spustit agenta nad libovolným projektem.
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+exec "$ROOT/scripts/agent.sh" "$@"
