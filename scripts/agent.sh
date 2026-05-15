@@ -16,12 +16,14 @@ WORKDIR="$PWD"
 PORT=8080
 HOST=127.0.0.1
 DANGEROUS=0
+ALLOW_HOME=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port)       PORT="$2"; shift 2 ;;
     --host)       HOST="$2"; shift 2 ;;
     --dangerous)  DANGEROUS=1; shift ;;
+    --allow-home) ALLOW_HOME=1; shift ;;
     -h|--help)
       sed -n '2,11p' "$0" | sed 's/^# \?//'; exit 0 ;;
     *)
@@ -31,6 +33,29 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Safety: refuse start pokud PWD == $HOME nebo / nebo top-level filesystem.
+# Agent dostane PWD jako sandbox root. Když je root = HOME, write_file
+# kamkoli pod ~ projde jako AUTO bez ptaní - hard to recover from. User
+# musí --allow-home explicitně, pokud opravdu chce sandbox=HOME.
+WORKDIR_REAL="$(readlink -f "$WORKDIR")"
+HOME_REAL="$(readlink -f "$HOME")"
+if [[ "$ALLOW_HOME" != "1" ]]; then
+  if [[ "$WORKDIR_REAL" == "$HOME_REAL" ]]; then
+    cat >&2 <<EOF
+NEBEZPEČNÉ: pokoušíš se spustit gemma s WORKDIR = $HOME (HOME).
+Agent by měl celé HOME jako sandbox, AUTO write všude pod ~. Místo toho:
+  cd ~/git/github/muj-projekt && gemma
+nebo pokud opravdu chceš HOME (nedoporučeno):
+  gemma --allow-home
+EOF
+    exit 1
+  fi
+  if [[ "$WORKDIR_REAL" == "/" || "$WORKDIR_REAL" == "/root" ]]; then
+    echo "NEBEZPEČNÉ: WORKDIR=$WORKDIR_REAL (root filesystem). Zvol projektový adresář." >&2
+    exit 1
+  fi
+fi
 
 # Sanity checks ---------------------------------------------------------
 if [[ ! -x "$ROOT/voice/.venv-tts/bin/uvicorn" ]]; then

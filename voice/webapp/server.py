@@ -585,6 +585,17 @@ async def lifespan(app: FastAPI):
     global _TURNS_LOCK, _WATCHDOG_TASK, _SHUTTING_DOWN
     _TURNS_LOCK = asyncio.Lock()
     _WATCHDOG_TASK = asyncio.create_task(_turn_cleanup_watchdog())
+    # Headline: agent sandbox root. Když je == HOME, ŘVAŤ - to byl reálný
+    # incident (write_file kamkoli pod ~ projde jako AUTO bez ptaní).
+    from voice.agent.config import WORKDIR as _WORKDIR
+    if str(_WORKDIR) == str(Path.home().resolve()):
+        log.error(
+            "WORKDIR = HOME (%s). Sandbox je celé HOME. write_file bez "
+            "approval kamkoli pod ~. Vypni server a spusť `gemma` z "
+            "projektového adresáře.", _WORKDIR,
+        )
+    else:
+        log.info("agent WORKDIR = %s", _WORKDIR)
     await _health_report()
     # Preload TTS na pozadí (neblokuje start serveru).
     loop = asyncio.get_running_loop()
@@ -636,6 +647,7 @@ app = FastAPI(lifespan=lifespan)
 # --------------------------------------------------------------------- health
 
 async def _health_report() -> dict:
+    from voice.agent.config import WORKDIR as _WORKDIR
     status = {
         "ffmpeg": bool(shutil.which("ffmpeg")),
         "whisper_bin": WHISPER_BIN.exists(),
@@ -646,6 +658,11 @@ async def _health_report() -> dict:
         "tts_loaded_lang": _TTS_CURRENT_LANG,
         "ollama": False,
         "cuda": False,
+        # Sandbox sandbox root — frontend ho ukáže v topbaru, ať user vidí,
+        # kam agent reálně píše. Kritické po incidentu kdy WORKDIR=HOME
+        # způsobil unprompted writes do ~/.
+        "workdir": str(_WORKDIR),
+        "workdir_is_home": str(_WORKDIR) == str(Path.home().resolve()),
     }
     async with httpx.AsyncClient(timeout=2.0) as c:
         try:
@@ -1768,11 +1785,12 @@ async def turn(req: Request):
         user_lang = lang_override
     else:
         user_lang = tts_cs.detect_lang(last_user, prev=prev_lang)
+    from voice.agent.config import WORKDIR as _WORKDIR
     log.info(
-        "turn start: model=%s mode=%s user_lang=%r → %s (override=%s, prev=%s, "
-        "want_tts=%s, stream_tts=%s, tts_scope=%s)",
-        model, mode, last_user[:60], user_lang, lang_override, prev_lang,
-        want_tts, stream_tts, tts_scope,
+        "turn start: model=%s mode=%s workdir=%s user_lang=%r → %s "
+        "(override=%s, prev=%s, want_tts=%s, stream_tts=%s, tts_scope=%s)",
+        model, mode, _WORKDIR, last_user[:60], user_lang, lang_override,
+        prev_lang, want_tts, stream_tts, tts_scope,
     )
 
     # System prompt: markdown povolen když nejedeme do TTS.

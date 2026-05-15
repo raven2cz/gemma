@@ -14,6 +14,7 @@ const AVATARS = {
 const $ = (id) => document.getElementById(id);
 const modelSelect = $('model-select');
 const brandModel = $('brand-model');
+const brandWorkdir = $('brand-workdir');
 
 /** Synchronizuj brand badge v topbaru s aktuálně zvoleným modelem. Voláno
  * po loadModels() a po každé change události na dropdownu. Badge má title
@@ -345,6 +346,20 @@ async function loadHealth() {
     healthDot.title = Object.entries(h).map(([k, v]) => `${k}: ${v ? '✓' : '✗'}`).join('\n');
     if (!h.ollama) showError('Ollama není dostupná na :11434. Spusť: sudo systemctl start ollama');
     if (!h.ffmpeg) showError('ffmpeg chybí. Nainstaluj: sudo pacman -S ffmpeg');
+
+    // Sandbox root badge v topbaru. Červený pulse pokud == HOME (kritické).
+    if (brandWorkdir && h.workdir) {
+      brandWorkdir.textContent = h.workdir;
+      brandWorkdir.title = `Agent sandbox root: ${h.workdir}\nVšechny fs tooly operují relativně k téhle cestě.`;
+      brandWorkdir.classList.toggle('danger', !!h.workdir_is_home);
+      if (h.workdir_is_home) {
+        showError(
+          `NEBEZPEČNÉ: WORKDIR = HOME (${h.workdir}). Agent může psát kamkoliv ` +
+          `pod ~. Vypni server, přejdi do projektu a spusť \`gemma\` znova.`,
+          { sticky: true }
+        );
+      }
+    }
     const dangerBadge = $('dangerous-badge');
     if (dangerBadge) {
       dangerBadge.hidden = !h.dangerous_mode;
