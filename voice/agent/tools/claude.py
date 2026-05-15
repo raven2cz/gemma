@@ -1,4 +1,4 @@
-"""Claude bridge tool — `ask_claude(prompt, system?, max_tokens?)`.
+"""Claude bridge tool - `ask_claude(prompt, system?, max_tokens?)`.
 
 Deleguje na **Claude Code CLI** (`claude -p`) jako sub-agent subprocess, ne
 přímo na Anthropic Messages REST API. Vzor: `avatar-engine/avatar_engine/
@@ -35,7 +35,7 @@ from voice.agent.tools.base import ExecuteContext, Tool
 
 async def _ask_claude_exec(args: dict, ctx: ExecuteContext) -> dict:
     """Validace args + delegace na claude_bridge.ask_claude_oneshot."""
-    # Re-validace (defense in depth — classifier už filtroval).
+    # Re-validace (defense in depth - classifier už filtroval).
     prompt_arg = args.get("prompt")
     if not isinstance(prompt_arg, str):
         return {"ok": False, "error": "prompt must be string"}
@@ -76,7 +76,7 @@ async def _ask_claude_exec(args: dict, ctx: ExecuteContext) -> dict:
     if ctx is not None and getattr(ctx, "cancel_event", None) is not None:
         # ExecuteContext.cancel_event může být threading.Event (z agent loop)
         # nebo asyncio.Event. Bridge očekává asyncio.Event interface (.wait()).
-        # Pokud je threading, balíme ho — ale v praxi se používá asyncio.
+        # Pokud je threading, balíme ho - ale v praxi se používá asyncio.
         ce = ctx.cancel_event
         if hasattr(ce, "wait") and asyncio_compatible(ce):
             cancel_event = ce
@@ -107,8 +107,8 @@ ASK_CLAUDE_TOOL = Tool(
         "CLI subprocess). Use this for problems that exceed local model "
         "capability: complex reasoning, expert second opinion, code review, "
         "or when context is too large for local model. The sub-agent has NO "
-        "tools (--tools '') and runs in an empty workdir — pure consult, no "
-        "file/shell access. Each call costs money — use sparingly."
+        "tools (--tools '') and runs in an empty workdir - pure consult, no "
+        "file/shell access. Each call costs money - use sparingly."
     ),
     parameters_schema={
         "type": "object",

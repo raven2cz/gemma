@@ -1,4 +1,4 @@
-"""Claude Code CLI bridge — oneshot subprocess call pro `ask_claude` tool.
+"""Claude Code CLI bridge - oneshot subprocess call pro `ask_claude` tool.
 
 Spawnuje `claude -p` jako subprocess, posílá prompt přes stdin, čte JSON
 výstup. **Není to REST API call.** Vzor je `avatar-engine/avatar_engine/
@@ -20,7 +20,7 @@ Bezpečnostní model:
   spawnuje child procesy (MCP servery, hooks); single PID kill nestačí.
 - Per-chunk output cap během streaming reading. Při překročení killpg
   okamžitě, ne až po `communicate()` (jinak by CLI sežrala RAM).
-- Stderr drain async task — bez něj plný stderr pipe zamrzne proces.
+- Stderr drain async task - bez něj plný stderr pipe zamrzne proces.
 
 Cancel:
 - Bridge přijímá `cancel_event` (asyncio.Event z turn_state). Race proti
@@ -73,7 +73,7 @@ async def _read_stream_capped(
 ) -> bytes:
     """Async per-chunk reader. Při překročení capu zavolá `on_overflow`
     (typicky killpg) a vrátí buffer ořezaný na cap. Nikdy nečte víc než cap+1
-    do paměti — neuložíme komprimovaný/decompression bombu."""
+    do paměti - neuložíme komprimovaný/decompression bombu."""
     buf = bytearray()
     overflowed = False
     while True:
@@ -164,7 +164,7 @@ async def ask_claude_oneshot(
     if not prompt or not prompt.strip():
         return {"ok": False, "error": "empty prompt"}
 
-    # Build argv — prompt NIKDY do argv (ps leak). Stdin only.
+    # Build argv - prompt NIKDY do argv (ps leak). Stdin only.
     argv = [
         claude_bin,
         "-p",                            # --print, non-interactive
@@ -177,14 +177,14 @@ async def ask_claude_oneshot(
         "--tools", "",                   # disable all built-in tools (Read/Edit/Bash)
     ]
     if system:
-        # System přes argv — ne ideal kvůli `ps`, ale --append-system-prompt-file
+        # System přes argv - ne ideal kvůli `ps`, ale --append-system-prompt-file
         # v CLI 2.1.x neexistuje. System je obvykle krátký a méně citlivý než user
         # prompt. Pokud user dá secrets do system, je to jeho rozhodnutí.
         argv += ["--append-system-prompt", system]
 
     env = _build_subprocess_env(api_key)
 
-    # Empty temp dir as cwd — Claude nemá kde najít project config / CLAUDE.md.
+    # Empty temp dir as cwd - Claude nemá kde najít project config / CLAUDE.md.
     with tempfile.TemporaryDirectory(prefix="claude_bridge_") as tmp:
         cwd = Path(tmp)
         log.debug("claude subprocess: argv=%s cwd=%s", argv, cwd)
@@ -236,7 +236,7 @@ async def ask_claude_oneshot(
             proc.stdin.close()
             await proc.stdin.wait_closed()
         except (BrokenPipeError, ConnectionResetError):
-            # Subprocess umřel dřív než přečetl stdin — pokračujeme do readeru
+            # Subprocess umřel dřív než přečetl stdin - pokračujeme do readeru
             # který zjistí exit code.
             pass
         except Exception as e:
@@ -301,7 +301,7 @@ async def ask_claude_oneshot(
         if overflow_triggered["v"]:
             return {
                 "ok": False,
-                "error": f"response exceeded {output_cap_bytes} bytes — proces zabit",
+                "error": f"response exceeded {output_cap_bytes} bytes - proces zabit",
                 "duration_ms": duration_ms, "exit_code": exit_code,
             }
         if exit_code != 0:

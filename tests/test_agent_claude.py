@@ -1,6 +1,6 @@
 """Tests pro `ask_claude` tool a `claude_bridge` subprocess wrapper.
 
-Mockujeme `asyncio.create_subprocess_exec` — žádný reálný `claude` CLI.
+Mockujeme `asyncio.create_subprocess_exec` - žádný reálný `claude` CLI.
 Fake subprocess implementuje stdin/stdout/stderr/wait minimum pro bridge.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ from voice.agent.tools.claude import ASK_CLAUDE_TOOL
 
 
 class _FakeStreamReader:
-    """Async StreamReader fake — `await read(n)` vrací postupně dané chunky."""
+    """Async StreamReader fake - `await read(n)` vrací postupně dané chunky."""
 
     def __init__(self, chunks: list[bytes]):
         self._chunks = list(chunks)
@@ -36,7 +36,7 @@ class _FakeStreamReader:
 
 
 class _FakeStreamWriter:
-    """Async StreamWriter fake — sbírá zapsané bytes (nikdy neblokuje)."""
+    """Async StreamWriter fake - sbírá zapsané bytes (nikdy neblokuje)."""
 
     def __init__(self):
         self.buffer = bytearray()
@@ -230,7 +230,7 @@ async def test_max_tokens_out_of_range():
     assert r["ok"] is False
 
 
-# ───────────────────────── Bridge — happy path ─────────────────────────
+# ───────────────────────── Bridge - happy path ─────────────────────────
 
 
 @pytest.mark.asyncio
@@ -296,7 +296,7 @@ async def test_system_via_argv(monkeypatch):
     assert "You are a tester" in captured["argv"]
 
 
-# ───────────────────────── Bridge — error paths ─────────────────────────
+# ───────────────────────── Bridge - error paths ─────────────────────────
 
 
 @pytest.mark.asyncio
@@ -371,7 +371,7 @@ async def test_is_error_flag(monkeypatch):
     assert "quota" in r["error"]
 
 
-# ─────────────────────── Bridge — timeout / cancel ───────────────────────
+# ─────────────────────── Bridge - timeout / cancel ───────────────────────
 
 
 @pytest.mark.asyncio
@@ -419,7 +419,7 @@ async def test_cancel_event(monkeypatch):
     assert any(c[0] == "killpg" for c in killpg_calls)
 
 
-# ───────────────────────── Bridge — output cap ─────────────────────────
+# ───────────────────────── Bridge - output cap ─────────────────────────
 
 
 @pytest.mark.asyncio
