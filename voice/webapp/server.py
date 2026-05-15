@@ -1768,8 +1768,12 @@ async def turn(req: Request):
         user_lang = lang_override
     else:
         user_lang = tts_cs.detect_lang(last_user, prev=prev_lang)
-    log.info("turn user_lang: %r → %s (override=%s, prev=%s, want_tts=%s, stream_tts=%s)",
-             last_user[:60], user_lang, lang_override, prev_lang, want_tts, stream_tts)
+    log.info(
+        "turn start: model=%s mode=%s user_lang=%r → %s (override=%s, prev=%s, "
+        "want_tts=%s, stream_tts=%s, tts_scope=%s)",
+        model, mode, last_user[:60], user_lang, lang_override, prev_lang,
+        want_tts, stream_tts, tts_scope,
+    )
 
     # System prompt: markdown povolen když nejedeme do TTS.
     sys_prompt = (

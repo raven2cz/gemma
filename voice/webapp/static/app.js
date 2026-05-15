@@ -366,9 +366,31 @@ async function loadModels() {
       opt.value = opt.textContent = m;
       modelSelect.appendChild(opt);
     }
-    const saved = localStorage.getItem('model');
-    if (saved && models.includes(saved)) modelSelect.value = saved;
-    else if (models.includes('gemma4-e4b-32k')) modelSelect.value = 'gemma4-e4b-32k';
+
+    // Resolve uložený model proti current Ollama list. Ollama vrací modely
+    // se sufixem `:latest` (např. "gemma4-e4b-32k:latest"); legacy localStorage
+    // mohlo držet verzi bez sufixu z předchozí verze appky. Fallback chain:
+    //   1) saved exact match
+    //   2) saved + ":latest"
+    //   3) saved bez ":latest" (case opačný)
+    //   4) preferovaný default "gemma4-e4b-32k" v různých variantách
+    //   5) první dostupný (cokoli aby dropdown nebyl prázdný)
+    const saved = localStorage.getItem('model') || '';
+    const tryMatch = (cand) => cand && models.includes(cand) ? cand : null;
+    const resolved =
+      tryMatch(saved)
+      || tryMatch(saved + ':latest')
+      || tryMatch(saved.replace(/:latest$/, ''))
+      || tryMatch('gemma4-e4b-32k:latest')
+      || tryMatch('gemma4-e4b-32k')
+      || tryMatch('gemma4:e4b')
+      || (models[0] || '');
+    if (resolved) {
+      modelSelect.value = resolved;
+      // Persistuj rozhodnutí, aby další load nemusel resolve-ovat znova.
+      localStorage.setItem('model', resolved);
+    }
+    console.info(`[model] resolved=${resolved} (saved=${JSON.stringify(saved)})`);
   } catch (e) {
     showError(`Nelze načíst modely: ${e.message}`);
   }
