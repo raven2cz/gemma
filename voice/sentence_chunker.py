@@ -400,6 +400,19 @@ def finalize(buf: str) -> list[Chunk]:
         if code_content:
             out.append(Chunk(text=code_content, speakable=False, kind="code"))
 
+    # Codex audit HIGH: neuzavřený fence (model dotekl max_tokens / EOS uprostřed
+    # ```code... bez ukončení). `_extract_code_blocks` ho nevyzobne (hledá jen
+    # uzavřené ```), takže by tail propadl do speakable cleanu → TTS by četl
+    # kód. Tady ho zachytíme: tail od posledního ``` jde jako code chunk,
+    # cokoli PŘED ním zůstane pro normální speakable processing.
+    if _has_unclosed_fence(stripped_buf):
+        last_fence = stripped_buf.rfind("```")
+        if last_fence != -1:
+            code_tail = stripped_buf[last_fence:].lstrip("`").lstrip("\n")
+            if code_tail.strip():
+                out.append(Chunk(text=code_tail, speakable=False, kind="code"))
+            stripped_buf = stripped_buf[:last_fence]
+
     cleaned = _clean_for_tts(stripped_buf)
     if not cleaned.strip():
         return out

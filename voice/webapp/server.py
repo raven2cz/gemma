@@ -438,6 +438,101 @@ def _tts_synth_chunk_blocking(
         tts_cs.set_cancel_event(None)
 
 
+async def _synth_chunk_and_emit(
+    *,
+    tid: str,
+    seq: int,
+    text: str,
+    turn_state: dict,
+    out_queue: asyncio.Queue,
+    voice: str,
+    ref: str,
+    fast: bool,
+    user_lang: str,
+) -> None:
+    """Per-chunk TTS synth — sdílený mezi chat tts_task (streaming) a agent
+    final-buf one-shot synth. Emit `audio` (úspěch) nebo `audio_error` (selhání).
+
+    Volající rozhoduje, jestli pokračovat dalším chunkem, podle stavu
+    `turn_state["canceled"]` (TTSCanceled → set True, caller break)
+    a `turn_state["tts_oom"]` (skip dalších chunků po prvním OOM).
+
+    Chování:
+    - `turn_state["canceled"]` / `tts_oom` set → no-op (caller už ví, že má skipnout).
+    - Voice ref resolve fail (HTTPException) → emit `audio_error`, vrátí se.
+    - TTSCanceled (cancel mid-synth) → set `turn_state["canceled"]=True`, vrátí se.
+    - CUDA OOM → set `turn_state["tts_oom"]=True`, empty_cache, emit `audio_error`.
+    - Generic exception → log + emit `audio_error`.
+    - Úspěch → register `turn_state["files"][seq]`, emit `audio` s URL.
+
+    Lang per chunk = `turn_state["lang_lock"] or user_lang`. Caller je
+    zodpovědný za nastavení `lang_lock` před voláním (jinak fallback na user_lang).
+    """
+    if turn_state["canceled"] or turn_state.get("tts_oom"):
+        return
+    chunk_lang = turn_state["lang_lock"] or user_lang
+    try:
+        ref_str = _resolve_voice_or_ref(voice, ref, chunk_lang)
+    except HTTPException as e:
+        log.warning("turn %s: voice resolve failed on seq %d: %s",
+                    tid, seq, e.detail)
+        await out_queue.put({"type": "audio_error", "seq": seq, "msg": e.detail})
+        return
+
+    out_path = turn_state["tmpdir"] / f"chunk_{seq}.wav"
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            _TTS_EXECUTOR,
+            _tts_synth_chunk_blocking,
+            text, ref_str, fast, chunk_lang, out_path, turn_state,
+        )
+    except Exception as e:
+        if _TTS_MODULE is not None and isinstance(e, getattr(_TTS_MODULE, "TTSCanceled", ())):
+            log.info("turn %s: tts canceled on seq %d", tid, seq)
+            turn_state["canceled"] = True
+            return
+        # CUDA OOM detection — typicky po přepnutí LLM v Ollamě (větší model
+        # sebere VRAM). Mark turn jako OOM, empty_cache, pošli jeden čistý
+        # error místo stack-trace spamu každý chunk.
+        err_name = type(e).__name__
+        is_oom = (
+            err_name in ("OutOfMemoryError", "CUDAOutOfMemoryError")
+            or "out of memory" in str(e).lower()
+        )
+        if is_oom:
+            turn_state["tts_oom"] = True
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            log.warning("turn %s: tts chunk %d OOM (%s) — zbytek turnu skipnut",
+                        tid, seq, err_name)
+            await out_queue.put({
+                "type": "audio_error", "seq": seq,
+                "msg": "TTS nemá dost VRAM. Přepni LLM na menší model nebo restartuj Ollamu.",
+            })
+            return
+        log.exception("turn %s: tts chunk %d failed", tid, seq)
+        await out_queue.put({"type": "audio_error", "seq": seq, "msg": str(e)})
+        return
+
+    if turn_state["canceled"] or result is None:
+        try:
+            out_path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    turn_state["files"][seq] = out_path
+    await out_queue.put({
+        "type": "audio",
+        "seq": seq,
+        "url": f"/api/turn/{tid}/audio/{seq}.wav",
+        "chars": len(text),
+    })
+
+
 _SHUTTING_DOWN = False
 
 
@@ -1206,6 +1301,67 @@ def _build_agent_messages(messages: list[dict], lang: str, want_tts: bool) -> li
     return [{"role": "system", "content": base}, *sanitized]
 
 
+async def _synth_agent_final_text(
+    *,
+    final_buf: str,
+    tid: str,
+    turn_state: dict,
+    out_queue: asyncio.Queue,
+    voice: str,
+    ref: str,
+    fast: bool,
+    user_lang: str,
+    lang_override: str,
+) -> None:
+    """Agent-mode "final-only" TTS: vezme akumulovaný text posledního LLM kola,
+    rozdělí přes `finalize()` na speakable + non-speakable části, emit `chunk`
+    eventy pro code bloky (neslyšitelné), speakable části spojí a syntetizuje
+    jako JEDEN audio chunk (seq=0) přes sdílený `_synth_chunk_and_emit`.
+
+    Volá se po `agent.run()` dokončeném s `agent_done` (caller musí ověřit
+    úspěch), PŘED finálním `done` eventem klientovi.
+
+    Lang lock: detekce běží jen na speakable obsahu (NE na code blocích —
+    jinak by velký anglický `console.log(...)` v code přepnul voice ref pro
+    českou prózu). `lang_override` má prioritu.
+
+    Code bloky (vč. neuzavřených fence) se NIKDY nesyntetizují — jdou jen
+    jako `chunk` event s `kind="code"`, frontend je zobrazí jako text bez TTS.
+    """
+    from voice.sentence_chunker import finalize
+    tts_cs = _import_tts_cs()
+
+    # 1) Nejdřív finalize → split speakable/code chunks; code emit hned.
+    speakable_parts: list[str] = []
+    for ch in finalize(final_buf):
+        if ch.speakable:
+            speakable_parts.append(ch.text)
+        else:
+            await out_queue.put({"type": "chunk", "kind": ch.kind, "text": ch.text})
+
+    if not speakable_parts:
+        return  # Jen code/think bloky → žádné audio, jen chunk eventy.
+    combined = " ".join(p.strip() for p in speakable_parts if p.strip())
+    if not combined:
+        return
+
+    # 2) Lang lock — detekce JEN na speakable text (po finalize), ne na code.
+    #    `lang_override` má prioritu; caller mohl pre-locknout v turn_state.
+    if turn_state.get("lang_lock") is None:
+        if lang_override in {"cs", "en"}:
+            turn_state["lang_lock"] = lang_override
+        else:
+            turn_state["lang_lock"] = tts_cs.detect_lang(combined, prev=user_lang)
+    await out_queue.put({"type": "lang", "lang": turn_state["lang_lock"]})
+
+    # 3) Single audio chunk seq=0 přes SDÍLENÝ helper (stejná funkce jako chat-mode).
+    await _synth_chunk_and_emit(
+        tid=tid, seq=0, text=combined,
+        turn_state=turn_state, out_queue=out_queue,
+        voice=voice, ref=ref, fast=fast, user_lang=user_lang,
+    )
+
+
 async def _run_agent_turn(
     *,
     req: Request,
@@ -1215,10 +1371,22 @@ async def _run_agent_turn(
     messages: list[dict],
     user_lang: str,
     want_tts: bool,
+    tts_scope: str = "off",          # "final" | "off" (agent-specifické)
+    voice: str = "",                  # voice id pro TTS (irrelevant pokud "off")
+    ref: str = "",                    # voice ref soubor (irrelevant pokud "off")
+    fast: bool = False,               # TTS fast mode
+    lang_override: str = "auto",      # "auto" | "cs" | "en"
 ) -> StreamingResponse:
     """Agent mode NDJSON stream. Emituje:
         user_lang, text, tool_call, tool_result, approval_required,
-        agent_error, canceled, done.
+        chunk (kind=code), audio, audio_error, lang, agent_error, canceled, done.
+
+    TTS (volitelné, default off): pokud `tts_scope == "final"`, po dokončení
+    agent.run() vezme nashromážděný text z POSLEDNÍHO LLM kola (vše po
+    posledním `tool_call` resetu) → `finalize()` z chunkeru → code bloky
+    jdou jako `chunk` event (neslyšitelné), speakable části spojí do jednoho
+    audio chunku (seq=0) přes sdílený `_synth_chunk_and_emit` (stejná funkce
+    jakou volá chat-mode tts_task — žádná duplikace).
     """
     from voice.agent.audit import AuditLog
     from voice.agent.config import AUDIT_DIR, WORKDIR
@@ -1229,7 +1397,11 @@ async def _run_agent_turn(
     out_queue: asyncio.Queue = asyncio.Queue()
     _SENTINEL = object()
 
-    history = _build_agent_messages(messages, user_lang, want_tts)
+    # `effective_tts` = je vůbec TTS na výstupu? Pokud agent + scope="off",
+    # system prompt NEpotřebuje "drž v jednom odstavci bez markdown" hint
+    # (user uvidí text v UI, ne uslyší).
+    effective_tts = want_tts and tts_scope != "off"
+    history = _build_agent_messages(messages, user_lang, effective_tts)
     audit_log = AuditLog(AUDIT_DIR)
     agent = AgentLoop(
         model=model,
@@ -1267,7 +1439,27 @@ async def _run_agent_turn(
 
     agent.set_approval_resolver(approval_resolver)
 
+    # Pre-lock lang override (final-buf path ho použije, pokud je set).
+    if lang_override in {"cs", "en"} and turn_state.get("lang_lock") is None:
+        turn_state["lang_lock"] = lang_override
+
     async def driver() -> None:
+        # `final_buf` = akumulace text dělt z agent.run() pro TTS scope "final".
+        # Pravidlo: reset na každém `tool_call` (text před toolem je mezikolový
+        # komentář, ne finální odpověď). Po skončení agent.run() obsahuje JEN
+        # text z posledního LLM kola (žádný tool_call už nepřišel) → ten zní.
+        final_buf = ""
+        synth_final = (tts_scope == "final")
+        # `saw_agent_done` rozliší úspěšný konec (=čti final_buf) od agent_error/
+        # canceled (=nečti, partial text by mohl být nesmyslný). Kontroluje to
+        # codex audit HIGH #1.
+        saw_agent_done = False
+        # `pending_agent_done_ev` — držíme `agent_done` event, dokud
+        # synthesujeme. Posíláme ho AŽ PO `audio`, aby klient (nebo budoucí
+        # konzument) co bere agent_done jako terminal event nestihl ukončit
+        # stream před přijetím audio. Codex audit HIGH #2.
+        pending_agent_done_ev: dict | None = None
+
         try:
             await out_queue.put({"type": "user_lang", "lang": user_lang})
             # Phase 7: pre-flight heuristic router — observability only,
@@ -1284,12 +1476,52 @@ async def _run_agent_turn(
             async for ev in agent.run():
                 if turn_state["canceled"]:
                     break
+                t = ev.get("type") if isinstance(ev, dict) else None
+                # Final-buf akumulace pro TTS scope="final".
+                if synth_final:
+                    if t == "text":
+                        final_buf += ev.get("delta", "") or ""
+                    elif t == "tool_call":
+                        # Nový tool round — předchozí text byl mezikolový komentář.
+                        # Final-buf nás zajímá jen pro POSLEDNÍ LLM kolo (kdy už
+                        # žádný další tool_call nepřijde).
+                        final_buf = ""
                 # Forensic stopa: jakékoli `agent_error` z loopu zaloguj jako
                 # ERROR. Bez tohoto by chyba existovala jen v transient NDJSON
                 # streamu (UI toast 6s → user nestihne) a do log souboru nic.
-                if isinstance(ev, dict) and ev.get("type") == "agent_error":
+                if t == "agent_error":
                     log.error("turn %s: agent_error event: %s", tid, ev.get("msg"))
+                # `agent_done` zadrž — pošleme až po případném audio synth,
+                # aby žádný konzument neměl konec dřív než audio.
+                if t == "agent_done" and synth_final:
+                    saw_agent_done = True
+                    pending_agent_done_ev = ev
+                    continue
+                if t == "agent_done":
+                    saw_agent_done = True
                 await out_queue.put(ev)
+
+            # Po skončení agent.run() — synth JEN pokud byl `agent_done`
+            # (= úspěšný konec, ne agent_error/canceled). Codex HIGH #1.
+            if (synth_final and saw_agent_done
+                    and not turn_state["canceled"]
+                    and final_buf.strip()):
+                await _synth_agent_final_text(
+                    final_buf=final_buf,
+                    tid=tid,
+                    turn_state=turn_state,
+                    out_queue=out_queue,
+                    voice=voice, ref=ref, fast=fast,
+                    user_lang=user_lang, lang_override=lang_override,
+                )
+
+            # Forward zadržený `agent_done` až po audio. Codex HIGH #2.
+            # POZOR: mid-synth cancel (TTSCanceled) setne turn_state["canceled"]
+            # uvnitř `_synth_chunk_and_emit`. V tom případě NESMÍME emitnout
+            # agent_done (finally pošle `canceled`), jinak by stream skončil
+            # úspěšným signálem navzdory zrušení. (Codex final audit HIGH fix.)
+            if pending_agent_done_ev is not None and not turn_state["canceled"]:
+                await out_queue.put(pending_agent_done_ev)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1370,6 +1602,17 @@ async def turn(req: Request):
     fast = bool(body.get("fast"))
     want_tts = bool(body.get("want_tts", True))
     stream_tts = bool(body.get("stream_tts", True))
+    # tts_scope: jen pro agent mode (final/off). Pro chat mode ignorováno.
+    _tts_scope_raw = (body.get("tts_scope") or "").lower().strip()
+    if mode == "agent":
+        tts_scope = _tts_scope_raw if _tts_scope_raw in {"final", "off"} else "final"
+        if not want_tts:
+            tts_scope = "off"
+    else:
+        tts_scope = "off"  # n/a — chat mode používá stream_tts
+    # Efektivní TTS pro readiness/voice gating: TTS hardware se nemusí načítat,
+    # pokud agent mode + scope=off (user explicitně vypnul agent TTS).
+    effective_tts = want_tts and not (mode == "agent" and tts_scope == "off")
     lang_override = (body.get("lang_override") or "auto").lower()
     prev_lang = (body.get("prev_lang") or "cs").lower()
     if prev_lang not in {"cs", "en"}:
@@ -1380,8 +1623,8 @@ async def turn(req: Request):
     # s `chunk_lang` (turn_state["lang_lock"]), protože assistant může odpovídat
     # v jiném jazyce než user. Žádné voice I/O se tady ještě nestane (kromě
     # allowlist scan cached v _VOICES_CACHE).
-    voice = _validate_voice(voice) if want_tts else ""
-    if ref and want_tts:
+    voice = _validate_voice(voice) if effective_tts else ""
+    if ref and effective_tts:
         # Syntaktická validace ref bez resolve — detekovat chybu hned.
         if "/" in ref or "\\" in ref or ".." in ref or not ref.startswith("ref_"):
             raise HTTPException(400, f"Neplatný ref {ref!r}")
@@ -1406,7 +1649,7 @@ async def turn(req: Request):
 
     # System prompt: markdown povolen když nejedeme do TTS.
     sys_prompt = (
-        SYSTEM_PROMPTS[user_lang] if want_tts else MARKDOWN_SYSTEM_PROMPTS[user_lang]
+        SYSTEM_PROMPTS[user_lang] if effective_tts else MARKDOWN_SYSTEM_PROMPTS[user_lang]
     )
     messages = [m for m in messages if m.get("role") != "system"]
     messages = [{"role": "system", "content": sys_prompt}, *messages]
@@ -1415,8 +1658,8 @@ async def turn(req: Request):
     # který může být jiný než user_lang (assistant odpoví v EN na CZ otázku).
     # Tady jen pre-fetch default, aby pádná chybka propadla dřív.
 
-    # TTS readiness (když ho chceme).
-    if want_tts:
+    # TTS readiness (když ho chceme). Agent + scope=off → neblokujeme.
+    if effective_tts:
         if not _TTS_READY.is_set():
             try:
                 await asyncio.wait_for(_TTS_READY.wait(), timeout=60.0)
@@ -1436,6 +1679,11 @@ async def turn(req: Request):
             messages=messages,
             user_lang=user_lang,
             want_tts=want_tts,
+            tts_scope=tts_scope,
+            voice=voice,
+            ref=ref,
+            fast=fast,
+            lang_override=lang_override,
         )
 
     loop = asyncio.get_running_loop()
@@ -1570,81 +1818,18 @@ async def turn(req: Request):
                 item = await tts_queue.get()
                 if item is _SENTINEL_TTS:
                     break
-                if turn_state["canceled"]:
-                    continue
-                seq = item["seq"]
-                text = item["text"]
-                # VRAM-dead turn: po první OOM už ostatní chunky stejně nevyjdou.
-                # Skip tiše — error byl klientovi poslán jednou, víc by jen spamovalo.
-                if turn_state.get("tts_oom"):
-                    continue
-                # Lang lock by měl být set nejpozději v době flushe; kdyby ne, fallback.
-                chunk_lang = turn_state["lang_lock"] or user_lang
-                # Resolve voice ref per chunk_lang: auto-lang + voice family
-                # dohromady → per-turn výběr správného ref_{family}_{lang}.wav.
-                # Strict mode u `voice` může raise (smazaný ref soubor) — proto
-                # HTTPException catch, ať to nespadne celý tts_task.
-                try:
-                    ref_str = _resolve_voice_or_ref(voice, ref, chunk_lang)
-                except HTTPException as e:
-                    log.warning("turn %s: voice resolve failed on seq %d: %s",
-                                tid, seq, e.detail)
-                    await out_queue.put({"type": "audio_error", "seq": seq, "msg": e.detail})
-                    continue
-                out_path = turn_state["tmpdir"] / f"chunk_{seq}.wav"
-                try:
-                    result = await loop.run_in_executor(
-                        _TTS_EXECUTOR,
-                        _tts_synth_chunk_blocking,
-                        text, ref_str, fast, chunk_lang, out_path, turn_state,
-                    )
-                except Exception as e:
-                    if _TTS_MODULE is not None and isinstance(e, getattr(_TTS_MODULE, "TTSCanceled", ())):
-                        log.info("turn %s: tts canceled on seq %d", tid, seq)
-                        turn_state["canceled"] = True
-                        break
-                    # Detect CUDA OOM — typicky po přepnutí LLM v Ollamě, kdy
-                    # větší model sebere VRAM a TTS nemá kam alokovat.
-                    # Markneme turn, pustíme empty_cache, a pošleme jeden čistý
-                    # user-facing error místo stack trace spamu každý chunk.
-                    err_name = type(e).__name__
-                    is_oom = (
-                        err_name in ("OutOfMemoryError", "CUDAOutOfMemoryError")
-                        or "out of memory" in str(e).lower()
-                    )
-                    if is_oom:
-                        turn_state["tts_oom"] = True
-                        try:
-                            import torch
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
-                        log.warning(
-                            "turn %s: tts chunk %d OOM (%s) — zbytek turnu skipnut",
-                            tid, seq, err_name,
-                        )
-                        await out_queue.put({
-                            "type": "audio_error",
-                            "seq": seq,
-                            "msg": "TTS nemá dost VRAM. Přepni LLM na menší model nebo restartuj Ollamu.",
-                        })
-                        continue
-                    log.exception("turn %s: tts chunk %d failed", tid, seq)
-                    await out_queue.put({"type": "audio_error", "seq": seq, "msg": str(e)})
-                    continue
-                if turn_state["canceled"] or result is None:
-                    try:
-                        out_path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    continue
-                turn_state["files"][seq] = out_path
-                await out_queue.put({
-                    "type": "audio",
-                    "seq": seq,
-                    "url": f"/api/turn/{tid}/audio/{seq}.wav",
-                    "chars": len(text),
-                })
+                # `_synth_chunk_and_emit` sám respektuje canceled / tts_oom flagy,
+                # po TTSCanceled nastaví turn_state["canceled"] = True. Po cancelu
+                # NESMÍME break-nout: llm_task může být zablokovaný na bounded
+                # `tts_queue.put(...)` a `gather(llm, tts)` v gen() by hangnul.
+                # Místo toho pokračujeme drainem queue — helper se sám no-opne
+                # protože vidí `turn_state["canceled"]=True` na začátku.
+                # (Codex final audit HIGH regrese fix.)
+                await _synth_chunk_and_emit(
+                    tid=tid, seq=item["seq"], text=item["text"],
+                    turn_state=turn_state, out_queue=out_queue,
+                    voice=voice, ref=ref, fast=fast, user_lang=user_lang,
+                )
         finally:
             if turn_state["canceled"]:
                 await out_queue.put({"type": "canceled"})

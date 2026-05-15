@@ -76,6 +76,9 @@ const state = {
   voiceEnabled: localStorage.getItem('tts') !== '0',
   // Streaming TTS chunking (Phase B): per-sentence synth + playback queue.
   streamTTSEnabled: localStorage.getItem('streamTTS') !== '0',
+  // Agent-mode TTS scope: 'final' = jen finální odpověď po toolech (default),
+  // 'off' = bez TTS v agent módu. V chat módu ignorováno (chat má vlastní stream_tts).
+  ttsScope: (localStorage.getItem('ttsScope') === 'off') ? 'off' : 'final',
   // Per-turn kontext (audio queue, cancel flag, turn id). Inicializuje runTurn().
   turnCtx: null,
   // Conversation mode. 'chat' = klasický single-turn LLM; 'agent' = tool-calling
@@ -178,11 +181,19 @@ function updateSendButton() {
 
 // ──────────── Error UI
 let errorTimer = 0;
-function showError(msg) {
+function showError(msg, opts = {}) {
+  // sticky=true → zůstane dokud user neclickne (pro chyby z agent loopu /
+  // serveru, kde user musí mít čas přečíst detail). Default = 6s auto-dismiss.
+  const sticky = opts.sticky === true;
   errorToast.textContent = msg;
   errorToast.hidden = false;
+  errorToast.classList.toggle('sticky', sticky);
   clearTimeout(errorTimer);
-  errorTimer = setTimeout(() => (errorToast.hidden = true), 6000);
+  if (!sticky) {
+    errorTimer = setTimeout(() => (errorToast.hidden = true), 6000);
+  } else {
+    errorTimer = 0;
+  }
   console.error(msg);
 }
 
@@ -317,6 +328,13 @@ async function loadHealth() {
     healthDot.title = Object.entries(h).map(([k, v]) => `${k}: ${v ? '✓' : '✗'}`).join('\n');
     if (!h.ollama) showError('Ollama není dostupná na :11434. Spusť: sudo systemctl start ollama');
     if (!h.ffmpeg) showError('ffmpeg chybí. Nainstaluj: sudo pacman -S ffmpeg');
+    const dangerBadge = $('dangerous-badge');
+    if (dangerBadge) {
+      dangerBadge.hidden = !h.dangerous_mode;
+      if (h.dangerous_mode && h.agent_workdir) {
+        dangerBadge.title = `Dangerous mode aktivní (workdir: ${h.agent_workdir}) — ASK skipována, destructive stále vyžaduje frázi`;
+      }
+    }
   } catch (e) {
     healthDot.classList.remove('ok');
     healthDot.classList.add('bad');
@@ -344,7 +362,7 @@ async function loadModels() {
     }
     const saved = localStorage.getItem('model');
     if (saved && models.includes(saved)) modelSelect.value = saved;
-    else if (models.includes('gemma3-12b-32k')) modelSelect.value = 'gemma3-12b-32k';
+    else if (models.includes('gemma4-e4b-32k')) modelSelect.value = 'gemma4-e4b-32k';
   } catch (e) {
     showError(`Nelze načíst modely: ${e.message}`);
   }
@@ -571,11 +589,15 @@ async function finishRecording() {
     return;
   }
 
+  state.inputMode = 'mic';
+
+  // Voice intent: "agent mód" / "chat mód" → přepne mode bez LLM kola.
+  if (handleModeSwitchIntent(userText)) return;
+
   addMessage('user', userText);
   state.messages.push({ role: 'user', content: userText });
 
   // Next: LLM (mic vstup → chceme TTS pokud není globálně vypnutý)
-  state.inputMode = 'mic';
   await runTurn();
 }
 
@@ -728,6 +750,8 @@ async function runTurn() {
         prev_lang: state.lastLang,
         want_tts: wantTTS,
         stream_tts: streamTTS,
+        // Agent-mode TTS scope. V chat módu ignorováno server-side.
+        tts_scope: state.ttsScope,
       }),
       signal: abort.signal,
     });
@@ -827,6 +851,9 @@ async function runTurn() {
             // Server ještě pošle 'done' event jako canonical terminator.
             break;
           case 'audio': {
+            // Codex audit HIGH: zruš audio_filler (speechSynthesis) PŘED tím,
+            // než pustíme server-side TTS. Jinak by hlasy spolu mluvily.
+            try { window.speechSynthesis?.cancel(); } catch {}
             if (!ctx.id) {
               // Derivuj turn id z URL: /api/turn/<id>/audio/<seq>.wav
               const m = /\/api\/turn\/([a-f0-9]{16})\//.exec(ev.url);
@@ -856,7 +883,12 @@ async function runTurn() {
       }
     }
   } catch (e) {
-    if (e.name !== 'AbortError') showError(`Turn: ${e.message}`);
+    if (e.name !== 'AbortError') {
+      // Sticky = user musí mít čas přečíst (typicky stack trace nebo ollama body).
+      // Console log s plnou exception pro DevTools dive.
+      console.error('Turn error:', e);
+      showError(`Turn: ${e.message}`, { sticky: true });
+    }
     ctx.canceled = true;
     ctx.streamDone = true;
     assistantEl.classList.remove('streaming');
@@ -1014,6 +1046,47 @@ function toggleMode() {
   const next = state.mode === 'agent' ? 'chat' : 'agent';
   applyMode(next);
   playModeBeep(next);
+}
+
+// Voice/text intent: rozpozná příkaz typu "agent mód", "přepni do chatu" atd.
+// Vrací "agent" | "chat" | null. Match je úmyslně přísný — vyhne se falsům
+// jako "zeptej se Claudeho v agent módu" (full sentence, ne pure switch).
+const _RE_INTENT_AGENT = /^\s*(?:p(?:ř|r)epni(?:\s+(?:do|na))?\s+|aktivuj\s+|spus(?:t|ť)\s+|zapni\s+|jdi\s+do\s+)?(?:agent(?:n(?:í|i))?(?:[\s-]*(?:m(?:ó|o)d|m(?:ó|o)du|re(?:ž|z)im(?:u)?|mode))?|agent[au]?)\s*\.?\s*$/i;
+const _RE_INTENT_CHAT = /^\s*(?:p(?:ř|r)epni(?:\s+(?:do|na|zp(?:ě|e)t\s+do))?\s+|zp(?:ě|e)t\s+(?:do|na)\s+|jdi\s+(?:do|zp(?:ě|e)t\s+do)\s+)?(?:chat[auem]?(?:[\s-]*(?:m(?:ó|o)d|m(?:ó|o)du|re(?:ž|z)im(?:u)?|mode))?|norm(?:á|a)ln(?:í|i)(?:[\s-]*(?:m(?:ó|o)d|re(?:ž|z)im))?)\s*\.?\s*$/i;
+
+function tryModeSwitchIntent(text) {
+  if (!text) return null;
+  if (_RE_INTENT_AGENT.test(text)) return 'agent';
+  if (_RE_INTENT_CHAT.test(text)) return 'chat';
+  return null;
+}
+
+// Provede přepnutí na základě voice/text intentu. Vrátí true pokud
+// se přepnulo (caller pak NEPOSÍLÁ message do LLM).
+function handleModeSwitchIntent(userText) {
+  const target = tryModeSwitchIntent(userText);
+  if (!target) return false;
+  if (state.mode !== target) {
+    applyMode(target);
+    playModeBeep(target);
+  }
+  // Echo do UI ať vidíš co se stalo. Žádné LLM volání, žádný state.messages push.
+  addMessage('user', userText);
+  const reply = target === 'agent'
+    ? 'Přepnuto do agent módu.'
+    : 'Přepnuto do chat módu.';
+  addMessage('assistant', reply);
+  // Voice response: pokud máš TTS zapnuté a vstup byl hlasový, ozvi se.
+  if (state.voiceEnabled && state.inputMode === 'mic') {
+    try {
+      const u = new SpeechSynthesisUtterance(reply);
+      u.lang = 'cs-CZ';
+      u.rate = 1.05;
+      window.speechSynthesis.speak(u);
+    } catch {}
+  }
+  setPhase('idle');
+  return true;
 }
 
 // Web Audio API — krátký tón při přepnutí mode. Agent = vyšší (880 Hz, "up"),
@@ -1271,6 +1344,10 @@ async function handleTextSubmit() {
   autoGrowTextarea();
 
   state.inputMode = 'text';
+
+  // Text intent: "agent mód" / "chat mód" → přepne mode bez LLM kola.
+  if (handleModeSwitchIntent(text)) return;
+
   addMessage('user', text);
   state.messages.push({ role: 'user', content: text });
 
@@ -1279,8 +1356,13 @@ async function handleTextSubmit() {
 
 function clearError() {
   errorToast.hidden = true;
+  errorToast.classList.remove('sticky');
   clearTimeout(errorTimer);
 }
+
+errorToast.addEventListener('click', () => {
+  if (errorToast.classList.contains('sticky')) clearError();
+});
 
 // ──────────── Events
 micBtn.addEventListener('click', async () => {
@@ -1432,6 +1514,15 @@ streamToggle.addEventListener('change', () => {
   state.streamTTSEnabled = streamToggle.checked;
   localStorage.setItem('streamTTS', streamToggle.checked ? '1' : '0');
 });
+const ttsScopeSelect = $('tts-scope');
+if (ttsScopeSelect) {
+  ttsScopeSelect.value = state.ttsScope;
+  ttsScopeSelect.addEventListener('change', () => {
+    const v = ttsScopeSelect.value === 'off' ? 'off' : 'final';
+    state.ttsScope = v;
+    localStorage.setItem('ttsScope', v);
+  });
+}
 langSelect.addEventListener('change', () => {
   state.langOverride = langSelect.value;
   localStorage.setItem('langOverride', state.langOverride);

@@ -214,6 +214,52 @@ def _mk_lines(content: str = "", tool_calls=None, done: bool = False) -> dict:
     return {"message": msg, "done": done}
 
 
+def _patch_agent_tts(*, force_oom: bool = False, fail_with: Exception | None = None):
+    """Monkeypatch `_tts_synth_chunk_blocking` v server.py — místo reálné synth
+    napíše prázdný WAV (44 bajtů valid WAV header). Žádné GPU/VRAM nepoužívá.
+
+    `force_oom=True` → simuluje CUDAOutOfMemoryError. `fail_with=Exception("…")` →
+    simuluje generic crash. Vrací context manager. Patchuje i `_TTS_READY`
+    (event) na set, aby readiness check v `/api/turn` neblokoval.
+    """
+    import voice.webapp.server as srv_mod
+
+    # Minimální 44-byte WAV header s 0 samples, dost na `Path.exists()` a serve.
+    _empty_wav = (
+        b"RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00"
+        b"\x40\x1f\x00\x00\x80>\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+    )
+
+    def fake_synth(text, ref_str, fast, lang, out_path, turn_state):
+        if force_oom:
+            raise type("CUDAOutOfMemoryError", (RuntimeError,), {})(
+                "CUDA out of memory (simulated)"
+            )
+        if fail_with is not None:
+            raise fail_with
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "wb") as f:
+            f.write(_empty_wav)
+        return out_path
+
+    class _Patcher:
+        def __init__(self):
+            self.original_synth = srv_mod._tts_synth_chunk_blocking
+            self.original_ready = srv_mod._TTS_READY
+
+        def __enter__(self):
+            srv_mod._tts_synth_chunk_blocking = fake_synth
+            # _TTS_READY je asyncio.Event — set ho, aby /api/turn readiness check
+            # neblokoval na 60s timeout v testu.
+            srv_mod._TTS_READY.set()
+            return self
+
+        def __exit__(self, *a):
+            srv_mod._tts_synth_chunk_blocking = self.original_synth
+
+    return _Patcher()
+
+
 def _patch_ollama(script: list[list[dict]]):
     """Monkeypatch voice.agent.loop.httpx.AsyncClient. Vrací context manager."""
     import voice.agent.loop as loop_mod
@@ -726,6 +772,311 @@ async def test_e2e_agent_write_file_inside_workdir_full_round_trip(client):
     finally:
         if os.path.exists(target):
             os.unlink(target)
+
+
+# ─────────────── Agent TTS (final-only scope) ───────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_tts_off_no_audio(client):
+    """`tts_scope=off`: žádný `audio` event ani `chunk` event nesmí být."""
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "echo", "arguments": {"text": "hi"}}}],
+            done=True,
+        )],
+        [_mk_lines(content="Hotovo: hi"), _mk_lines(done=True)],
+    ]
+    with _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "echo hi"}],
+            "want_tts": True,
+            "tts_scope": "off",
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+    types = [e["type"] for e in events]
+    assert "audio" not in types
+    assert "audio_error" not in types
+    # `chunk` (kind=code) by tu být neměl protože scope=off skipuje finalize taky.
+    assert not any(e["type"] == "chunk" for e in events)
+    assert "agent_done" in types
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_tts_final_emits_audio_only_from_final_round(client):
+    """`tts_scope=final`: text z mezikolových komentářů (před tool_call) se NEČTE.
+    Pouze finální round po posledním tool_result jde do audio."""
+    script = [
+        [
+            # Round 1: model emituje "úvodní" text + tool call
+            _mk_lines(content="Tak to udělám. "),
+            _mk_lines(
+                tool_calls=[{"function": {"name": "echo", "arguments": {"text": "hi"}}}],
+                done=True,
+            ),
+        ],
+        [
+            # Round 2: finální odpověď bez dalšího tool callu
+            _mk_lines(content="Hotovo: hi."),
+            _mk_lines(done=True),
+        ],
+    ]
+    with _patch_agent_tts(), _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "echo hi"}],
+            "want_tts": True,
+            "tts_scope": "final",
+            "voice": "",
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+
+    types = [e["type"] for e in events]
+    # Audio MUSÍ být — finální text "Hotovo: hi." existoval a měl by zazvučet.
+    audio_events = [e for e in events if e["type"] == "audio"]
+    assert len(audio_events) == 1, f"expected 1 audio event, got {len(audio_events)}: {types}"
+    # `agent_done` MUSÍ být PO `audio` (Codex HIGH #2).
+    ai_idx = types.index("audio")
+    ad_idx = types.index("agent_done")
+    assert ai_idx < ad_idx, (
+        f"agent_done přišel před audio (frontend by ukončil stream před TTS): {types}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_tts_final_no_text_in_final_round_no_audio(client):
+    """Agent dokončí turn bez text dělty v finálním kole (jen tool_result) →
+    žádné audio (final_buf prázdný)."""
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "echo", "arguments": {"text": "x"}}}],
+            done=True,
+        )],
+        # Round 2: žádný content, jen done.
+        [_mk_lines(done=True)],
+    ]
+    with _patch_agent_tts(), _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "echo"}],
+            "want_tts": True, "tts_scope": "final",
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+    assert "audio" not in [e["type"] for e in events]
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_tts_code_block_not_spoken(client):
+    """Final text obsahuje markdown code block — code jde jako `chunk`,
+    speakable věty kolem jdou do `audio`."""
+    final_text = "Tady je výsledek:\n```python\nprint('hello')\n```\nFunguje."
+    script = [
+        [_mk_lines(
+            tool_calls=[{"function": {"name": "echo", "arguments": {"text": "x"}}}],
+            done=True,
+        )],
+        [_mk_lines(content=final_text), _mk_lines(done=True)],
+    ]
+    with _patch_agent_tts(), _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "ukaž kód"}],
+            "want_tts": True, "tts_scope": "final",
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+
+    # Code block → chunk event s kind="code", obsah `print('hello')` ano,
+    # ale NESMÍ se objevit jako součást audio textu.
+    chunk_events = [e for e in events if e["type"] == "chunk"]
+    assert any(e.get("kind") == "code" and "print" in e.get("text", "") for e in chunk_events), (
+        f"chybí code chunk: {chunk_events}"
+    )
+    # Audio event existuje (speakable věty kolem code).
+    audio_events = [e for e in events if e["type"] == "audio"]
+    assert len(audio_events) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_tts_unclosed_code_fence_not_spoken(client):
+    """Codex audit HIGH #3 fix: neuzavřený code fence (model došel max_tokens)
+    NESMÍ propadnout do TTS jako speakable. Musí jít jako `chunk` kind=code."""
+    final_text = "Vytvořím to:\n```bash\nls -la /etc"  # neuzavřený fence
+    script = [
+        [_mk_lines(content=final_text), _mk_lines(done=True)],  # bez tool callu, vše v 1 round
+    ]
+    with _patch_agent_tts(), _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "ukaž"}],
+            "want_tts": True, "tts_scope": "final",
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+
+    # Code chunk MUSÍ být (tail od ```)
+    chunk_events = [e for e in events if e["type"] == "chunk" and e.get("kind") == "code"]
+    assert chunk_events, f"unclosed fence se nedostal do chunk events: {events}"
+    # Žádný audio text NESMÍ obsahovat "ls -la"
+    # (Verifikace přes obsah audio chunků by vyžadovala dekódovat WAV, ale
+    #  audio event má `chars` = délka speakable textu, který chunk obsahuje.
+    #  Zkontrolujeme přes `_synth_chunk_and_emit` mock — pokud audio event
+    #  vzniknul, dostaneme jeho chars; pokud je text "ls -la" v něm, chars
+    #  by byly velké. Místo toho přímý kontrakt: code tail je v chunk events.)
+    code_text = "\n".join(e["text"] for e in chunk_events)
+    assert "ls -la" in code_text or "/etc" in code_text
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_tts_final_skipped_on_agent_error(client):
+    """Codex audit HIGH #1: pokud agent skončí s `agent_error` (ne agent_done),
+    final_buf se NESMÍ syntetizovat — text byl partial/nedokončený."""
+    # Force agent_error tím, že posíláme 400-style response → agent loop emituje agent_error.
+    # Trick: nepřidat done=true; agent loop pak skončí timeoutem nebo
+    # neočekávaným EOF. Jednodušší: pošli ollama 500-ish odpověď.
+    from unittest.mock import patch
+    import voice.agent.loop as loop_mod
+
+    class _500Stream:
+        status_code = 500
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def aiter_lines(self):
+            return
+            yield  # pragma: no cover
+        async def aread(self): return b"server err"
+
+    class _500Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        def stream(self, *a, **kw): return _500Stream()
+
+    with _patch_agent_tts(), patch.object(loop_mod.httpx, "AsyncClient", return_value=_500Client()):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "trigger"}],
+            "want_tts": True, "tts_scope": "final",
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+    types = [e["type"] for e in events]
+    assert "agent_error" in types
+    # KLÍČOVÉ: žádný audio event po agent_error
+    assert "audio" not in types, (
+        f"audio emitnut po agent_error (HIGH regrese): {types}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
+async def test_e2e_agent_tts_mid_synth_cancel_no_agent_done(client):
+    """Codex final audit HIGH: cancel během final synth → NESMÍ emit `agent_done`
+    (turn skončil zrušený, ne úspěšně). Místo toho `canceled`.
+
+    Trigger TTSCanceled: fake_synth simuluje cancel (raise TTSCanceled).
+    """
+    # Naimportuj TTSCanceled exception class přes tts_cs module.
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path("voice").resolve()))
+    import voice.webapp.server as srv_mod
+    tts_cs = srv_mod._import_tts_cs()
+
+    class _CancelingPatcher:
+        """Fake synth co raises TTSCanceled — simuluje cancel během synth."""
+        def __init__(self):
+            self.original = srv_mod._tts_synth_chunk_blocking
+        def __enter__(self):
+            def fake(text, ref_str, fast, lang, out_path, turn_state):
+                raise tts_cs.TTSCanceled("simulated mid-synth cancel")
+            srv_mod._tts_synth_chunk_blocking = fake
+            srv_mod._TTS_READY.set()
+            return self
+        def __exit__(self, *a):
+            srv_mod._tts_synth_chunk_blocking = self.original
+
+    script = [[_mk_lines(content="Hotovo."), _mk_lines(done=True)]]
+    with _CancelingPatcher(), _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "agent",
+            "messages": [{"role": "user", "content": "hi"}],
+            "want_tts": True, "tts_scope": "final",
+        }
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+
+    types = [e["type"] for e in events]
+    # Cancel během synth → terminal event musí být `canceled`, NE `agent_done`.
+    # (Před fixem `pending_agent_done_ev` byl forwardován bezpodmínečně.)
+    assert "agent_done" not in types, (
+        f"agent_done po mid-synth cancelu (HIGH regrese!): {types}"
+    )
+    assert "canceled" in types
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(15)
+async def test_e2e_chat_tts_cancel_does_not_deadlock(client):
+    """Codex final audit HIGH: chat-mode tts_task po TTSCanceled nesmí breaknout
+    bez drainu — jinak llm_task hangne na bounded tts_queue.put a gather()
+    nedoběhne. Po cancelu MUSÍ stream skončit do timeout.
+
+    Trigger: dlouhý chat response + TTSCanceled na první chunk.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path("voice").resolve()))
+    import voice.webapp.server as srv_mod
+    tts_cs = srv_mod._import_tts_cs()
+
+    class _CancelingPatcher:
+        def __init__(self):
+            self.original = srv_mod._tts_synth_chunk_blocking
+        def __enter__(self):
+            def fake(text, ref_str, fast, lang, out_path, turn_state):
+                raise tts_cs.TTSCanceled("simulated")
+            srv_mod._tts_synth_chunk_blocking = fake
+            srv_mod._TTS_READY.set()
+            return self
+        def __exit__(self, *a):
+            srv_mod._tts_synth_chunk_blocking = self.original
+
+    # Dlouhý chat output → víc TTS chunků → queue se zaplní pokud tts_task break.
+    lines = [_mk_lines(content=f"Věta číslo {i}. " * 3) for i in range(20)]
+    lines.append(_mk_lines(done=True))
+    script = [lines]
+    with _CancelingPatcher(), _patch_ollama(script):
+        payload = {
+            "model": "m", "mode": "chat",
+            "messages": [{"role": "user", "content": "long answer"}],
+            "want_tts": True, "stream_tts": True,
+        }
+        # Pokud deadlock, hit pytest.mark.timeout(15) — test failne timeout.
+        async with client.stream("POST", "/api/turn", json=payload) as r:
+            assert r.status_code == 200
+            events = await _stream_ndjson(r)
+    # Stream MUSÍ dorazit do konce (žádný hang).
+    types = [e["type"] for e in events]
+    assert any(t in {"canceled", "done"} for t in types), (
+        f"stream nedoběhl (deadlock regrese?): {types}"
+    )
 
 
 @pytest.mark.asyncio
