@@ -189,7 +189,7 @@ body {
   transition: all 300ms var(--ease);
 }
 
-/* Quick TTS toggle v topbaru — duplicates settings' tts-toggle, synced. */
+/* Quick TTS toggle v topbaru - duplicates settings' tts-toggle, synced. */
 .tts-quick {
   display: inline-flex;
   align-items: center;
@@ -385,7 +385,7 @@ body {
   color: var(--fg);
 }
 
-/* Voice select — option s lang chip (vykreslujeme přes custom markup) */
+/* Voice select - option s lang chip (vykreslujeme přes custom markup) */
 .voice-option {
   display: flex;
   align-items: center;
@@ -455,7 +455,7 @@ body {
   .settings-panel.open { transform: translateY(0); }
 }
 
-/* Globální reduced-motion politika — motion sensitivity je skutečná
+/* Globální reduced-motion politika - motion sensitivity je skutečná
  * accessibility potřeba (vestibulární poruchy, migrény). Necháváme:
  *   - opacity-only transice (hover/focus states) beze změny
  *   - focus ring
@@ -511,7 +511,7 @@ body {
   /* Pozor: `display: grid` s `auto` řádky + canvas s `height: 100%` → feedback
    * loop (řádek roste podle obsahu, obsah podle řádku). `.orb-caption` a
    * `.orb-toggle` jsou `position: absolute`, takže centrování gridem stejně
-   * nepotřebujeme — blok stačí. */
+   * nepotřebujeme - blok stačí. */
   display: block;
   background:
     radial-gradient(ellipse at center, rgba(124, 92, 255, 0.06), transparent 70%),
@@ -549,7 +549,7 @@ body {
   transition: color 400ms var(--ease), opacity 220ms var(--ease);
 }
 
-/* Collapse tlačítko — vlevo uvnitř orb-wrap (při expanded), funguje i jako
+/* Collapse tlačítko - vlevo uvnitř orb-wrap (při expanded), funguje i jako
  * "restore" při collapsed, jen se otočí šipka. */
 .orb-toggle {
   position: absolute;
@@ -693,7 +693,7 @@ body {
   text-align: center;
 }
 
-/* Composer pill — jeden řádek s textareou a akčními tlačítky vpravo. */
+/* Composer pill - jeden řádek s textareou a akčními tlačítky vpravo. */
 .composer {
   display: flex;
   align-items: flex-end;
@@ -751,7 +751,7 @@ body {
   transition: transform 200ms var(--ease), box-shadow 300ms var(--ease), background 300ms var(--ease), opacity 200ms var(--ease);
 }
 /* `display: grid` výše by přepsal default [hidden]{display:none}, tak to tu
- * vyrovnáme — jinak Send/Stop vidíš i když má `hidden` atribut. */
+ * vyrovnáme - jinak Send/Stop vidíš i když má `hidden` atribut. */
 .mic-btn[hidden], .stop-btn[hidden], .send-btn[hidden] { display: none; }
 
 .mic-btn {
@@ -1157,6 +1157,60 @@ body {
 .tool-card[data-status="done"] .tool-card-status { color: var(--success); }
 .tool-card[data-status="denied"] .tool-card-status,
 .tool-card[data-status="error"] .tool-card-status { color: var(--error); }
+
+/* Inline progress text z dlouhých subagent calls (ask_claude stream events) */
+.tool-card-progress {
+  margin-top: 4px;
+  font-size: 11.5px;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--fg-dim);
+  font-style: italic;
+}
+.tool-card-progress[data-stage="thinking"] { color: #cbd5e1; }
+.tool-card-progress[data-stage="tool_use"] { color: #fbbf24; }
+.tool-card-progress[data-stage="tool_result"] { color: #4ade80; }
+.tool-card-progress[data-stage="started"] { color: #93c5fd; }
+
+/* Claude result card - speciální blok pod tool kartou pro ask_claude.
+   Fialový border, monospace text, žádné TTS. Uživatel vidí celou Claudovu
+   odpověď bez ohledu na to co Gemma pak vyrobí jako finální shrnutí. */
+.claude-result-card {
+  margin: 8px 0 14px 24px;
+  padding: 12px 14px;
+  border-left: 3px solid #a855f7;
+  background: rgba(168, 85, 247, 0.06);
+  border-radius: 0 6px 6px 0;
+}
+.claude-result-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: baseline;
+  margin-bottom: 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+}
+.claude-result-badge {
+  color: #c084fc;
+  font-weight: 600;
+}
+.claude-result-meta {
+  color: var(--fg-dim);
+}
+.claude-result-body {
+  white-space: pre-wrap;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--fg);
+  max-height: 600px;
+  overflow-y: auto;
+}
+.claude-result-card[data-mode="edit"] {
+  border-left-color: #f97316;
+  background: rgba(249, 115, 22, 0.06);
+}
+.claude-result-card[data-mode="edit"] .claude-result-badge { color: #fdba74; }
 .tool-card-details {
   margin-top: 8px;
   font-size: 11.5px;

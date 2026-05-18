@@ -729,9 +729,8 @@ def test_light_set_deny(tmp_path: Path, args: dict, reason_kw: str):
 @pytest.mark.parametrize("args", [
     {"prompt": "Hello"},
     {"prompt": "Compare these two approaches", "system": "You are a senior engineer."},
-    {"prompt": "Q", "max_tokens": 100},
-    {"prompt": "Q", "max_tokens": 4096},
-    {"prompt": "Q", "system": "S", "max_tokens": 256},
+    {"prompt": "Q"},
+    {"prompt": "Q", "system": "S"},
 ])
 def test_ask_claude_ask(tmp_path: Path, args: dict):
     r = decide("ask_claude", args, tmp_path)
@@ -750,17 +749,47 @@ def test_ask_claude_ask(tmp_path: Path, args: dict):
     ({"prompt": "x" * 200000}, "too large"),
     ({"prompt": "ok", "system": 42}, "system must be string"),
     ({"prompt": "ok", "system": "x" * 100000}, "system too large"),
-    ({"prompt": "ok", "max_tokens": "abc"}, "integer"),
-    ({"prompt": "ok", "max_tokens": True}, "bool"),
-    ({"prompt": "ok", "max_tokens": False}, "bool"),
-    ({"prompt": "ok", "max_tokens": 0}, "range"),
-    ({"prompt": "ok", "max_tokens": -1}, "range"),
-    ({"prompt": "ok", "max_tokens": 999999}, "range"),
+    ({"prompt": "ok", "mode": 42}, "mode must be string"),
+    ({"prompt": "ok", "mode": "destroy"}, "unknown mode"),
 ])
 def test_ask_claude_deny(tmp_path: Path, args: dict, reason_kw: str):
     r = decide("ask_claude", args, tmp_path)
     assert r.decision == Decision.DENY, f"{args}: got {r.decision} ({r.reason})"
     assert reason_kw.lower() in r.reason.lower(), f"{args}: reason={r.reason}"
+
+
+# ─────────────────── ask_claude v2: mode handling ───────────────────
+
+
+def test_ask_claude_edit_mode_destructive(tmp_path: Path):
+    """mode=edit s modifikačním promptem → ASK + requires_explicit=True (destructive)."""
+    r = decide("ask_claude", {
+        "prompt": "Vytvoř soubor test.txt s 'hi'", "mode": "edit",
+    }, tmp_path)
+    assert r.decision == Decision.ASK
+    assert r.risk == "destructive"
+    assert r.requires_explicit is True
+    assert "FULL SHELL DELEGATION" in r.reason
+
+
+def test_ask_claude_edit_denied_for_readonly_prompt(tmp_path: Path):
+    """Codex audit CRITICAL: nemůžeme downgrade label (execute by stejně použil
+    edit args). DENY hned. Gemma uvidí error v tool_result a opraví."""
+    r = decide("ask_claude", {
+        "prompt": "Co dělá tahle funkce?",  # žádný modify keyword
+        "mode": "edit",
+    }, tmp_path)
+    assert r.decision == Decision.DENY
+    assert "modifikační keyword" in r.reason
+    assert "consult" in r.reason  # navod jak opravit
+
+
+def test_ask_claude_consult_default_medium(tmp_path: Path):
+    """Default (žádný mode arg) = consult = ASK medium."""
+    r = decide("ask_claude", {"prompt": "explain X"}, tmp_path)
+    assert r.decision == Decision.ASK
+    assert r.risk == "medium"
+    assert r.requires_explicit is False
 
 
 # ----------------------------------------------------------------------

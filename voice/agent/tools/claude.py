@@ -1,22 +1,20 @@
-"""Claude bridge tool - `ask_claude(prompt, system?, max_tokens?)`.
+"""ask_claude tool - deleguje na Claude Code CLI subprocess přes bridge.
 
-Deleguje na **Claude Code CLI** (`claude -p`) jako sub-agent subprocess, ne
-přímo na Anthropic Messages REST API. Vzor: `avatar-engine/avatar_engine/
-bridges/claude.py`. Implementace bridge je v `voice/agent/claude_bridge.py`,
-tool je tenký wrapper s validací args.
+Dva módy:
+  consult (default) - pure consult, žádné Claude tools, žádný FS přístup.
+                       Classifier ASK medium (cena).
+  edit               - Claude má Read/Edit/Write/Bash/Glob/Grep v --add-dir
+                       workdir (= full shell delegace v projektu).
+                       Classifier ASK destructive (vyžaduje frázi).
 
-Použití:
-  - když lokální Gemma narazí na limit (kontext / kvalita reasoningu / unknown)
-  - jako "expert review" druhý názor v rámci řetězu úvah
-
-Bezpečnostní model viz `claude_bridge.py`:
-  - Prompt přes stdin (žádný argv leak přes `ps`)
-  - `--bare` + `--tools ""` + `--no-session-persistence` + empty cwd
-  - Subprocess s scrubbed env, process group + killpg cleanup
-  - Per-chunk output cap, stderr drain async task
-  - Cancel přes turn_state.cancel_event
+Model:
+  Args.model > ctx.model_hint > CLAUDE_DEFAULT_MODEL
+  Enum: "opus" | "sonnet" | full alias (např. "claude-opus-4-7"). Krátké
+  aliasy expand-uje resolver před voláním bridge.
 """
 from __future__ import annotations
+
+import asyncio
 
 from voice.agent.claude_bridge import ask_claude_oneshot
 from voice.agent.config import (
@@ -24,17 +22,58 @@ from voice.agent.config import (
     CLAUDE_DEFAULT_MODEL,
     CLAUDE_MAX_PROMPT_BYTES,
     CLAUDE_MAX_SYSTEM_BYTES,
-    CLAUDE_MAX_TOKENS_DEFAULT,  # ponecháno pro kompat schema, no-op
-    CLAUDE_MAX_TOKENS_LIMIT,    # ponecháno pro kompat schema
     CLAUDE_OUTPUT_CAP_BYTES,
     CLAUDE_TIMEOUT_SEC,
 )
 from voice.agent.tools.base import ExecuteContext, Tool
 
 
+# Krátké aliasy pro user-friendly "Opus" / "Sonnet" / "Haiku" v promptu.
+# Expand-uje na full model name před voláním bridge.
+_MODEL_ALIAS = {
+    "opus": "claude-opus-4-7",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
+}
+
+# Allowlist pro `model` arg - shared mezi tool execute a permission classifier
+# (Codex iter-9: schema enum není security boundary, runtime check nutný).
+# Akceptujeme: krátké aliasy + plné claude-* jména.
+ALLOWED_MODEL_ALIASES = frozenset(_MODEL_ALIAS.keys())
+ALLOWED_MODEL_FULLNAMES = frozenset(_MODEL_ALIAS.values())
+
+
+def is_allowed_model(value: str) -> bool:
+    """True pokud value je validní krátký alias nebo plné claude-* jméno."""
+    if not isinstance(value, str):
+        return False
+    v = value.lower().strip()
+    if not v:
+        return False
+    return v in ALLOWED_MODEL_ALIASES or v in ALLOWED_MODEL_FULLNAMES
+
+
+# Allowed mode values.
+_ALLOWED_MODES = frozenset({"consult", "edit"})
+
+
+def _resolve_model(args_model: str | None, ctx_hint: str | None) -> str:
+    """Precedence: args > ctx_hint > default. Aliasy expand-uje."""
+    for cand in (args_model, ctx_hint):
+        if not cand:
+            continue
+        c = cand.lower().strip()
+        if c in _MODEL_ALIAS:
+            return _MODEL_ALIAS[c]
+        # Plain full name passes through (defense: pokud uživatel/router posune
+        # nesmysl, bridge stejně failne v CLI a my zachytíme stderr).
+        return cand.strip()
+    return CLAUDE_DEFAULT_MODEL
+
+
 async def _ask_claude_exec(args: dict, ctx: ExecuteContext) -> dict:
     """Validace args + delegace na claude_bridge.ask_claude_oneshot."""
-    # Re-validace (defense in depth - classifier už filtroval).
+    # prompt
     prompt_arg = args.get("prompt")
     if not isinstance(prompt_arg, str):
         return {"ok": False, "error": "prompt must be string"}
@@ -47,6 +86,7 @@ async def _ask_claude_exec(args: dict, ctx: ExecuteContext) -> dict:
     except UnicodeEncodeError:
         return {"ok": False, "error": "prompt not valid utf-8"}
 
+    # system (optional)
     system_arg = args.get("system")
     if system_arg is not None:
         if not isinstance(system_arg, str):
@@ -57,56 +97,84 @@ async def _ask_claude_exec(args: dict, ctx: ExecuteContext) -> dict:
         except UnicodeEncodeError:
             return {"ok": False, "error": "system not valid utf-8"}
 
-    # max_tokens je v Claude CLI no-op (CLI nemá direct mapping); ponecháno
-    # v schemě kvůli backward-kompat klientů. Pokud chce user reálný cap,
-    # musí na CLI úrovni (max_budget_usd, nebo system prompt instrukce).
-    max_tokens_arg = args.get("max_tokens")
-    if max_tokens_arg is not None:
-        if isinstance(max_tokens_arg, bool):
-            return {"ok": False, "error": "max_tokens must be int, not bool"}
-        try:
-            max_tokens = int(max_tokens_arg)
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "max_tokens must be integer"}
-        if max_tokens < 1 or max_tokens > CLAUDE_MAX_TOKENS_LIMIT:
-            return {"ok": False, "error": f"max_tokens out of range 1..{CLAUDE_MAX_TOKENS_LIMIT}"}
+    # mode validation. Codex audit HIGH: nemůžeme spoléhat na JSON schema -
+    # tool execute musí runtime check pro non-string typy (`mode=true` by jinak
+    # spadl na .lower() AttributeError).
+    mode_arg = args.get("mode")
+    if mode_arg is None:
+        mode = "consult"  # missing key = default
+    elif not isinstance(mode_arg, str):
+        return {"ok": False, "error": f"mode must be string, got {type(mode_arg).__name__}"}
+    else:
+        # Blank string nebo whitespace = error (NE default consult). Classifier
+        # i execute musí mít stejnou normalizaci (Codex iter-8 symmetry fix).
+        mode = mode_arg.lower().strip()
+        if not mode:
+            return {"ok": False, "error": "mode must not be empty string"}
+    if mode not in _ALLOWED_MODES:
+        return {"ok": False, "error": f"unknown mode {mode!r}, allowed: {sorted(_ALLOWED_MODES)}"}
 
+    # model arg validation (volitelný - None = default fallback)
+    model_arg = args.get("model")
+    if model_arg is not None:
+        if not isinstance(model_arg, str):
+            return {"ok": False, "error": f"model must be string, got {type(model_arg).__name__}"}
+        # Codex iter-9: runtime allowlist check (schema enum není security boundary).
+        if not is_allowed_model(model_arg):
+            return {"ok": False,
+                    "error": f"model {model_arg!r} not in allowlist (opus/sonnet/haiku/full name)"}
+
+    # model resolution
+    model = _resolve_model(model_arg, ctx.model_hint if ctx else None)
+
+    # workdir (jen pro edit)
+    workdir = None
+    if mode == "edit":
+        if ctx is None or not getattr(ctx, "workdir", None):
+            return {"ok": False, "error": "mode=edit requires workdir from execute context"}
+        workdir = ctx.workdir
+
+    # cancel_event (jen pokud je asyncio.Event compatible)
     cancel_event = None
     if ctx is not None and getattr(ctx, "cancel_event", None) is not None:
-        # ExecuteContext.cancel_event může být threading.Event (z agent loop)
-        # nebo asyncio.Event. Bridge očekává asyncio.Event interface (.wait()).
-        # Pokud je threading, balíme ho - ale v praxi se používá asyncio.
         ce = ctx.cancel_event
-        if hasattr(ce, "wait") and asyncio_compatible(ce):
+        if isinstance(ce, asyncio.Event):
             cancel_event = ce
 
+    # progress_callback wrapper: tool dostane payload, předá do ctx.progress_emitter
+    # který má per-tool kontext (tool_call_id) a posílá jako tool_progress event.
+    progress_cb = None
+    if ctx is not None and getattr(ctx, "progress_emitter", None) is not None:
+        emitter = ctx.progress_emitter
+
+        async def progress_cb(payload: dict) -> None:
+            await emitter(payload)
+
     result = await ask_claude_oneshot(
-        prompt=prompt,
-        system=system_arg,
-        model=CLAUDE_DEFAULT_MODEL,
+        prompt=prompt, system=system_arg,
+        model=model, mode=mode, workdir=workdir,
         timeout_sec=CLAUDE_TIMEOUT_SEC,
         output_cap_bytes=CLAUDE_OUTPUT_CAP_BYTES,
         claude_bin=CLAUDE_CLI_BIN,
         cancel_event=cancel_event,
+        progress_callback=progress_cb,
     )
     return result
-
-
-def asyncio_compatible(event) -> bool:
-    """True pokud event vypadá jako asyncio.Event (má awaitable .wait())."""
-    import asyncio
-    return isinstance(event, asyncio.Event)
 
 
 ASK_CLAUDE_TOOL = Tool(
     name="ask_claude",
     description=(
         "Delegate a question or task to Claude (Anthropic LLM via Claude Code "
-        "CLI subprocess). Use this for problems that exceed local model "
-        "capability: complex reasoning, expert second opinion, code review, "
-        "or when context is too large for local model. The sub-agent has NO "
-        "tools (--tools '') and runs in an empty workdir - pure consult, no "
-        "file/shell access. Each call costs money - use sparingly."
+        "CLI subprocess). Two modes:\n"
+        "- mode='consult' (default): pure expert review, no tools, no file "
+        "  access. Use for code review, complex reasoning, second opinion.\n"
+        "- mode='edit': Claude has Read/Edit/Write/Bash/Glob/Grep in the "
+        "  workdir. Use when user explicitly asks Claude to modify code, "
+        "  create files, run tests in the project. Requires user approval "
+        "  phrase ('ano povoluju') - full shell delegation.\n"
+        "Optional model: 'opus' (claude-opus-4-7, deeper reasoning) or "
+        "'sonnet' (claude-sonnet-4-6, faster). Defaults to opus."
     ),
     parameters_schema={
         "type": "object",
@@ -124,15 +192,20 @@ ASK_CLAUDE_TOOL = Tool(
                     f"{CLAUDE_MAX_SYSTEM_BYTES // 1024} KiB UTF-8."
                 ),
             },
-            "max_tokens": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": CLAUDE_MAX_TOKENS_LIMIT,
+            "mode": {
+                "type": "string",
+                "enum": ["consult", "edit"],
                 "description": (
-                    "Maximum output tokens (default "
-                    f"{CLAUDE_MAX_TOKENS_DEFAULT}, max {CLAUDE_MAX_TOKENS_LIMIT}). "
-                    "Note: currently no-op with Claude CLI backend (no direct "
-                    "mapping); kept for forward-compat with REST adapter."
+                    "consult (default) = no tools/FS access. "
+                    "edit = full shell delegation in workdir, requires approval phrase."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "enum": ["opus", "sonnet", "haiku"],
+                "description": (
+                    "Optional model selection. Default opus. Use sonnet for "
+                    "faster cheaper consultation."
                 ),
             },
         },

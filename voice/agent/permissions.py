@@ -107,7 +107,7 @@ def decide(tool_name: str, args: dict, workdir: Path) -> PermissionResult:
     result = fn(args, workdir)
     # Auto-degradace: pokud jsme uvnitř okna po destruktivním approve a
     # classifier vrátil AUTO, downgrade na ASK. ASK/DENY rozhodnutí
-    # nemodifikujeme — ta už jsou „bezpečnější nebo stejná".
+    # nemodifikujeme - ta už jsou „bezpečnější nebo stejná".
     if result.decision == Decision.AUTO:
         remaining = _degrade_remaining_sec(workdir)
         if remaining > 0:
@@ -153,7 +153,7 @@ def _echo(args: dict, workdir: Path) -> PermissionResult:
 
 # ----------------------------------------------------------------------
 # Phase 2: File-system classifiery.
-# Sandbox primitiva v `tools/_sandbox.py` — tady jen mapujeme decision.
+# Sandbox primitiva v `tools/_sandbox.py` - tady jen mapujeme decision.
 # ----------------------------------------------------------------------
 
 
@@ -283,7 +283,7 @@ _SHELL_META_RE = re.compile(r"[|<>;&$`()\n\\]|>>|<<")
 # Segment separator pro destructive token detection (split podle ; | &).
 _SEGMENT_SEP_RE = re.compile(r"[;|&]+")
 
-# File redirect detection — pokrývá:
+# File redirect detection - pokrývá:
 #   `> file`, `>>file`, `> /dev/null`    (basic stdout redirect)
 #   `&> file`, `&>> file`                 (composite stdout+stderr → file)
 #   `>& /tmp/x`                           (rare bashism, stderr+stdout → file)
@@ -303,7 +303,7 @@ def _has_file_redirect(command: str) -> bool:
 
     Nereaguje na fd-duplikaci jako `2>&1` ani `>&2`. Pozn.: může false-positive
     pokud `>` je uvnitř quoted stringu (regex nečte quote state), což je OK
-    — escaluje na requires_explicit, user jen potvrdí.
+    - escaluje na requires_explicit, user jen potvrdí.
     """
     return bool(_FILE_REDIRECT_RE.search(command))
 
@@ -366,13 +366,13 @@ def _has_destructive_word(command: str) -> bool:
     """True pokud command (raw string) obsahuje destruktivní root jako word.
 
     Defense in depth proti tokenizaci-bypass:
-    - `bash -c "rm -rf x"` — shlex tokenizuje na ["bash", "-c", "rm -rf x"];
+    - `bash -c "rm -rf x"` - shlex tokenizuje na ["bash", "-c", "rm -rf x"];
       token "rm -rf x" je jeden string, basename match selže. Raw regex zachytí.
-    - `python -c "os.unlink(...)"` — netriviální, ale aspoň rm/sudo v stringu chytí.
+    - `python -c "os.unlink(...)"` - netriviální, ale aspoň rm/sudo v stringu chytí.
     - `env LC_ALL=C rm foo` (už chytí token scan, ale belt&suspenders).
 
     Trade-off: false-positive pokud destruktivní slovo je v textu argumentu
-    (`cat rm.txt`, `echo "remove rm"`). User schválí — bezpečnost > UX.
+    (`cat rm.txt`, `echo "remove rm"`). User schválí - bezpečnost > UX.
     Underscore je word char, takže `README_rm_fix.md` nematch.
     """
     global _DESTRUCTIVE_WORD_RE
@@ -389,11 +389,11 @@ def _has_destructive_token(command: str) -> bool:
     file-write redirect (`>`/`>>`/`&>`/`>&` na soubor), nebo shell substitution.
 
     Scan VŠECH tokenů (ne jen first) brání wrapper-flag bypassu:
-    `xargs -I{} rm -rf /tmp/x` — wrapper má vlastní flagy, takže `_effective_root`
+    `xargs -I{} rm -rf /tmp/x` - wrapper má vlastní flagy, takže `_effective_root`
     by se zastavil na `-I{}` a minul `rm`. Per-token scan to zachytí.
 
     Trade-off: false-positive na harmless commandy obsahující destructive name
-    jako operand (`echo rm`, `cat rm.txt`). User schválí — bezpečnost > UX.
+    jako operand (`echo rm`, `cat rm.txt`). User schválí - bezpečnost > UX.
 
     Bezpečnostní fallback: pokud shlex.split selže, vrací True (lepší false
     positive než leak).
@@ -424,15 +424,15 @@ def _has_destructive_token(command: str) -> bool:
             continue
         # Defense in depth: scan VŠECHNY tokeny (ne jen first), basename-match
         # destructive set. Pokrývá: `env rm`, `xargs -I{} rm`, `nohup -- rm`,
-        # `command rm`, `time rm`, atd. — vše kde destructive root není token[0].
+        # `command rm`, `time rm`, atd. - vše kde destructive root není token[0].
         for tok in tokens:
             bn = os.path.basename(tok) or tok
             if bn in BASH_DESTRUCTIVE_COMMANDS:
                 return True
-        # find s mutating flagem (-delete / -exec / -fprint*) — root detection
+        # find s mutating flagem (-delete / -exec / -fprint*) - root detection
         # samostatně, protože MUTATING_FLAGS jsou flagy ne tokeny.
         # Pozn.: jen MUTATING (ne FIND_FORBIDDEN_FLAGS), aby `-L`/`-H`/`-follow`
-        # nepřeřadilo na destructive — to je read-escape, ne file mutation.
+        # nepřeřadilo na destructive - to je read-escape, ne file mutation.
         root = _effective_root(tokens)
         if root == "find" and any(t in FIND_MUTATING_FLAGS for t in tokens[1:]):
             return True
@@ -458,7 +458,7 @@ def _is_path_outside_workdir(operand: str, workdir: Path) -> bool:
     if not operand:
         return False
     # Plain identifier (žádný path separator, žádný `..`, neexistuje jako
-    # file ani symlink): considered safe — typicky rg pattern, git branch,
+    # file ani symlink): considered safe - typicky rg pattern, git branch,
     # find condition value.
     looks_like_path = ("/" in operand) or operand == ".." or operand.startswith("..")
     if not looks_like_path:
@@ -505,11 +505,11 @@ def _argv_safe_for_auto(root: str, argv: list[str], workdir: Path) -> tuple[bool
         f[1] for f in forbidden if len(f) == 2 and f.startswith("-") and f[1].isalpha()
     }
 
-    # Long-flag prefixes from forbidden set — GNU coreutils (wc, ls, cat, head,
+    # Long-flag prefixes from forbidden set - GNU coreutils (wc, ls, cat, head,
     # tail) přijímají jakýkoli unambiguous prefix long option. Bez znalosti
     # plného option setu binárky nelze určit ambiguity, takže safer to reject
     # každý prefix ≥3 chars (`--x` nebo delší), který prefixuje forbidden flag.
-    # Cena: false-positive pro rg/find (které GNU abbreviation nemají) — uživatel
+    # Cena: false-positive pro rg/find (které GNU abbreviation nemají) - uživatel
     # musí napsat flag plně, jinak ASK. Acceptable trade-off.
     forbidden_long: list[str] = [
         f for f in forbidden if f.startswith("--") and len(f) > 2
@@ -536,23 +536,23 @@ def _argv_safe_for_auto(root: str, argv: list[str], workdir: Path) -> tuple[bool
                         f"forbidden {fb!r} (GNU abbreviation)"
                     )
         # Short flag cluster: `-laL`, `-RL`, `-oFILE`, `-cKEY=VAL`, `-1LR`, `-0L`.
-        # Scan VŠECHNY chars clusteru (continue na non-alpha — digit/special se
+        # Scan VŠECHNY chars clusteru (continue na non-alpha - digit/special se
         # přeskočí ale loop pokračuje). Pokud kterýkoli alpha char je v
         # forbidden_short_chars → reject. Kryje:
         #   `ls -1LR` (`L` na pozici 2 za digitem `1`)
         #   `rg -0L pattern` (`L` za digitem `0`)
         #   `rg -fPATH` (`f` první char, attached value)
         # Trade-off: false-positive pokud cluster obsahuje value-letter shodný
-        # s forbidden short (např. `-IFILE` v ls — neexistující kombinace).
+        # s forbidden short (např. `-IFILE` v ls - neexistující kombinace).
         if len(tok) > 2 and tok.startswith("-") and not tok.startswith("--"):
             cluster = tok[1:]
             for ch in cluster:
                 if not ch.isalpha():
-                    continue  # digit / special — pokračuj scanovat
+                    continue  # digit / special - pokračuj scanovat
                 if ch in forbidden_short_chars:
                     return False, f"{root} short flag {ch!r} in cluster {tok!r} forbidden"
 
-    # Path operand check — pokrývá:
+    # Path operand check - pokrývá:
     #   - positional path operandy (cat /etc/passwd, ls ../foo)
     #   - symlinky uvnitř workdir mířící ven (cat secret_link)
     #   - flag-value paths (rg --iglob=../../.ssh/id_rsa, wc --files0-from=/etc/x)
@@ -564,7 +564,7 @@ def _argv_safe_for_auto(root: str, argv: list[str], workdir: Path) -> tuple[bool
             after_double_dash = True
             continue
         if not after_double_dash and tok.startswith("-"):
-            # Flag — extract value pokud `=` form, check path safety.
+            # Flag - extract value pokud `=` form, check path safety.
             if "=" in tok:
                 value = tok.split("=", 1)[1]
                 if value and _is_path_outside_workdir(value, workdir):
@@ -595,7 +595,7 @@ def _classify_bash_cwd(cwd_str: str, workdir: Path) -> tuple[Path | None, str | 
 
 @register_classifier("run_bash")
 def _cls_run_bash(args: dict, workdir: Path) -> PermissionResult:
-    """Klasifikace bash commandu — viz plán Phase 3.
+    """Klasifikace bash commandu - viz plán Phase 3.
 
     AUTO = root v BASH_AUTO_COMMANDS, žádné shell metaznaky, validní subkomandy
            pro git/find. Spouští se shell=False s argv listem.
@@ -632,7 +632,7 @@ def _cls_run_bash(args: dict, workdir: Path) -> PermissionResult:
 
     short_cmd = command if len(command) <= 80 else command[:77] + "..."
 
-    # Destructive root token check — applies for both shell-mode and argv-mode.
+    # Destructive root token check - applies for both shell-mode and argv-mode.
     if _has_destructive_token(command):
         return PermissionResult(
             decision=Decision.ASK,
@@ -642,7 +642,7 @@ def _cls_run_bash(args: dict, workdir: Path) -> PermissionResult:
             requires_explicit=True,
         )
 
-    # Shell metaznaky → ASK (medium) — po approve běží /bin/bash -c.
+    # Shell metaznaky → ASK (medium) - po approve běží /bin/bash -c.
     if _has_shell_metas(command):
         return PermissionResult(
             decision=Decision.ASK,
@@ -651,7 +651,7 @@ def _cls_run_bash(args: dict, workdir: Path) -> PermissionResult:
             risk="medium",
         )
 
-    # Čistý argv path — parse a aplikuj allowlist logiku.
+    # Čistý argv path - parse a aplikuj allowlist logiku.
     try:
         argv = shlex.split(command)
     except ValueError as e:
@@ -721,13 +721,13 @@ def _is_private_or_blocked_host(host: str) -> tuple[bool, str]:
     """SSRF defense: blokuj private/loopback/link-local/multicast/reserved IPs
     a special-case hostnames (localhost, *.localhost, …). Vrací (blocked, reason).
 
-    Pro DNS hostnames bez literal IP vrátí (False, "") — runtime fetch musí
+    Pro DNS hostnames bez literal IP vrátí (False, "") - runtime fetch musí
     resolvovat a re-checkovat (TOCTOU defense udělá custom backend
     v tools/web.py). Tady jen statická validace.
 
-    IPv4-mapped IPv6 (`::ffff:127.0.0.1`) — v Pythonu < 3.12 `is_private` vrací
+    IPv4-mapped IPv6 (`::ffff:127.0.0.1`) - v Pythonu < 3.12 `is_private` vrací
     False, takže explicit unwrap přes `.ipv4_mapped` před privacy testem.
-    Stejně tak NAT64 (`64:ff9b::/96`) a 6to4/Teredo IPv6 mapped IPv4 — tahaj
+    Stejně tak NAT64 (`64:ff9b::/96`) a 6to4/Teredo IPv6 mapped IPv4 - tahaj
     embedded IPv4, ten musí být public.
     """
     import ipaddress
@@ -740,7 +740,7 @@ def _is_private_or_blocked_host(host: str) -> tuple[bool, str]:
     if h.startswith("[") and h.endswith("]"):
         h = h[1:-1]
 
-    # Special hostnames — blokuj bez DNS lookupu.
+    # Special hostnames - blokuj bez DNS lookupu.
     blocked_names = {
         "localhost", "ip6-localhost", "ip6-loopback",
         "broadcasthost",
@@ -748,11 +748,11 @@ def _is_private_or_blocked_host(host: str) -> tuple[bool, str]:
     if h in blocked_names or h.endswith(".localhost") or h.endswith(".local"):
         return True, f"blocked hostname {host!r}"
 
-    # Try IP literal — pokud parseuje, classifikuj.
+    # Try IP literal - pokud parseuje, classifikuj.
     try:
         ip = ipaddress.ip_address(h)
     except ValueError:
-        return False, ""  # not an IP literal — DNS resolve later
+        return False, ""  # not an IP literal - DNS resolve later
 
     # IPv4-mapped IPv6 unwrap. Python 3.11 nemá auto is_private propagation.
     if isinstance(ip, ipaddress.IPv6Address):
@@ -790,7 +790,7 @@ def _is_private_or_blocked_host(host: str) -> tuple[bool, str]:
         if check_ip in ipaddress.IPv6Network("::/96") and check_ip not in (ipaddress.IPv6Address("::1"), ipaddress.IPv6Address("::")):
             return True, f"blocked IPv4-compatible IP {ip}"
 
-    # CGNAT (100.64.0.0/10) — RFC 6598 shared address space, často interní.
+    # CGNAT (100.64.0.0/10) - RFC 6598 shared address space, často interní.
     # ipaddress.is_private nezahrnuje. Blokujeme defensively.
     try:
         if isinstance(check_ip, ipaddress.IPv4Address):
@@ -827,9 +827,9 @@ def _validate_url(url: str) -> tuple[str, str, str]:
     if scheme not in {"http", "https"}:
         return scheme, "", f"unsupported scheme {scheme!r}"
 
-    # userinfo block (user:pass@) — credentials v URL je bezpečnostní risk.
+    # userinfo block (user:pass@) - credentials v URL je bezpečnostní risk.
     # Pozn.: `parsed.username`/`password` může vyhodit ValueError pro URL kde
-    # syntax je nesmyslná — interpretovat jako "invalid url" než "no userinfo".
+    # syntax je nesmyslná - interpretovat jako "invalid url" než "no userinfo".
     try:
         if parsed.username or parsed.password:
             return scheme, "", "url contains userinfo"
@@ -858,11 +858,11 @@ def _validate_url(url: str) -> tuple[str, str, str]:
 
 @register_classifier("fetch_url")
 def _cls_fetch_url(args: dict, workdir: Path) -> PermissionResult:
-    """fetch_url(url) — AUTO pro public http(s); DENY pro file/ftp/private IPs.
+    """fetch_url(url) - AUTO pro public http(s); DENY pro file/ftp/private IPs.
 
     Side-effect: žádný side effect na FS, jen HTTP GET. Risk = low pro veřejnou
     síť. ASK by byl over-paranoidní (LLM dělá research). SSRF guard je tvrdý
-    DENY — žádný „ano povoluju" interní síti.
+    DENY - žádný „ano povoluju" interní síti.
     """
     url = str(args.get("url", "")).strip()
     scheme, host, err = _validate_url(url)
@@ -889,7 +889,7 @@ def _cls_fetch_url(args: dict, workdir: Path) -> PermissionResult:
 
 @register_classifier("light_list")
 def _cls_light_list(args: dict, workdir: Path) -> PermissionResult:
-    """light_list — AUTO. Read-only GET na local Hue Bridge.
+    """light_list - AUTO. Read-only GET na local Hue Bridge.
 
     Bridge IP a app key jsou load-time fixed v config.py (LLM nekontroluje target).
     Žádný FS side effect, žádná persistent change.
@@ -904,12 +904,12 @@ def _cls_light_list(args: dict, workdir: Path) -> PermissionResult:
 
 @register_classifier("light_set")
 def _cls_light_set(args: dict, workdir: Path) -> PermissionResult:
-    """light_set(name, on?, brightness?, color_name?) — AUTO low.
+    """light_set(name, on?, brightness?, color_name?) - AUTO low.
 
     Změna stavu světla je reverzibilní (user může jen vypnout/rozsvítit zpět).
     LLM kontroluje jen name (mapped na resource ID via Hue), bool on, brightness
     integer (validated 0..100), color_name (validated proti fixed paletě).
-    Bridge URL je hard-coded z config — žádná URL injection.
+    Bridge URL je hard-coded z config - žádná URL injection.
     Žádný credentials log, žádný FS side effect.
     """
     name = str(args.get("name", "")).strip()
@@ -928,7 +928,7 @@ def _cls_light_set(args: dict, workdir: Path) -> PermissionResult:
             risk="high",
         )
     # Reject control chars / newlines (could confuse log readers or
-    # log-injection downstream — defense in depth).
+    # log-injection downstream - defense in depth).
     if any(ord(c) < 0x20 or ord(c) == 0x7f for c in name):
         return PermissionResult(
             decision=Decision.DENY,
@@ -936,7 +936,7 @@ def _cls_light_set(args: dict, workdir: Path) -> PermissionResult:
             summary="light_set: jméno obsahuje řídicí znaky",
             risk="high",
         )
-    # Validate types early (defense in depth — exec re-validates).
+    # Validate types early (defense in depth - exec re-validates).
     on_arg = args.get("on", None)
     if on_arg is not None and not isinstance(on_arg, bool):
         return PermissionResult(
@@ -947,7 +947,7 @@ def _cls_light_set(args: dict, workdir: Path) -> PermissionResult:
         )
     br_arg = args.get("brightness", None)
     if br_arg is not None:
-        # bool is subclass of int — `True/False` would coerce to 1.0/0.0 and
+        # bool is subclass of int - `True/False` would coerce to 1.0/0.0 and
         # silently pass; reject explicitly so user must pick the right field.
         if isinstance(br_arg, bool):
             return PermissionResult(
@@ -1019,7 +1019,7 @@ def _cls_light_set(args: dict, workdir: Path) -> PermissionResult:
 
 @register_classifier("web_search")
 def _cls_web_search(args: dict, workdir: Path) -> PermissionResult:
-    """web_search(query, count?) — AUTO. Brave Search API call, no side effects."""
+    """web_search(query, count?) - AUTO. Brave Search API call, no side effects."""
     from voice.agent.config import WEB_SEARCH_MAX_COUNT
 
     query = str(args.get("query", "")).strip()
@@ -1066,7 +1066,7 @@ def _cls_web_search(args: dict, workdir: Path) -> PermissionResult:
 
 @register_classifier("ask_claude")
 def _cls_ask_claude(args: dict, workdir: Path) -> PermissionResult:
-    """ask_claude(prompt, system?, max_tokens?) — ASK medium.
+    """ask_claude(prompt, system?, max_tokens?) - ASK medium.
 
     Deleguje na Claude Code CLI subprocess (`claude -p`, --bare, --tools '').
     Sub-agent volá Anthropic backend, nepřímo, my spawnujeme jen CLI proces.
@@ -1078,7 +1078,6 @@ def _cls_ask_claude(args: dict, workdir: Path) -> PermissionResult:
     from voice.agent.config import (
         CLAUDE_MAX_PROMPT_BYTES,
         CLAUDE_MAX_SYSTEM_BYTES,
-        CLAUDE_MAX_TOKENS_LIMIT,
     )
 
     prompt_arg = args.get("prompt", None)
@@ -1097,7 +1096,7 @@ def _cls_ask_claude(args: dict, workdir: Path) -> PermissionResult:
             summary="ask_claude: prázdný prompt",
             risk="high",
         )
-    # Byte size check (UTF-8) — defense proti gigantickému promptu = cost blow-up.
+    # Byte size check (UTF-8) - defense proti gigantickému promptu = cost blow-up.
     try:
         prompt_bytes = len(prompt.encode("utf-8"))
     except UnicodeEncodeError:
@@ -1141,37 +1140,102 @@ def _cls_ask_claude(args: dict, workdir: Path) -> PermissionResult:
                 risk="high",
             )
 
-    max_tokens_arg = args.get("max_tokens", None)
-    if max_tokens_arg is not None:
-        # bool je int subclass — odmítnout explicit, jinak True/False projde jako 1/0.
-        if isinstance(max_tokens_arg, bool):
+    # v2 schema: žádný max_tokens (CLI nemá direct mapping; legacy field
+    # vyhozen v iter-6 refactoru). Pokud klient pošle, classifier ho ignoruje,
+    # tool execute taky. Pokud bychom striktně odmítali unknown args, vznikla
+    # by friction při schema evoluci; necháváme tolerantní (Postel's law).
+
+    # Mode validation. consult = ASK medium. edit = ASK destructive + frázi.
+    # Codex iter-7: classifier i execute MUSÍ stejně normalizovat - `mode=False`
+    # nesmí v classifier projít jako "consult" když execute ho odmítne.
+    mode_raw = args.get("mode")
+    if mode_raw is None:
+        mode = "consult"  # missing key = default
+    elif not isinstance(mode_raw, str):
+        return PermissionResult(
+            decision=Decision.DENY, reason="mode must be string",
+            summary="ask_claude: mode není string", risk="high",
+        )
+    else:
+        # Codex iter-8: blank string je error (NE default), aby classifier
+        # a execute měly symmetrickou normalizaci.
+        mode = mode_raw.lower().strip()
+        if not mode:
             return PermissionResult(
-                decision=Decision.DENY,
-                reason="max_tokens must be int, not bool",
-                summary="ask_claude: max_tokens není int",
-                risk="high",
+                decision=Decision.DENY, reason="mode must not be empty string",
+                summary="ask_claude: mode je prázdný string", risk="high",
             )
-        try:
-            max_tokens = int(max_tokens_arg)
-        except (TypeError, ValueError):
+    if mode not in {"consult", "edit"}:
+        return PermissionResult(
+            decision=Decision.DENY,
+            reason=f"unknown mode {mode!r}; allowed: consult|edit",
+            summary=f"ask_claude: neznámý mode {mode!r}",
+            risk="high",
+        )
+
+    # Mode-edit safety (Codex audit CRITICAL): nemůžeme jen "downgradovat"
+    # label permission výsledku - tool execute pak použije původní args["mode"]
+    # a stejně spustí edit. To by byl bypass destructive phrase.
+    # Místo toho DENY když Gemma navrhla mode=edit ale prompt nemá modificační
+    # keywords. Gemma uvidí error v tool_result, opraví a zkusí znova s
+    # mode=consult (nebo s lepším promptem, pokud user opravdu chtěl edit).
+    if mode == "edit":
+        modify_kw = (
+            "uprav", "změn", "změň", "edituj", "vytvor", "vytvoř", "naprogramuj",
+            "naimplementuj", "implement", "smaz", "smaž", "delete", "remove",
+            "refaktor", "refactor", "fix", "oprav", "přidej", "pridej", "add",
+            "create", "write", "modify", "change", "build", "generat", "rewrite",
+            "přepiš", "prepis",
+        )
+        prompt_lower = prompt.lower()
+        if not any(kw in prompt_lower for kw in modify_kw):
             return PermissionResult(
                 decision=Decision.DENY,
-                reason="max_tokens must be integer",
-                summary="ask_claude: max_tokens není int",
-                risk="high",
-            )
-        if max_tokens < 1 or max_tokens > CLAUDE_MAX_TOKENS_LIMIT:
-            return PermissionResult(
-                decision=Decision.DENY,
-                reason=f"max_tokens out of range 1..{CLAUDE_MAX_TOKENS_LIMIT}",
-                summary=f"ask_claude: max_tokens mimo 1..{CLAUDE_MAX_TOKENS_LIMIT}",
+                reason=(
+                    "mode='edit' vyžaduje modifikační keyword v promptu "
+                    "(vytvor, uprav, fix, refactor, ...). Tvůj prompt vypadá "
+                    "jako read-only otázka; použij mode='consult' pro jen radu."
+                ),
+                summary=f'ask_claude EDIT odmítnut: read-only prompt "{prompt[:40]}…"',
                 risk="high",
             )
 
+    # Codex iter-9: model arg runtime allowlist (sdílený s execute path).
+    model_arg = args.get("model")
+    if model_arg is not None:
+        if not isinstance(model_arg, str):
+            return PermissionResult(
+                decision=Decision.DENY, reason="model must be string",
+                summary="ask_claude: model není string", risk="high",
+            )
+        from voice.agent.tools.claude import is_allowed_model
+        if not is_allowed_model(model_arg):
+            return PermissionResult(
+                decision=Decision.DENY,
+                reason=f"model {model_arg!r} not in allowlist (opus/sonnet/haiku/full claude-* name)",
+                summary=f"ask_claude: neznámý model {model_arg!r}",
+                risk="high",
+            )
+
+    # Approval summary include model + mode pro user transparency.
+    model_label = (model_arg or "default").lower().strip() if isinstance(model_arg, str) else "default"
     short = prompt if len(prompt) <= 60 else prompt[:57] + "…"
+    if mode == "edit":
+        return PermissionResult(
+            decision=Decision.ASK,
+            reason=(
+                "Claude Code CLI sub-agent FULL SHELL DELEGATION v cwd=workdir "
+                "(Read/Edit/Write/Bash/Glob/Grep, --add-dir, --permission-mode "
+                "acceptEdits). Bash bez sandboxu - Claude může cd /, číst HOME "
+                "kvůli auth keychain, atd. User MUSÍ explicit povolit."
+            ),
+            summary=f'ask_claude EDIT ({model_label}): "{short}" (Claude bude mít plný shell ve workdir)',
+            risk="destructive",
+            requires_explicit=True,
+        )
     return PermissionResult(
         decision=Decision.ASK,
-        reason="external paid LLM call (Claude Code CLI subagent)",
-        summary=f'ask_claude: "{short}"',
+        reason="external paid LLM call (Claude Code CLI sub-agent, consult mode)",
+        summary=f'ask_claude ({model_label}): "{short}"',
         risk="medium",
     )

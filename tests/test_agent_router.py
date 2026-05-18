@@ -352,3 +352,53 @@ def test_router_decision_fields_present():
     assert isinstance(r.confidence, str)
     assert r.target in ("local", "claude")
     assert r.confidence in ("low", "high")
+    # model_hint je volitelný (None pro lokální)
+    assert r.model_hint is None or isinstance(r.model_hint, str)
+
+
+# ─────────────── v2: aktivační fráze pro explicit Claude/Opus/Sonnet ───────────────
+
+
+@pytest.mark.parametrize("text,expected_hint", [
+    # user-explicit "použij Claude"
+    ("Použij Claude na tento problém", None),
+    ("pouzij Clauda", None),
+    # opus
+    ("Použij Opus pro toto code review", "opus"),
+    ("použij opus", "opus"),
+    # sonnet
+    ("Použij Sonnet, je rychlejší", "sonnet"),
+    ("pouzij Sonet", "sonnet"),
+    # "udělej přes Claude/Opus/Sonnet"
+    ("Udělej to přes Claude", None),
+    ("Udelej to pres Opus", "opus"),
+    ("Udělej přes Sonnet, ať to máme rychle", "sonnet"),
+    # @claude / [claude]
+    ("@claude review my code", None),
+    ("[claude] expert opinion needed", None),
+    # ask claude
+    ("ask Claude what's the best approach", None),
+])
+def test_router_explicit_claude_directives(text, expected_hint):
+    """Všechny tyto věty MUSÍ být routovány na claude/high."""
+    r = decide_route(_u(text))
+    assert r.target == "claude", f"text={text!r}: got target={r.target}, reason={r.reason}"
+    assert r.confidence == "high"
+    assert r.model_hint == expected_hint, f"text={text!r}: hint={r.model_hint}"
+
+
+@pytest.mark.parametrize("text", [
+    # Žádné akční sloveso → NEMĚLO by triggernout
+    "Mluvil jsem o Claudovi včera",
+    "Claude je dobrý model",
+    "Slyšel jsi o Opusu?",
+    "Sonnet je rychlejší než Opus",
+])
+def test_router_no_false_positive_on_passive_mention(text):
+    """Verb-prefixed regex nesmí matchnout pasivní zmínky."""
+    r = decide_route(_u(text))
+    # Tyto věty by neměly skončit jako claude/high (explicit directive)
+    if r.target == "claude":
+        assert r.confidence == "low", (
+            f"text={text!r}: got claude/high (false positive!)"
+        )

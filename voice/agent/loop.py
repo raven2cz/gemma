@@ -480,11 +480,25 @@ class AgentLoop:
             )
             return
 
+        # Progress emitter per tool call - tool může emit dict payload,
+        # loop ho wrapne jako `tool_progress` event s tool_call_id + tool name.
+        async def _progress_emit(payload: dict) -> None:
+            await self._out_queue.put({
+                "type": "tool_progress",
+                "tool_call_id": tcid,
+                "tool": name,
+                "payload": payload,
+            })
+
+        # Model hint z router_decision (server může uložit do turn_state).
+        # Tool ho použije pokud user/Gemma nezadal `model` arg explicitně.
         ctx = ExecuteContext(
             turn_id=self.turn_state.get("id", ""),
             cancel_event=self.turn_state.get("cancel_event"),
             workdir=self.workdir,
             resolved_path=perm.resolved_path,
+            progress_emitter=_progress_emit,
+            model_hint=self.turn_state.get("model_hint"),
         )
         remaining = self._remaining_budget()
         if remaining <= 0:

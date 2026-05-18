@@ -15,11 +15,22 @@ class ExecuteContext:
     a na které spočinulo permission rozhodnutí. Tooly, které manipulují s FS,
     by měly preferovat tuto cestu před vlastním re-resolve, aby se eliminoval
     TOCTOU gap mezi klasifikací a exekucí.
+
+    `progress_emitter` (volitelná) = async callback pro průběžné notifikace
+    z dlouho běžícího toolu (např. Claude bridge). Tool ji volá s dict
+    payload `{stage, message, ...}`; loop ji forwarduje do NDJSON streamu
+    jako `tool_progress` event s `tool_call_id` + `tool` doplněnými.
+
+    `model_hint` (volitelná) = preferovaný backend model (např. "opus" /
+    "sonnet" detekovaný routerem z user věty „použij Opus"). Tool ho použije
+    jen pokud user explicit argument (např. `model`) nenastavil.
     """
     turn_id: str
     cancel_event: asyncio.Event | None
     workdir: Path
     resolved_path: Path | None = None
+    progress_emitter: "Callable[[dict], Awaitable[None]] | None" = None
+    model_hint: str | None = None
 
 
 ExecuteFn = Callable[[dict, ExecuteContext], Awaitable[Any]]

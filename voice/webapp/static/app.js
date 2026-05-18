@@ -1,5 +1,5 @@
 /**
- * Voice chat — main app.
+ * Voice chat - main app.
  *
  * State machine:  idle → recording → transcribing → thinking → speaking → idle
  * Any state → error (banner, retry)
@@ -96,7 +96,7 @@ const state = {
   // Per-turn kontext (audio queue, cancel flag, turn id). Inicializuje runTurn().
   turnCtx: null,
   // Conversation mode. 'chat' = klasický single-turn LLM; 'agent' = tool-calling
-  // smyčka. Frontend stateless ze strany serveru — persistuje se v localStorage,
+  // smyčka. Frontend stateless ze strany serveru - persistuje se v localStorage,
   // server jen čte z body.mode na každém /api/turn requestu.
   mode: localStorage.getItem('mode') || 'chat',
 };
@@ -122,7 +122,7 @@ try {
 } catch (e) {
   console.warn('avatar attach failed, using null avatar:', e);
   avatar = new NullAvatar();
-  // Schovej canvas container — bez WebGL je tam černé místo.
+  // Schovej canvas container - bez WebGL je tam černé místo.
   if (stageEl) stageEl.classList.add('orb-unavailable');
 }
 
@@ -316,7 +316,7 @@ function addMessage(role, content = '') {
   return el;
 }
 
-// Rerender throttled přes rAF — markdown parsing každý token je zbytečné,
+// Rerender throttled přes rAF - markdown parsing každý token je zbytečné,
 // stačí aktualizovat max raz za frame (~16 ms). Idempotentní: parser dostane
 // aktuální state.assistantBuffer a vyrenderuje.
 let _appendPending = false;
@@ -364,7 +364,7 @@ async function loadHealth() {
     if (dangerBadge) {
       dangerBadge.hidden = !h.dangerous_mode;
       if (h.dangerous_mode && h.agent_workdir) {
-        dangerBadge.title = `Dangerous mode aktivní (workdir: ${h.agent_workdir}) — ASK skipována, destructive stále vyžaduje frázi`;
+        dangerBadge.title = `Dangerous mode aktivní (workdir: ${h.agent_workdir}) - ASK skipována, destructive stále vyžaduje frázi`;
       }
     }
   } catch (e) {
@@ -575,7 +575,7 @@ async function beginRecording({ auto }) {
     mr.ondataavailable = (e) => { if (e.data && e.data.size) state.recordedChunks.push(e.data); };
     mr.onstop = () => finishRecording();
     state.mediaRecorder = mr;
-    // Snapshot pending approval (turnId + approvalId) — pokud se mezitím modal
+    // Snapshot pending approval (turnId + approvalId) - pokud se mezitím modal
     // zavře/změní, finishRecording() to detekuje a discard-ne transkripci místo
     // toho, aby ji omylem poslal na neaktivní approval nebo do nového turnu.
     state.recordingApprovalSnap = _pendingApproval
@@ -656,7 +656,7 @@ async function finishRecording() {
   // Voice approval intercept: pokud běží modal čekající na phrase, route
   // tam místo do /api/turn. Race-guard: snapshot ID na startu recordingu
   // a při finishi STRIKTNĚ ověř shodu (snap může být null pokud recording
-  // začal PŘED otevřením modalu — taky discard, jinak by neúmyslná
+  // začal PŘED otevřením modalu - taky discard, jinak by neúmyslná
   // transkripce poslala approve nahodile do právě otevřeného modalu).
   if (_pendingApproval !== null) {
     const snap = state.recordingApprovalSnap;
@@ -665,7 +665,7 @@ async function finishRecording() {
       && snap.approvalId === _pendingApproval.approvalId;
     if (!matches) {
       showError(
-        'Mikrofon byl spuštěn před schvalovacím modalem — transkripci ignoruji. '
+        'Mikrofon byl spuštěn před schvalovacím modalem - transkripci ignoruji. '
         + 'Stiskni mic znovu a řekni „ano povoluju" / „ne".',
         { sticky: true }
       );
@@ -676,12 +676,12 @@ async function finishRecording() {
     return;
   }
   // Pokud recording začal pro approval ALE modal mezitím zavřel (user kliknul
-  // Allow/Deny/Esc během recording), zahoď transkripci — jinak by šla jako
+  // Allow/Deny/Esc během recording), zahoď transkripci - jinak by šla jako
   // nový chat turn. Codex audit HIGH: defense in depth nad běžným resetem
   // `recordingApprovalSnap` až v beginRecording.
   if (state.recordingApprovalSnap !== null) {
     state.recordingApprovalSnap = null;
-    showError('Modal byl mezitím zavřen — nahrávku ignoruji.');
+    showError('Modal byl mezitím zavřen - nahrávku ignoruji.');
     setPhase('idle');
     return;
   }
@@ -696,7 +696,7 @@ async function finishRecording() {
   await runTurn();
 }
 
-/** Voice approval handler — mapuje transcript na approve/deny rozhodnutí.
+/** Voice approval handler - mapuje transcript na approve/deny rozhodnutí.
  * No-match: ukáže transcript v modal phrase inputu + toast, user může opravit
  * ručně nebo nahrát znovu. Transcript se NEPŘIDÁVÁ do chat historie. */
 function handleVoiceApproval(userText) {
@@ -718,18 +718,18 @@ function handleVoiceApproval(userText) {
         : `Nerozumím, řekni „ano" / „ne". (transcript: „${userText}")`,
       { sticky: true }
     );
-    // Modal pořád otevřený — phase zpátky na approval, ať mic/text input
+    // Modal pořád otevřený - phase zpátky na approval, ať mic/text input
     // zůstanou aktivní pro další pokus.
     setPhase('approval');
     return;
   }
-  // Atomic resolve — finish() volá cleanup + resolve, nuluje _pendingApproval.
+  // Atomic resolve - finish() volá cleanup + resolve, nuluje _pendingApproval.
   // setPhase přepne caller v stream loop ('approval' → 'thinking').
   _pendingApproval.finish(result);
 }
 
 // Měkký cap: posledních 40 tahů (20 párů). Všechny naše modely mají num_ctx=32768,
-// což je ~24k slov čistého textu — 40 tahů se tam bohatě vejde i s dlouhými odpověďmi.
+// což je ~24k slov čistého textu - 40 tahů se tam bohatě vejde i s dlouhými odpověďmi.
 const MAX_TURNS = 40;
 function trimMessages() {
   if (state.messages.length > MAX_TURNS) {
@@ -742,7 +742,7 @@ function trimMessages() {
 // Jedno <audio> = jeden bound MediaElementSource (bind jen 1×, jinak crash).
 // `audioEl.preload="auto"` + `audioEl.src = url` → browser si chunk natáhne
 // přes HTTP cache. Backend nemaže audio soubory při GETu, takže retry/Range
-// requests fungují nativně — žádný blob-prefetch už není potřeba.
+// requests fungují nativně - žádný blob-prefetch už není potřeba.
 // Single source of truth pro pipeline stav: state.turnCtx.
 
 function ensureAudioElementWired() {
@@ -776,7 +776,7 @@ function enqueueAudio(ctx, seq, url) {
   // Cache warming: nový Audio(url).load() prefetchne WAV do HTTP cache
   // bez playbacku. Bez toho by server-side post-complete cleanup (watchdog
   // smaže tmpdir 60 s po `done`) mohl ukousnout ještě nepřehrané chunky
-  // dlouhé fronty — teď je frontend stáhne hned a má je lokálně.
+  // dlouhé fronty - teď je frontend stáhne hned a má je lokálně.
   try {
     const pre = new Audio();
     pre.preload = 'auto';
@@ -791,7 +791,7 @@ function enqueueAudio(ctx, seq, url) {
 
 async function playNextInCtx(ctx) {
   // Re-entrancy guard: pokud už hrajeme, nechej `ended` handler řetězit dál.
-  // Flag musí být nastaven SYNCHRONNĚ PŘED jakýmkoli await — jinak by dva
+  // Flag musí být nastaven SYNCHRONNĚ PŘED jakýmkoli await - jinak by dva
   // souběžné vstupy (enqueueAudio + 'ended') mohly oba dojít k shift().
   if (ctx.audioPlaying) return;
   if (ctx.canceled || ctx.audioQueue.length === 0) {
@@ -885,7 +885,7 @@ async function runTurn() {
     if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
 
     // Vezmi turn_id z response header (server ho může sdílet; zatím ho tam
-    // neposílá — použijeme URL z prvního audio eventu jako fallback).
+    // neposílá - použijeme URL z prvního audio eventu jako fallback).
     ctx.id = r.headers.get('x-turn-id') || null;
 
     const reader = r.body.getReader();
@@ -906,7 +906,7 @@ async function runTurn() {
             break;
           case 'text': {
             if (ev.delta) {
-              // Po tool_call se assistant bubble vynulovala — vytvoř novou
+              // Po tool_call se assistant bubble vynulovala - vytvoř novou
               // pro další text deltas. Buffer je per-bubble, ne per-turn.
               if (!state.currentAssistantEl) {
                 const newBubble = addMessage('assistant', '');
@@ -923,7 +923,7 @@ async function runTurn() {
             outLang = ev.lang;
             break;
           case 'chunk':
-            // Non-speakable blok (code) — tokeny už v text.delta, ignoruj.
+            // Non-speakable blok (code) - tokeny už v text.delta, ignoruj.
             break;
           case 'tool_call':
             // Agent mode: nový tool call. Karta v transcriptu, "running" stav.
@@ -943,7 +943,7 @@ async function runTurn() {
             setPhase('thinking');
             const ok = await sendApprovalDecision(ctx.id, ev.approval_id, decision, phrase);
             // Pokud server odmítl (např. destruktivní bez správné fráze),
-            // nahlas to a abortni turn — server čeká na další POST a nic
+            // nahlas to a abortni turn - server čeká na další POST a nic
             // jiného mu neulehčí.
             if (!ok) {
               try { await fetch(`/api/turn/${ctx.id}/cancel`, { method: 'POST' }); } catch {}
@@ -964,6 +964,15 @@ async function runTurn() {
             // ok=false a content obsahuje "denied", reflectni to v kartě.
             const isDenied = !ev.ok && /"denied"|"user denied"/i.test(ev.content || '');
             fillToolResult({ ...ev, denied: isDenied });
+            // ask_claude result má speciální grafický blok pod tool kartou -
+            // user vidí celý Claudův text, NEZpracovává se přes TTS (jen v UI).
+            maybeRenderClaudeResultCard(ev);
+            break;
+          }
+          case 'tool_progress': {
+            // Subagent (typicky ask_claude) emituje průběžné status updaty.
+            // UI text only, žádné TTS.
+            updateToolProgress(ev);
             break;
           }
           case 'audio_filler': {
@@ -1053,7 +1062,7 @@ async function runTurn() {
     } catch (e) {
       console.warn('agent history fetch failed:', e);
     }
-    // Fallback: nepodařilo se stáhnout — alespoň ulož final text.
+    // Fallback: nepodařilo se stáhnout - alespoň ulož final text.
     if (state.assistantBuffer.trim()) {
       state.messages.push({ role: 'assistant', content: state.assistantBuffer });
       persistMessages();
@@ -1070,7 +1079,7 @@ async function runTurn() {
     return;
   }
 
-  // Persist assistant message (oba módy — voice i text).
+  // Persist assistant message (oba módy - voice i text).
   state.messages.push({ role: 'assistant', content: state.assistantBuffer });
   persistMessages();
   state.lastLang = outLang;
@@ -1081,7 +1090,7 @@ async function runTurn() {
     return;
   }
 
-  // Když je stream hotový a queue prázdná (krátká odpověď / cache už hrála) — finish.
+  // Když je stream hotový a queue prázdná (krátká odpověď / cache už hrála) - finish.
   maybeFinishTurnCtx(ctx);
 }
 
@@ -1117,7 +1126,7 @@ function stopEverything() {
   }
 }
 
-// Audio element: jeden globální `ended` listener — řetězí přehrávání.
+// Audio element: jeden globální `ended` listener - řetězí přehrávání.
 audioEl.addEventListener('ended', () => {
   const ctx = state.turnCtx;
   if (!ctx) return;
@@ -1146,7 +1155,7 @@ function restoreMessages() {
     state.messages = arr;
     for (const m of arr) {
       if (m.role === 'user' || m.role === 'assistant') {
-        // Tool calls (assistant s tool_calls) ukážeme jen jako bublinu —
+        // Tool calls (assistant s tool_calls) ukážeme jen jako bublinu -
         // pro Phase 1 nepřehráváme tool karty z historie. Detailní replay
         // přidáme později, až bude tool history rich (Phase 2+).
         const content = typeof m.content === 'string' ? m.content : '';
@@ -1181,7 +1190,7 @@ function toggleMode() {
 }
 
 // Voice/text intent: rozpozná příkaz typu "agent mód", "přepni do chatu" atd.
-// Vrací "agent" | "chat" | null. Match je úmyslně přísný — vyhne se falsům
+// Vrací "agent" | "chat" | null. Match je úmyslně přísný - vyhne se falsům
 // jako "zeptej se Claudeho v agent módu" (full sentence, ne pure switch).
 const _RE_INTENT_AGENT = /^\s*(?:p(?:ř|r)epni(?:\s+(?:do|na))?\s+|aktivuj\s+|spus(?:t|ť)\s+|zapni\s+|jdi\s+do\s+)?(?:agent(?:n(?:í|i))?(?:[\s-]*(?:m(?:ó|o)d|m(?:ó|o)du|re(?:ž|z)im(?:u)?|mode))?|agent[au]?)\s*\.?\s*$/i;
 const _RE_INTENT_CHAT = /^\s*(?:p(?:ř|r)epni(?:\s+(?:do|na|zp(?:ě|e)t\s+do))?\s+|zp(?:ě|e)t\s+(?:do|na)\s+|jdi\s+(?:do|zp(?:ě|e)t\s+do)\s+)?(?:chat[auem]?(?:[\s-]*(?:m(?:ó|o)d|m(?:ó|o)du|re(?:ž|z)im(?:u)?|mode))?|norm(?:á|a)ln(?:í|i)(?:[\s-]*(?:m(?:ó|o)d|re(?:ž|z)im))?)\s*\.?\s*$/i;
@@ -1221,7 +1230,7 @@ function handleModeSwitchIntent(userText) {
   return true;
 }
 
-// Web Audio API — krátký tón při přepnutí mode. Agent = vyšší (880 Hz, "up"),
+// Web Audio API - krátký tón při přepnutí mode. Agent = vyšší (880 Hz, "up"),
 // chat = nižší (440 Hz, "down"). User-gesture safe (toggleMode je vždy z kliku).
 let _beepCtx = null;
 function playModeBeep(mode) {
@@ -1245,7 +1254,7 @@ function playModeBeep(mode) {
   } catch {}
 }
 
-// Phase 9.3: Audio filler — krátké rotující CZ fráze přes prohlížečové
+// Phase 9.3: Audio filler - krátké rotující CZ fráze přes prohlížečové
 // speechSynthesis. Throttled aby série rychlých tool callů nezahltila audio.
 const _FILLER_PHRASES = ['Moment.', 'Hledám.', 'Pracuju na tom.', 'Chvilku.'];
 let _fillerLastAt = 0;
@@ -1295,13 +1304,13 @@ function summarizeArgs(args) {
 
 function appendToolCard(ev) {
   clearWelcome();
-  // Pokud běží streaming assistant bubble a je prázdná, odstraň ji —
+  // Pokud běží streaming assistant bubble a je prázdná, odstraň ji -
   // jinak vznikne "ghost" bublina mezi userem a tool kartou.
   if (state.currentAssistantEl && !state.assistantBuffer.trim()) {
     state.currentAssistantEl.remove();
     state.currentAssistantEl = null;
   } else if (state.currentAssistantEl) {
-    // Bublina měla text — finalizuj a začni novou až přijdou další text deltas.
+    // Bublina měla text - finalizuj a začni novou až přijdou další text deltas.
     state.currentAssistantEl.classList.remove('streaming');
     state.currentAssistantEl = null;
     state.assistantBuffer = '';
@@ -1353,15 +1362,89 @@ function fillToolResult(ev) {
     const parsed = JSON.parse(resultText);
     resultText = JSON.stringify(parsed, null, 2);
   } catch {
-    // Plain text — leave as-is.
+    // Plain text - leave as-is.
   }
   const pre = card.querySelector('.tool-card-result');
   pre.textContent = resultText;
   pre.hidden = false;
 }
 
+/** Update inline progress text na tool kartě podle tool_progress eventu.
+ * Vytvoří subline element pokud ještě neexistuje. */
+function updateToolProgress(ev) {
+  const card = findToolCard(ev.tool_call_id);
+  if (!card) return;
+  let progEl = card.querySelector('.tool-card-progress');
+  if (!progEl) {
+    progEl = document.createElement('div');
+    progEl.className = 'tool-card-progress';
+    // Vložit pod status, před result.
+    const status = card.querySelector('.tool-card-status');
+    if (status && status.parentNode) {
+      status.parentNode.insertBefore(progEl, status.nextSibling);
+    } else {
+      card.appendChild(progEl);
+    }
+  }
+  const p = ev.payload || {};
+  const stage = p.stage || 'work';
+  const message = p.message || '';
+  progEl.textContent = message ? `${stage}: ${message}` : stage;
+  progEl.dataset.stage = stage;
+}
+
+/** Pokud tool_result je z ask_claude, vykresli pod kartu speciální blok
+ * s celým Claudovým textem (ne procesován TTS). Jinak nic. */
+function maybeRenderClaudeResultCard(ev) {
+  if (!ev.ok || !ev.content) return;
+  let payload;
+  try {
+    payload = JSON.parse(ev.content);
+  } catch { return; }
+  // Detekce ask_claude payload tvaru: má `text` + `model` + `mode` keys.
+  if (!payload || typeof payload !== 'object') return;
+  if (typeof payload.text !== 'string' || !payload.model || !payload.mode) return;
+
+  const card = findToolCard(ev.id);
+  if (!card) return;
+
+  // Plný Claudův text + metadata (cost, duration, model, session, tool_uses).
+  const wrap = document.createElement('div');
+  wrap.className = 'claude-result-card';
+  wrap.dataset.mode = payload.mode;
+
+  const head = document.createElement('div');
+  head.className = 'claude-result-head';
+  const cost = payload.total_cost_usd != null
+    ? `$${payload.total_cost_usd.toFixed(4)}`
+    : '-';
+  const dur = payload.duration_ms != null ? `${(payload.duration_ms / 1000).toFixed(1)}s` : '-';
+  const tools = (payload.tool_uses || []).join(', ') || '-';
+  head.innerHTML = `
+    <span class="claude-result-badge">🤖 Claude · ${escapeHtml(payload.model)} · ${escapeHtml(payload.mode)}</span>
+    <span class="claude-result-meta">cost ${cost} · ${dur} · tools: ${escapeHtml(tools)}</span>
+  `;
+  wrap.appendChild(head);
+
+  const body = document.createElement('div');
+  body.className = 'claude-result-body';
+  body.textContent = payload.text;
+  wrap.appendChild(body);
+
+  // Vložit pod tool kartu.
+  if (card.parentNode) {
+    card.parentNode.insertBefore(wrap, card.nextSibling);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
 // ──────────── Approval modal
-// Approval phrase config — fetchnuto z `/api/approval_config` při startu UI,
+// Approval phrase config - fetchnuto z `/api/approval_config` při startu UI,
 // fallback constants (musí být v sync s voice/agent/config.py). Server je
 // authoritative; tyto fallbacky kryjí init před prvním fetchem.
 let _approvalConfig = {
@@ -1411,7 +1494,7 @@ function classifyApprovalUtterance(text, requiresExplicit) {
   if (hasDeny) return { decision: 'deny', phrase: '' };
 
   if (requiresExplicit) {
-    // Destructive: STRICT match — normalized text musí být přesně rovný
+    // Destructive: STRICT match - normalized text musí být přesně rovný
     // canonical frázi. Codex audit HIGH: contains/substring chytí false
     // positive jako "tak jsem řekl 'ano povoluju' nikdy", což by povolilo
     // destruktivní akci ze špatného kontextu. Pokud whisper přidá prefix
@@ -1509,7 +1592,7 @@ function showApprovalModal(ev, turnId) {
     approvalModal.addEventListener('cancel', onCancel);
     approvalForm?.addEventListener('submit', onFormSubmit);
 
-    // Mic UVNITŘ modalu — `<dialog>::showModal()` udělá zbytek stránky inert,
+    // Mic UVNITŘ modalu - `<dialog>::showModal()` udělá zbytek stránky inert,
     // takže mic v hlavním composeru by nešel kliknout. Tlačítko v modalu má
     // vlastní recording lifecycle; finishRecording() routuje přes
     // _pendingApproval do classifyApprovalUtterance.
@@ -1570,7 +1653,7 @@ async function sendApprovalDecision(turnId, approvalId, decision, phrase) {
 }
 
 function clearConversation() {
-  // Pokud běží turn, nejdřív ho přerušíme — jinak by stream dál zapisoval
+  // Pokud běží turn, nejdřív ho přerušíme - jinak by stream dál zapisoval
   // do detached assistantEl a výsledek by se smazal, ale server by pořád
   // generoval TTS a drze dohráván do `audioEl`. Stop = single source of
   // truth pro zrušení pipeline.
@@ -1602,7 +1685,7 @@ async function handleTextSubmit() {
   // (intercept přebírá _pendingApproval handler níž).
   if (state.phase !== 'idle' && state.phase !== 'error' && state.phase !== 'approval') return;
 
-  // Předběžně resume AudioContext — pokud bude TTS hrát, autoplay policy
+  // Předběžně resume AudioContext - pokud bude TTS hrát, autoplay policy
   // vyžaduje gesto před prvním AudioContext.resume(). Submit click je
   // platné gesto.
   ensureAudioCtx().catch(() => {});
@@ -1669,7 +1752,7 @@ function getSettingsInertTargets() {
     .filter((el) => el);
 }
 
-// Focusable prvky uvnitř panelu — pouze nedisabled, visible. Neviditelné inputy
+// Focusable prvky uvnitř panelu - pouze nedisabled, visible. Neviditelné inputy
 // (ref-field když hidden) filtrujeme přes offsetParent.
 const FOCUSABLE_SEL = 'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
@@ -1748,7 +1831,7 @@ settingsBtn.addEventListener('click', () => {
 settingsClose.addEventListener('click', closeSettings);
 settingsBackdrop.addEventListener('click', closeSettings);
 
-// Composer — form submit (Enter bez shift)
+// Composer - form submit (Enter bez shift)
 composer.addEventListener('submit', (e) => {
   e.preventDefault();
   handleTextSubmit();
@@ -1804,7 +1887,7 @@ if (ttsScopeSelect) {
 langSelect.addEventListener('change', () => {
   state.langOverride = langSelect.value;
   localStorage.setItem('langOverride', state.langOverride);
-  // Voice families se podle jazyka neorezávají — family sama obsahuje per-lang
+  // Voice families se podle jazyka neorezávají - family sama obsahuje per-lang
   // varianty, backend vybere tu správnou. Refresh seznamu tu není třeba.
 });
 
@@ -1816,7 +1899,7 @@ ttsQuickToggle.checked = state.voiceEnabled;
 streamToggle.checked = state.streamTTSEnabled;
 langSelect.value = state.langOverride;
 
-// Orb collapse — schová animovaného avatara do úzkého pruhu u levého kraje.
+// Orb collapse - schová animovaného avatara do úzkého pruhu u levého kraje.
 // ResizeObserver na canvasu se postará o resize WebGL viewportu během tranzice;
 // fallback setTimeout pro jistotu po dokončení animace (320 ms).
 function setOrbCollapsed(collapsed, { persist = true } = {}) {
@@ -1830,7 +1913,7 @@ orbToggle.addEventListener('click', () => {
   setOrbCollapsed(!stageEl.classList.contains('orb-collapsed'));
 });
 
-// Keyboard: space = start/stop recording — ale nikdy neukradne input v
+// Keyboard: space = start/stop recording - ale nikdy neukradne input v
 // textarea/input/select/button/contenteditable (jinak by nešlo napsat mezeru,
 // ani přepnout checkbox).
 const INTERACTIVE_SEL = 'textarea,input,select,button,[contenteditable="true"]';
@@ -1843,7 +1926,7 @@ document.addEventListener('keydown', (e) => {
   else if (!stopBtn.hidden) stopEverything();
 });
 
-// Copy tlačítko v code block — delegovaný listener (funguje i na dynamicky
+// Copy tlačítko v code block - delegovaný listener (funguje i na dynamicky
 // vložené bloky z rerenderu během streamingu).
 transcript.addEventListener('click', (e) => {
   const btn = e.target.closest('.code-copy');

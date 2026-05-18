@@ -1,40 +1,44 @@
-"""Claude Code CLI bridge - oneshot subprocess call pro `ask_claude` tool.
+"""Claude Code CLI bridge - subprocess wrapper s stream-json parserem.
 
-Spawnuje `claude -p` jako subprocess, posílá prompt přes stdin, čte JSON
-výstup. **Není to REST API call.** Vzor je `avatar-engine/avatar_engine/
-bridges/claude.py` (zjednodušeno, oneshot místo persistentního).
+Spawnuje `claude -p --output-format stream-json --include-partial-messages`
+a parsuje NDJSON events. Voláno z `ask_claude` toolu jako oneshot per call
+(persistent warm session je out of scope, viz plans/agent_mode.md Fáze 6).
 
-Auth: Claude CLI si řeší autentizaci sám přes `claude auth` (OAuth /
-keychain / API key, dle setupu uživatele). Bridge nepotřebuje ANTHROPIC_API_KEY
-explicitně - pokud user má funkční `claude` v terminálu, funguje i tady.
+Auth: Claude CLI si řeší sám (OAuth/keychain/API key dle setupu uživatele).
+Bridge nenastavuje ANTHROPIC_API_KEY explicitně, jen ho propouští z env
+přes allowlist (pokud user ho má). Pokud `claude` funguje v terminálu,
+funguje i tady.
 
-Bezpečnostní model:
-- Prompt se NEPOSÍLÁ přes argv (leak přes `ps`). Stdin only.
-- `--tools ""`: žádné built-in Claude Code tools (Read/Edit/Bash). Sub-agent
-  jen odpoví textem, žádné FS/shell side-effects. Naše tooly se přes tohle
-  obejít nedají.
-- `--no-session-persistence`: žádný session state na disku.
-- `--permission-mode plan`: Claude plánuje, needituje (defense in depth).
-- `cwd` = prázdný temp dir → Claude nemá kde číst project config, CLAUDE.md.
-- Env scrub: keep jen needed (HOME/USER/PATH/LANG/XDG_*) pro CLI auth flow,
-  drop AGENT_*/BRAVE_*/GH_*/*_SECRET/*_TOKEN/MY_API_KEY/etc. Pokud user má
-  ANTHROPIC_API_KEY v env, projde (CLI to honoruje stejně jako keychain).
-- `start_new_session=True` (process group) + `os.killpg` cleanup. Claude CLI
-  spawnuje child procesy (MCP servery, hooks); single PID kill nestačí.
-- Per-chunk output cap během streaming reading. Při překročení killpg
-  okamžitě, ne až po `communicate()` (jinak by CLI sežrala RAM).
-- Stderr drain async task - bez něj plný stderr pipe zamrzne proces.
+Dva módy:
 
-Caveats bez `--bare`:
-- User hooks z `~/.claude/hooks/` se spustí. To je user-controlled, ne
-  attack surface (vlastník stroje = vlastník hooks).
-- CLAUDE.md auto-discovery: cwd je prázdný temp dir, takže nic nenajde.
-- Plugin sync: může dělat krátký network call k registry. Akceptovatelný overhead.
+`mode="consult"` (default, pure expert review):
+  --tools "" --permission-mode plan --no-session-persistence
+  cwd = empty temp dir, žádný --add-dir
+  Bezpečnost: Claude nemá žádné tools, nic na disku nesahá. Sandbox = nic.
+
+`mode="edit"` (FULL SHELL DELEGACE v cwd=workdir):
+  --tools "Read,Edit,Write,Bash,Glob,Grep" --permission-mode acceptEdits
+  --add-dir <WORKDIR>, cwd = workdir
+  Bezpečnost: Claude má Bash + Edit/Write v --add-dir. To je full shell
+  v cwd. Bash může `cd /` a operovat dále (Bash NENÍ omezený --add-dir,
+  ten omezuje jen file tools). Classifier proto MUSÍ require_explicit=True
+  (user řekne "ano povoluju"). Audit zachytí spawned ask_claude call, NE
+  jednotlivé Claude tool calls - pokud user chce per-tool tracing, dostane
+  ho přes progress events v UI.
+
+Stream parser:
+- `proc.stdout.readline()` (nativní NDJSON fragmentation handling)
+- Per-line `json.loads`, dispatch dle `event["type"]`
+- Progress callback dostane normalizovaný envelope `{stage, message, ...}`
+- Buffer pro accumulated assistant text → final result
+- Output cap: per-line, agregate counter, killpg pokud překročí
 
 Cancel:
-- Bridge přijímá `cancel_event` (asyncio.Event z turn_state). Race proti
-  process wait + read tasks.
-- Cleanup vždy: SIGTERM proces group → wait 2s → SIGKILL.
+- `cancel_event` (asyncio.Event z turn_state) race proti readline + proc.wait
+- Cleanup: SIGTERM process group → 2s → SIGKILL
+
+Env scrub: HOME, USER, PATH, LANG, LC_*, XDG_*, ANTHROPIC_API_KEY (volitelný).
+Drop AGENT_*, BRAVE_*, GH_*, *_TOKEN, *_SECRET, MY_API_KEY atd.
 """
 from __future__ import annotations
 
@@ -46,72 +50,106 @@ import signal
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 log = logging.getLogger("agent-claude-bridge")
 
 
-# Env vars které Claude CLI legitimně potřebuje pro auth flow + běh.
-# XDG_* a HOME jsou kritické - tam má keychain/config. ANTHROPIC_API_KEY
-# pustíme jen pokud user ho v env explicitně má (alternativa k OAuth/keychain).
-# Vše ostatní z parent env je drop (žádné AGENT_*, GH_*, BRAVE_*, *_SECRET).
 _ENV_ALLOWLIST = frozenset({
     "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TZ", "TERM",
-    "PATH", "PWD", "TMPDIR",
-    # Claude CLI auth a config:
-    "ANTHROPIC_API_KEY",   # volitelný, OAuth/keychain je primární
-    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
-    "XDG_RUNTIME_DIR",     # keychain pod systemd-user může čerpat z tohohle
+    "PATH", "TMPDIR",
+    # NE PWD - Codex iter-9: PWD z parent env by mohl Claude CLI použít místo
+    # getcwd() a najít project/CLAUDE.md mimo náš cwd=tmpdir. Setujeme ho
+    # explicitně níž na skutečné cwd.
+    "ANTHROPIC_API_KEY",  # volitelné; OAuth/keychain je primární
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR",
 })
 
 
-def _build_subprocess_env() -> dict[str, str]:
-    """Filtruj parent env na allowlist. Claude CLI si auth řeší sám
-    (OAuth/keychain/API key). Bridge sám ANTHROPIC_API_KEY nenastavuje -
-    nechá CLI rozhodnout, co je nakonfigurované."""
+# Mode=edit tools allowlist. Subset Claude built-in tools. NE `default`
+# (vyloučí WebSearch/WebFetch - máme vlastní; TodoWrite - sub-agent nesmysl).
+_EDIT_MODE_TOOLS = "Read,Edit,Write,Bash,Glob,Grep"
+
+# Throttle pro repetitive progress events (thinking, partial text).
+_PROGRESS_THROTTLE_SEC = 1.5
+
+
+def _build_subprocess_env(cwd: str | None = None) -> dict[str, str]:
+    """Filtruj parent env na allowlist. Claude CLI si auth řeší sám.
+    `cwd` (pokud daný) → PWD=cwd, aby Claude CLI co případně používá PWD
+    místo getcwd() neunikl mimo sandbox cwd."""
     out: dict[str, str] = {}
     for k, v in os.environ.items():
         if k in _ENV_ALLOWLIST or k.startswith("LC_"):
             out[k] = v
+    if cwd is not None:
+        out["PWD"] = cwd
     return out
 
 
-async def _read_stream_capped(
-    stream: asyncio.StreamReader,
-    cap_bytes: int,
+def _build_argv(
     *,
-    on_overflow: callable[[], None],
-) -> bytes:
-    """Async per-chunk reader. Při překročení capu zavolá `on_overflow`
-    (typicky killpg) a vrátí buffer ořezaný na cap. Nikdy nečte víc než cap+1
-    do paměti - neuložíme komprimovaný/decompression bombu."""
-    buf = bytearray()
-    overflowed = False
-    while True:
-        try:
-            chunk = await stream.read(8192)
-        except Exception:
-            break
-        if not chunk:
-            break
-        if overflowed:
-            # Pokračujeme drainem (jinak by SIGTERM nestihl), ale zahodíme.
-            continue
-        buf.extend(chunk)
-        if len(buf) > cap_bytes:
-            overflowed = True
-            try:
-                on_overflow()
-            except Exception:
-                log.exception("on_overflow callback failed")
-    if overflowed:
-        return bytes(buf[:cap_bytes])
-    return bytes(buf)
+    claude_bin: str,
+    mode: str,
+    model: str,
+    system: str | None,
+    workdir: Path | None,
+) -> list[str]:
+    """Sestaví argv pro `claude -p` podle módu."""
+    argv = [
+        claude_bin,
+        "-p",
+        "--output-format", "stream-json",
+        "--input-format", "text",
+        "--verbose",                       # required pro stream-json
+        "--include-partial-messages",      # incremental events
+        "--no-session-persistence",
+        "--model", model,
+    ]
+    if mode == "consult":
+        argv += [
+            "--permission-mode", "plan",   # plan: žádné edits ani s tools
+            "--tools", "",                 # žádné tools
+        ]
+    elif mode == "edit":
+        if workdir is None:
+            raise ValueError("mode=edit requires workdir")
+        argv += [
+            "--permission-mode", "acceptEdits",
+            "--tools", _EDIT_MODE_TOOLS,
+            "--add-dir", str(workdir),
+        ]
+    else:
+        raise ValueError(f"unknown mode: {mode!r}")
+
+    if system:
+        # System přes argv (CLI 2.1.x nemá --append-system-prompt-file).
+        # Je v `ps`, ale system bývá krátký a obecnější než user prompt.
+        argv += ["--append-system-prompt", system]
+    return argv
+
+
+def _short_tool_input_summary(name: str, inp: dict | None) -> str:
+    """Zkrácený popis tool_use vstupu pro progress event."""
+    if not isinstance(inp, dict):
+        return name
+    if name in ("Edit", "Write", "Read", "NotebookEdit"):
+        p = inp.get("file_path") or inp.get("path") or inp.get("notebook_path")
+        if isinstance(p, str):
+            return f"{name} {p}"
+    if name == "Bash":
+        cmd = inp.get("command")
+        if isinstance(cmd, str):
+            return f"Bash: {cmd[:80]}"
+    if name in ("Glob", "Grep"):
+        pat = inp.get("pattern")
+        if isinstance(pat, str):
+            return f"{name} {pat}"
+    return name
 
 
 async def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
-    """SIGTERM → wait 2s → SIGKILL. Cílí celý process group (Claude spawnuje
-    child procesy: MCP servery, hooks)."""
+    """SIGTERM → 2s wait → SIGKILL. Cílí celý process group."""
     if proc.returncode is not None:
         return
     try:
@@ -134,7 +172,200 @@ async def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
     try:
         await asyncio.wait_for(proc.wait(), timeout=1.0)
     except asyncio.TimeoutError:
-        log.warning("claude subprocess pid=%d survived SIGKILL (timeout 1s)", proc.pid)
+        log.warning("claude pid=%d survived SIGKILL", proc.pid)
+
+
+async def _safe_progress(
+    cb: Callable[[dict], Awaitable[None]] | None,
+    payload: dict,
+) -> None:
+    """Progress emit s tolerancí chyb (callback NESMÍ shodit bridge)."""
+    if cb is None:
+        return
+    try:
+        await cb(payload)
+    except Exception:
+        log.exception("progress callback failed: %s", payload.get("stage"))
+
+
+def _parse_stream_event(
+    obj: dict,
+    state: dict,
+) -> dict | None:
+    """Mapuje jeden stream-json event na progress payload (nebo None).
+
+    `state` mutable dict pro accumulating: `assistant_text`, `last_emit`,
+    `tool_uses` (list dict)."""
+    t = obj.get("type")
+    if t == "system":
+        st = obj.get("subtype")
+        if st == "init":
+            # Codex iter-7: scalar fields guard - CLI mohl pošle non-string
+            # session_id/model. Slice/format na non-string crash.
+            sid = obj.get("session_id")
+            sid_str = sid if isinstance(sid, str) else ""
+            model = obj.get("model")
+            model_str = model if isinstance(model, str) else "?"
+            state["session_id"] = sid_str
+            return {
+                "stage": "started",
+                "message": f"Claude {model_str} session {sid_str[:8]}",
+                "session_id": sid_str,
+                "model": model_str,
+            }
+        return None  # status/heartbeat - skip
+
+    if t == "stream_event":
+        # Codex iter-6: nested non-dict guard. `event` MUSÍ být dict (jinak
+        # .get() AttributeError shodí celý reader task).
+        ev = obj.get("event")
+        if not isinstance(ev, dict):
+            return None
+        et = ev.get("type")
+        if et == "content_block_start":
+            cb = ev.get("content_block")
+            if not isinstance(cb, dict):
+                return None
+            cbt = cb.get("type")
+            if cbt == "thinking":
+                # Throttle: thinking emit max 1× per window
+                now = time.monotonic()
+                if now - state.get("last_thinking_emit", 0) < _PROGRESS_THROTTLE_SEC:
+                    return None
+                state["last_thinking_emit"] = now
+                return {"stage": "thinking", "message": "přemýšlí…"}
+            if cbt == "tool_use":
+                # Codex iter-8: name scalar guard.
+                name_raw = cb.get("name")
+                name = name_raw if isinstance(name_raw, str) else "?"
+                summary = _short_tool_input_summary(name, cb.get("input"))
+                state.setdefault("tool_uses", []).append(name)
+                return {
+                    "stage": "tool_use",
+                    "message": summary,
+                    "tool_name": name,
+                }
+            if cbt == "text":
+                # Nový text block - neemit tady, počkáme až bude něco akumulované
+                state["text_block_started"] = True
+                return None
+        return None  # ostatní stream_event subtypes (deltas, stops) → skip
+
+    if t == "assistant":
+        # Accumulated assistant message; extrahuj text pro finální result.
+        # Codex iter-6: message MUSÍ být dict, content MUSÍ být list.
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            return None
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return None
+        text_parts = [
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        if text_parts:
+            state["assistant_text"] = "".join(text_parts)
+        return None
+
+    if t == "user":
+        # User-role message obsahuje tool_result (Claude vidí výsledek tool).
+        # Codex iter-6: nested non-dict guards.
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            return None
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return None
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                is_err = b.get("is_error") is True
+                return {
+                    "stage": "tool_result",
+                    "message": "tool selhal" if is_err else "tool OK",
+                    "ok": not is_err,
+                }
+        return None
+
+    if t == "result":
+        # Finální event - caller ho zpracuje mimo dispatcher (terminal).
+        return None
+
+    return None  # rate_limit_event, mcp_*, unknown → skip
+
+
+async def _read_stream_capped(
+    proc: asyncio.subprocess.Process,
+    cap_bytes: int,
+    progress_cb: Callable[[dict], Awaitable[None]] | None,
+    state: dict,
+    overflow_event: asyncio.Event,
+) -> dict | None:
+    """Čte NDJSON ze stdout řádek po řádku, dispatch events. Vrací finální
+    `result` event obj (nebo None pokud stream skončil bez result).
+
+    Při překročení capu nebo asyncio LimitOverrunError (line > stream_limit):
+    set state["overflow"], signal overflow_event, return None. Caller pak
+    race-detekuje overflow a killpg eskaluje.
+    """
+    def _signal_overflow():
+        state["overflow"] = True
+        overflow_event.set()
+
+    total = 0
+    while True:
+        try:
+            line = await proc.stdout.readline()
+        except (asyncio.LimitOverrunError, ValueError) as e:
+            # Codex iter-4/5 HIGH: StreamReader.readline() při overflow limitu
+            # v Pythonu 3.11+ raises plain ValueError (ne LimitOverrunError jak
+            # bych myslel). Treat as overflow (ne tichý break → "no result").
+            log.warning("claude stream line exceeded asyncio limit: %s", e)
+            _signal_overflow()
+            try:
+                await proc.stdout.read(-1)  # drain rest
+            except Exception:
+                pass
+            break
+        except Exception as e:
+            log.warning("claude stdout read error: %s", e)
+            break
+        if not line:
+            break  # EOF
+        total += len(line)
+        if total > cap_bytes:
+            log.warning("claude stream exceeded %d bytes - overflow", cap_bytes)
+            _signal_overflow()
+            break
+        try:
+            obj = json.loads(line.decode("utf-8", errors="replace").rstrip())
+        except (ValueError, UnicodeDecodeError):
+            continue
+        # Codex iter-5 MEDIUM: parser předpokládá dict. `[]` / `"x"` / `123`
+        # by jinak hodili AttributeError v obj.get(). Skip non-dict lines.
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "result":
+            return obj
+        payload = _parse_stream_event(obj, state)
+        if payload is not None:
+            await _safe_progress(progress_cb, payload)
+    return None
+
+
+async def _drain_stderr(proc: asyncio.subprocess.Process, cap_bytes: int) -> bytes:
+    """Async stderr drain - bez něj plný pipe zamrzne proces."""
+    buf = bytearray()
+    while True:
+        try:
+            chunk = await proc.stderr.read(8192)
+        except Exception:
+            break
+        if not chunk:
+            break
+        if len(buf) < cap_bytes:
+            buf.extend(chunk[:cap_bytes - len(buf)])
+    return bytes(buf)
 
 
 async def ask_claude_oneshot(
@@ -142,112 +373,111 @@ async def ask_claude_oneshot(
     prompt: str,
     system: str | None,
     model: str,
+    mode: str,                                         # "consult" | "edit"
+    workdir: Path | None,                              # required for mode=edit
     timeout_sec: float,
     output_cap_bytes: int,
     claude_bin: str = "claude",
     cancel_event: asyncio.Event | None = None,
+    progress_callback: Callable[[dict], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
-    """Oneshot subprocess call na Claude Code CLI. Vrací:
+    """Oneshot subprocess call na Claude Code CLI s stream-json parserem.
 
-    {
-      "ok": bool,
-      "text": str,           # extracted text response
-      "stop_reason": str?,
-      "duration_ms": int,
-      "model": str,
-      "error": str?,         # pokud ok=False
-      "exit_code": int?,
-      "stderr_preview": str? # první ~500 bytů stderr při errorech
-    }
+    Vrací (drop-in kompatibilní napříč módy a s/bez progress_callback):
+      {
+        "ok": bool,
+        "text": str,                    # finální assistant text
+        "model": str,
+        "mode": str,
+        "session_id": str?,
+        "total_cost_usd": float?,
+        "duration_ms": int,
+        "tool_uses": [str, ...],        # list jmen tools které Claude použil
+        "error": str?,                  # pokud ok=False
+        "exit_code": int?,
+        "stderr_preview": str?,
+      }
 
-    Auth: Claude CLI si řeší sám (OAuth/keychain/API key dle setupu).
-    Bridge nemusí ANTHROPIC_API_KEY ručně podávat. Žádné FS side-effects,
-    žádné network calls z naší strany (Claude CLI si dělá HTTPS sám).
+    Args validace probíhá v callsite (`tools/claude.py`). Bridge předpokládá
+    sanitizovaný prompt/system/model/mode/workdir.
     """
     if not prompt or not prompt.strip():
-        return {"ok": False, "error": "empty prompt"}
+        return {"ok": False, "error": "empty prompt", "mode": mode}
+    try:
+        argv = _build_argv(
+            claude_bin=claude_bin, mode=mode, model=model,
+            system=system, workdir=workdir,
+        )
+    except ValueError as e:
+        return {"ok": False, "error": str(e), "mode": mode}
 
-    # Build argv - prompt NIKDY do argv (ps leak). Stdin only.
-    argv = [
-        claude_bin,
-        "-p",                            # --print, non-interactive
-        "--no-session-persistence",      # žádný state na disku
-        "--permission-mode", "plan",     # plan only, žádné edits (defense in depth)
-        "--output-format", "json",       # single JSON result
-        "--input-format", "text",        # stdin = plain text prompt
-        "--model", model,
-        "--tools", "",                   # disable all built-in tools (Read/Edit/Bash)
-    ]
-    if system:
-        # System přes argv - ne ideal kvůli `ps`, ale --append-system-prompt-file
-        # v CLI 2.1.x neexistuje. System je obvykle krátký a méně citlivý než user
-        # prompt. Pokud user dá secrets do system, je to jeho rozhodnutí.
-        argv += ["--append-system-prompt", system]
-
-    env = _build_subprocess_env()
-
-    # Empty temp dir as cwd - Claude nemá kde najít project config / CLAUDE.md.
+    # cwd: edit = workdir, consult = empty temp
     with tempfile.TemporaryDirectory(prefix="claude_bridge_") as tmp:
-        cwd = Path(tmp)
-        log.debug("claude subprocess: argv=%s cwd=%s", argv, cwd)
+        cwd = str(workdir) if mode == "edit" else tmp
+        env = _build_subprocess_env(cwd=cwd)  # PWD = cwd (Codex iter-9 fix)
+        log.info("claude spawn mode=%s model=%s cwd=%s", mode, model, cwd)
 
         try:
+            # Codex audit HIGH: default asyncio StreamReader limit ~64 KiB per
+            # line. Validní finální `result` event může mít text > 64 KiB
+            # → ValueError → parser zhroutí, vrátí "no result event". Nastavit
+            # limit na output_cap (s rezervou) ať readline zvládne jakýkoli
+            # legitimní line. Cap stejně chrání proti unbounded RAM.
+            stream_limit = max(output_cap_bytes + 16 * 1024, 256 * 1024)
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=str(cwd),
-                env=env,
-                start_new_session=True,  # process group → killpg
+                cwd=cwd, env=env,
+                start_new_session=True,
+                limit=stream_limit,
             )
         except FileNotFoundError:
             return {
-                "ok": False,
+                "ok": False, "mode": mode,
                 "error": f"claude CLI nenalezen (binary={claude_bin!r}). "
                          "Nainstaluj Claude Code nebo nastav CLAUDE_CLI_BIN.",
             }
         except Exception as e:
-            return {"ok": False, "error": f"subprocess spawn: {type(e).__name__}: {e}"}
+            return {"ok": False, "mode": mode,
+                    "error": f"subprocess spawn: {type(e).__name__}: {e}"}
 
         start = time.monotonic()
-        overflow_triggered = {"v": False}
 
-        def _on_overflow():
-            overflow_triggered["v"] = True
+        # Codex audit HIGH: reader tasky MUSÍ start PŘED stdin write. Pokud
+        # Claude před přečtením stdinu zaplní stdout/stderr pipe (např. vypíše
+        # init+status events okamžitě), `proc.stdin.drain()` by visel navždy
+        # protože nikdo nečte stdout. Timeout/cancel race ještě neběží.
+        state: dict = {"assistant_text": "", "tool_uses": []}
+        # overflow_event je signál ze _read_stream_capped → main coroutine,
+        # aby okamžitě killpg eskalovala (jinak by čekala na timeout).
+        overflow_event = asyncio.Event()
+        stdout_task = asyncio.create_task(
+            _read_stream_capped(proc, output_cap_bytes, progress_callback,
+                                state, overflow_event)
+        )
+        stderr_task = asyncio.create_task(_drain_stderr(proc, 64 * 1024))
+
+        # Stdin write taky jako task - nesmí blokovat main coroutine, aby
+        # timeout/cancel race fungoval i v patologickém případě.
+        async def _write_stdin() -> None:
             try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
+                proc.stdin.write(prompt.encode("utf-8"))
+                await proc.stdin.drain()
+                proc.stdin.close()
+                await proc.stdin.wait_closed()
+            except (BrokenPipeError, ConnectionResetError):
                 pass
-
-        # Spustit reader tasks PŘED stdin write, ať se pipe neblokuje
-        # zpětným tlakem stdoutu.
-        stdout_task = asyncio.create_task(_read_stream_capped(
-            proc.stdout, output_cap_bytes, on_overflow=_on_overflow,
-        ))
-        # Stderr cap nižší (debug logy + occasional warnings), ale dostatečný.
-        stderr_task = asyncio.create_task(_read_stream_capped(
-            proc.stderr, 64 * 1024, on_overflow=lambda: None,  # neabortovat na stderr
-        ))
-
-        # Stdin: zapsat prompt + EOF
-        try:
-            proc.stdin.write(prompt.encode("utf-8"))
-            await proc.stdin.drain()
-            proc.stdin.close()
-            await proc.stdin.wait_closed()
-        except (BrokenPipeError, ConnectionResetError):
-            # Subprocess umřel dřív než přečetl stdin - pokračujeme do readeru
-            # který zjistí exit code.
-            pass
-        except Exception as e:
-            await _kill_process_group(proc)
-            return {"ok": False, "error": f"stdin write: {type(e).__name__}: {e}"}
-
-        # Race: timeout vs cancel_event vs process exit
+            except Exception as e:
+                log.warning("stdin write failed: %s", e)
+        stdin_task = asyncio.create_task(_write_stdin())
         wait_task = asyncio.create_task(proc.wait())
-        waiters: list[asyncio.Task] = [wait_task]
+        # Codex iter-4 HIGH: overflow_event MUSÍ být v race waiters. Jinak
+        # main čeká až do timeout_sec, i když reader už dávno detekoval cap
+        # overflow a SIGTERM mohl být eskalován okamžitě.
+        overflow_task = asyncio.create_task(overflow_event.wait())
+        waiters: list[asyncio.Task] = [wait_task, overflow_task]
         cancel_task = None
         if cancel_event is not None:
             cancel_task = asyncio.create_task(cancel_event.wait())
@@ -259,27 +489,36 @@ async def ask_claude_oneshot(
             )
         except asyncio.CancelledError:
             await _kill_process_group(proc)
-            for t in (stdout_task, stderr_task, *waiters):
+            for t in (stdout_task, stderr_task, stdin_task, *waiters):
                 if not t.done():
                     t.cancel()
             raise
 
-        timed_out = wait_task not in done and (cancel_task is None or cancel_task not in done)
         was_canceled = cancel_task is not None and cancel_task in done
-
-        if timed_out or was_canceled or overflow_triggered["v"]:
+        overflow_triggered = overflow_task in done
+        timed_out = wait_task not in done and not was_canceled and not overflow_triggered
+        if timed_out or was_canceled or overflow_triggered:
             await _kill_process_group(proc)
-
-        # Cleanup orphan tasks
         if cancel_task is not None and not cancel_task.done():
             cancel_task.cancel()
+        if not overflow_task.done():
+            overflow_task.cancel()
+        # Stdin task pravděpodobně už doběhl (proc.wait() se vrátí po jeho
+        # close); pokud ne, cancel ho.
+        if not stdin_task.done():
+            stdin_task.cancel()
 
-        # Drain reader tasks (po killu by měly skončit rychle)
+        # Drain reader tasks (po killu by měly skončit rychle). Codex iter-7:
+        # parser may raise exception on malformed data - catch a degrade na
+        # `no result event` místo propagace do callera.
         try:
-            stdout_bytes = await asyncio.wait_for(stdout_task, timeout=2.0)
+            result_obj = await asyncio.wait_for(stdout_task, timeout=3.0)
         except asyncio.TimeoutError:
             stdout_task.cancel()
-            stdout_bytes = b""
+            result_obj = None
+        except Exception as e:
+            log.warning("stdout_task raised: %s", e)
+            result_obj = None
         try:
             stderr_bytes = await asyncio.wait_for(stderr_task, timeout=2.0)
         except asyncio.TimeoutError:
@@ -291,77 +530,76 @@ async def ask_claude_oneshot(
 
         if was_canceled:
             return {
-                "ok": False, "error": "canceled",
+                "ok": False, "mode": mode, "error": "canceled",
                 "duration_ms": duration_ms, "exit_code": exit_code,
             }
         if timed_out:
             return {
-                "ok": False,
+                "ok": False, "mode": mode,
                 "error": f"timeout after {timeout_sec:.0f}s",
                 "duration_ms": duration_ms, "exit_code": exit_code,
             }
-        if overflow_triggered["v"]:
+        if state.get("overflow"):
             return {
-                "ok": False,
+                "ok": False, "mode": mode,
                 "error": f"response exceeded {output_cap_bytes} bytes - proces zabit",
                 "duration_ms": duration_ms, "exit_code": exit_code,
             }
         if exit_code != 0:
             stderr_preview = stderr_bytes[:500].decode("utf-8", errors="replace")
             return {
-                "ok": False,
+                "ok": False, "mode": mode,
                 "error": f"claude CLI exit code {exit_code}",
+                "exit_code": exit_code, "stderr_preview": stderr_preview,
+                "duration_ms": duration_ms,
+            }
+
+        # Extract final result. Codex audit HIGH: pokud chybí `result` event
+        # (CLI crash, protokol drift, exec0 ale stream nedoběhl), MUSÍME vrátit
+        # ok=False. Mlčet by maskovalo invalid JSON, drift CLI verze i partial
+        # výsledky v edit módu (Claude něco napsal na disk, my říkáme "OK").
+        if result_obj is None:
+            stderr_preview = stderr_bytes[:500].decode("utf-8", errors="replace")
+            return {
+                "ok": False, "mode": mode,
+                "error": "no result event (CLI protocol failure or premature EOF)",
                 "exit_code": exit_code,
                 "stderr_preview": stderr_preview,
                 "duration_ms": duration_ms,
+                "session_id": state.get("session_id"),
+                "tool_uses": state.get("tool_uses", []),
             }
 
-        # Parse JSON output
-        try:
-            payload = json.loads(stdout_bytes.decode("utf-8", errors="replace"))
-        except (ValueError, UnicodeDecodeError) as e:
+        is_error = bool(result_obj.get("is_error"))
+        text = state.get("assistant_text", "")
+        # CLI ve `result` má i `result` field s finální text odpovědí
+        r = result_obj.get("result")
+        if isinstance(r, str) and r:
+            text = r
+
+        # Codex iter-7: subtype scalar guard (může být None/int z buggy CLI).
+        subtype_raw = result_obj.get("subtype")
+        subtype = subtype_raw if isinstance(subtype_raw, str) else ""
+        if is_error or subtype.startswith("error_"):
             return {
-                "ok": False,
-                "error": f"invalid JSON output: {type(e).__name__}: {e}",
-                "duration_ms": duration_ms,
+                "ok": False, "mode": mode,
+                "error": text or f"claude error ({subtype or 'unknown'})",
+                "duration_ms": duration_ms, "exit_code": exit_code,
+                "session_id": state.get("session_id"),
+                "tool_uses": state.get("tool_uses", []),
             }
 
-        # Claude CLI JSON output shape:
-        # { "type": "result", "subtype": "success"|"error_*",
-        #   "result": "text response", "session_id": "...",
-        #   "total_cost_usd": ..., "usage": {...}, "is_error": false }
-        text = ""
-        if isinstance(payload, dict):
-            r = payload.get("result")
-            if isinstance(r, str):
-                text = r
-            # Některé verze CLI dávají do "message.content"
-            elif isinstance(payload.get("message"), dict):
-                content = payload["message"].get("content")
-                if isinstance(content, str):
-                    text = content
-                elif isinstance(content, list):
-                    parts = [
-                        b.get("text", "") for b in content
-                        if isinstance(b, dict) and b.get("type") == "text"
-                    ]
-                    text = "".join(parts)
-
-        is_error = isinstance(payload, dict) and payload.get("is_error") is True
-        if is_error:
-            return {
-                "ok": False,
-                "error": text or "claude CLI reported error",
-                "duration_ms": duration_ms,
-                "model": model,
-            }
-
+        # Codex iter-8: scalar guard pro result.model (CLI by mohl pošle non-string).
+        result_model = result_obj.get("model")
+        result_model_str = result_model if isinstance(result_model, str) else model
         return {
             "ok": True,
+            "mode": mode,
             "text": text,
-            "model": model,
-            "stop_reason": payload.get("stop_reason") if isinstance(payload, dict) else None,
-            "session_id": payload.get("session_id") if isinstance(payload, dict) else None,
-            "total_cost_usd": payload.get("total_cost_usd") if isinstance(payload, dict) else None,
+            "model": result_model_str,
+            "session_id": state.get("session_id"),
+            "total_cost_usd": result_obj.get("total_cost_usd"),
             "duration_ms": duration_ms,
+            "tool_uses": state.get("tool_uses", []),
+            "num_turns": result_obj.get("num_turns"),
         }

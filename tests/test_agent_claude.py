@@ -21,18 +21,47 @@ from voice.agent.tools.claude import ASK_CLAUDE_TOOL
 
 
 class _FakeStreamReader:
-    """Async StreamReader fake - `await read(n)` vrací postupně dané chunky."""
+    """Async StreamReader fake - `await read(n)` vrací postupně dané chunky.
+    `await readline()` vrací postupně řádky (rozdělené `\n` nebo celý chunk)."""
 
     def __init__(self, chunks: list[bytes]):
         self._chunks = list(chunks)
         self._closed = False
+        # Pro readline: spojené bytes přerozdělené na řádky.
+        self._lines = self._chunks_to_lines(chunks)
+
+    @staticmethod
+    def _chunks_to_lines(chunks: list[bytes]) -> list[bytes]:
+        joined = b"".join(chunks)
+        if not joined:
+            return []
+        # Zachovat \n na konci každého řádku (jak readline vrací).
+        lines: list[bytes] = []
+        start = 0
+        for i, b in enumerate(joined):
+            if b == 0x0A:  # \n
+                lines.append(joined[start:i+1])
+                start = i + 1
+        if start < len(joined):
+            lines.append(joined[start:])
+        return lines
 
     async def read(self, n: int = -1) -> bytes:
         if self._closed or not self._chunks:
             self._closed = True
             return b""
         chunk = self._chunks.pop(0)
-        return chunk if n < 0 or len(chunk) <= n else chunk[:n]
+        if n < 0 or len(chunk) <= n:
+            return chunk
+        # Codex audit fix: partial read by neměl zahodit zbytek. Vrať prefix,
+        # zbytek vrať na začátek queue pro další read().
+        self._chunks.insert(0, chunk[n:])
+        return chunk[:n]
+
+    async def readline(self) -> bytes:
+        if not self._lines:
+            return b""
+        return self._lines.pop(0)
 
 
 class _FakeStreamWriter:
@@ -114,6 +143,7 @@ def _patch_subprocess(
         captured["cwd"] = kwargs.get("cwd")
         captured["env"] = kwargs.get("env")
         captured["start_new_session"] = kwargs.get("start_new_session")
+        captured["limit"] = kwargs.get("limit")  # readline overflow guard
         if raises is not None:
             raise raises("fake")
         return proc
@@ -150,14 +180,17 @@ def _make_ctx(cancel_event: asyncio.Event | None = None) -> ExecuteContext:
 
 
 def test_tool_metadata():
-    """Tool má správné jméno + schema kontrakt."""
+    """Tool má správné jméno + schema kontrakt (v2: mode + model, ne max_tokens)."""
     assert ASK_CLAUDE_TOOL.name == "ask_claude"
     assert "Claude Code CLI subprocess" in ASK_CLAUDE_TOOL.description
     schema = ASK_CLAUDE_TOOL.parameters_schema
     assert "prompt" in schema["required"]
     assert "prompt" in schema["properties"]
     assert "system" in schema["properties"]
-    assert "max_tokens" in schema["properties"]
+    assert "mode" in schema["properties"]
+    assert schema["properties"]["mode"]["enum"] == ["consult", "edit"]
+    assert "model" in schema["properties"]
+    assert set(schema["properties"]["model"]["enum"]) == {"opus", "sonnet", "haiku"}
 
 
 # ──────────────────────────── Args validation ────────────────────────────
@@ -210,44 +243,126 @@ async def test_system_oversized():
 
 
 @pytest.mark.asyncio
-async def test_max_tokens_bool_rejected():
-    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi", "max_tokens": True}, _make_ctx())
+async def test_unknown_mode_rejected():
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi", "mode": "destroy"}, _make_ctx())
     assert r["ok"] is False
+    assert "unknown mode" in r["error"]
 
 
 @pytest.mark.asyncio
-async def test_max_tokens_invalid_type():
-    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi", "max_tokens": "abc"}, _make_ctx())
-    assert r["ok"] is False
+async def test_mode_blank_string_rejected():
+    """Codex iter-8: blank/whitespace mode = error (NE default consult).
+    Classifier i execute MUSÍ mít stejnou normalizaci."""
+    for blank in ("", "   ", "\t\n"):
+        r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi", "mode": blank}, _make_ctx())
+        assert r["ok"] is False
+        assert "empty" in r["error"], f"blank={blank!r}: {r}"
 
 
 @pytest.mark.asyncio
-async def test_max_tokens_out_of_range():
-    from voice.agent.config import CLAUDE_MAX_TOKENS_LIMIT
-    r = await ASK_CLAUDE_TOOL.execute(
-        {"prompt": "hi", "max_tokens": CLAUDE_MAX_TOKENS_LIMIT + 1}, _make_ctx(),
+async def test_mode_non_string_rejected():
+    """Codex iter-4 HIGH: bool/int v `mode` args nesmí shodit tool na
+    AttributeError. Vrátit controlled ok=False."""
+    for bad in (True, False, 42, [], {"x": 1}):
+        r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi", "mode": bad}, _make_ctx())
+        assert r["ok"] is False
+        assert "mode must be string" in r["error"], f"bad={bad!r}: {r}"
+
+
+@pytest.mark.asyncio
+async def test_model_non_string_rejected():
+    """Codex iter-4 HIGH: stejně pro `model` arg."""
+    for bad in (True, 1, [], {}):
+        r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi", "model": bad}, _make_ctx())
+        assert r["ok"] is False
+        assert "model must be string" in r["error"], f"bad={bad!r}: {r}"
+
+
+@pytest.mark.asyncio
+async def test_model_unknown_string_rejected():
+    """Codex iter-9 MEDIUM: random model string mimo allowlist → reject."""
+    for bad in ("gpt-4", "gemini-pro", "claude-foo", "x"):
+        r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi", "model": bad}, _make_ctx())
+        assert r["ok"] is False
+        assert "allowlist" in r["error"], f"bad={bad!r}: {r}"
+
+
+@pytest.mark.asyncio
+async def test_model_full_claude_name_accepted(monkeypatch):
+    """Plné claude-* jméno (claude-opus-4-7) musí projít stejně jako alias."""
+    stream_lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s", "model": "claude-opus-4-7"}) + "\n",
+        json.dumps({"type": "result", "subtype": "success",
+                    "result": "ok", "is_error": False}) + "\n",
+    ]
+    proc = _FakeProcess(
+        stdout_chunks=[s.encode() for s in stream_lines],
+        stderr_chunks=[], returncode=0,
     )
+    _patch_subprocess(monkeypatch, proc)
+    _patch_killpg(monkeypatch)
+    r = await ASK_CLAUDE_TOOL.execute(
+        {"prompt": "hi", "model": "claude-opus-4-7"}, _make_ctx(),
+    )
+    assert r["ok"] is True
+
+
+def test_env_excludes_pwd(monkeypatch):
+    """Codex iter-9 MEDIUM: PWD z parent env NESMÍ propadnout (Claude CLI by
+    ho mohl použít místo getcwd() a najít project mimo náš sandbox cwd)."""
+    monkeypatch.setenv("PWD", "/some/external/project")
+    from voice.agent import claude_bridge
+    # Bez argumentu - žádný PWD set
+    env = claude_bridge._build_subprocess_env()
+    assert "PWD" not in env, "PWD parent env MUSÍ být dropped"
+
+
+def test_env_sets_pwd_to_cwd(monkeypatch):
+    """Při explicit cwd argumentu se PWD nastaví na něj (ne parent)."""
+    monkeypatch.setenv("PWD", "/some/external/project")
+    from voice.agent import claude_bridge
+    env = claude_bridge._build_subprocess_env(cwd="/sandbox/tmp")
+    assert env["PWD"] == "/sandbox/tmp", "PWD MUSÍ být cwd, ne parent env"
+
+
+@pytest.mark.asyncio
+async def test_edit_requires_workdir():
+    """mode=edit potřebuje ctx.workdir. ExecuteContext v testu má /tmp default."""
+    # mode=edit s workdir OK pre-validation (subprocess fail-fast bez claude bin
+    # je další path). Pojďme assert že mode rejected pokud ctx.workdir je None
+    # - patchnu ctx.
+    from pathlib import Path
+    bad_ctx = ExecuteContext(
+        turn_id="t", cancel_event=None, workdir=None, resolved_path=None,
+    )
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "fix bug", "mode": "edit"}, bad_ctx)
     assert r["ok"] is False
+    assert "workdir" in r["error"]
 
 
 # ───────────────────────── Bridge - happy path ─────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_happy_path(monkeypatch):
-    """Validní prompt → subprocess úspěch → JSON parsed → ok=True + text.
-    Auth si Claude CLI řeší sám (OAuth/keychain/API key) - bridge se na to
-    nedívá. Pokud `claude` v terminálu funguje, funguje i tady."""
-
-    response_json = json.dumps({
-        "type": "result", "subtype": "success",
-        "result": "Hello from Claude.",
-        "session_id": "abc-123",
-        "total_cost_usd": 0.0012,
-        "is_error": False,
-    })
+async def test_happy_path_consult(monkeypatch):
+    """consult mode: stream-json sekvence → ok=True + finální text."""
+    # Realistický stream: init → assistant text → result
+    stream_lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "abc-123", "model": "claude-opus-4-7"}) + "\n",
+        json.dumps({"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "Hello from Claude."}]
+        }}) + "\n",
+        json.dumps({"type": "result", "subtype": "success",
+                    "result": "Hello from Claude.",
+                    "session_id": "abc-123",
+                    "total_cost_usd": 0.0012,
+                    "is_error": False,
+                    "model": "claude-opus-4-7"}) + "\n",
+    ]
     proc = _FakeProcess(
-        stdout_chunks=[response_json.encode("utf-8")],
+        stdout_chunks=[s.encode("utf-8") for s in stream_lines],
         stderr_chunks=[],
         returncode=0,
     )
@@ -256,35 +371,191 @@ async def test_happy_path(monkeypatch):
 
     r = await ASK_CLAUDE_TOOL.execute({"prompt": "Hi Claude"}, _make_ctx())
 
-    assert r["ok"] is True
+    assert r["ok"] is True, f"failed: {r}"
     assert r["text"] == "Hello from Claude."
     assert r["session_id"] == "abc-123"
     assert r["total_cost_usd"] == 0.0012
+    assert r["mode"] == "consult"
     assert r["duration_ms"] >= 0
     # Argv security: prompt MUSÍ NE být v argv (`ps` leak)
     argv_joined = " ".join(captured["argv"])
     assert "Hi Claude" not in argv_joined, "prompt leak v argv!"
-    # Bezpečnostní flagy MUSÍ být přítomné. NE `--bare` (zakazuje OAuth/
-    # keychain auth, vynucuje API klíč - user by ho jinak nepotřeboval).
-    assert "--bare" not in captured["argv"]
+    # consult mode flagy
     assert "--no-session-persistence" in captured["argv"]
     assert "--permission-mode" in captured["argv"]
-    assert "plan" in captured["argv"]
+    assert "plan" in captured["argv"]  # consult = plan permission
     assert "--tools" in captured["argv"]
-    assert "" in captured["argv"]  # --tools ""
+    assert "" in captured["argv"]  # --tools "" (žádné tools)
+    assert "--output-format" in captured["argv"]
+    assert "stream-json" in captured["argv"]
+    assert "--include-partial-messages" in captured["argv"]
     assert captured["start_new_session"] is True
-    # Prompt poslán přes stdin
+    # Prompt přes stdin
     assert proc.stdin.buffer == b"Hi Claude"
-    # Empty cwd (temp dir, ne náš workdir)
-    assert captured["cwd"] is not None
+    # consult: empty temp cwd, NE workdir
     assert "claude_bridge_" in captured["cwd"]
+
+
+@pytest.mark.asyncio
+async def test_happy_path_edit(monkeypatch, tmp_path):
+    """edit mode: argv obsahuje --add-dir + tools + acceptEdits, cwd=workdir."""
+    stream_lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "xyz", "model": "claude-sonnet-4-6"}) + "\n",
+        json.dumps({"type": "stream_event", "event": {
+            "type": "content_block_start",
+            "content_block": {"type": "tool_use", "name": "Write",
+                              "input": {"file_path": "hello.txt"}}
+        }}) + "\n",
+        json.dumps({"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "Done."}]
+        }}) + "\n",
+        json.dumps({"type": "result", "subtype": "success", "result": "Done.",
+                    "is_error": False}) + "\n",
+    ]
+    proc = _FakeProcess(
+        stdout_chunks=[s.encode() for s in stream_lines],
+        stderr_chunks=[],
+        returncode=0,
+    )
+    captured = _patch_subprocess(monkeypatch, proc)
+    _patch_killpg(monkeypatch)
+
+    ctx = ExecuteContext(
+        turn_id="t", cancel_event=None, workdir=tmp_path, resolved_path=None,
+    )
+    r = await ASK_CLAUDE_TOOL.execute(
+        {"prompt": "Create hello.txt", "mode": "edit"}, ctx,
+    )
+
+    assert r["ok"] is True, f"failed: {r}"
+    assert r["mode"] == "edit"
+    assert r["tool_uses"] == ["Write"]
+    # edit mode flagy
+    assert "--permission-mode" in captured["argv"]
+    assert "acceptEdits" in captured["argv"]
+    assert "--add-dir" in captured["argv"]
+    assert str(tmp_path) in captured["argv"]
+    # --tools subset (NE prázdný string)
+    tools_idx = captured["argv"].index("--tools")
+    tools_val = captured["argv"][tools_idx + 1]
+    assert "Edit" in tools_val and "Write" in tools_val
+    # cwd = workdir
+    assert captured["cwd"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_progress_callback_dispatches(monkeypatch, tmp_path):
+    """progress_emitter z ctx dostane payloady pro každý dispatched stream event."""
+    stream_lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s1", "model": "claude-opus-4-7"}) + "\n",
+        json.dumps({"type": "stream_event", "event": {
+            "type": "content_block_start",
+            "content_block": {"type": "thinking"}
+        }}) + "\n",
+        json.dumps({"type": "stream_event", "event": {
+            "type": "content_block_start",
+            "content_block": {"type": "tool_use", "name": "Read",
+                              "input": {"file_path": "x.py"}}
+        }}) + "\n",
+        json.dumps({"type": "result", "subtype": "success",
+                    "result": "ok", "is_error": False}) + "\n",
+    ]
+    proc = _FakeProcess(
+        stdout_chunks=[s.encode() for s in stream_lines],
+        stderr_chunks=[], returncode=0,
+    )
+    _patch_subprocess(monkeypatch, proc)
+    _patch_killpg(monkeypatch)
+
+    emitted: list[dict] = []
+    async def collector(payload):
+        emitted.append(payload)
+
+    ctx = ExecuteContext(
+        turn_id="t", cancel_event=None, workdir=tmp_path, resolved_path=None,
+        progress_emitter=collector,
+    )
+    r = await ASK_CLAUDE_TOOL.execute(
+        {"prompt": "Read x.py", "mode": "edit"}, ctx,
+    )
+    assert r["ok"] is True
+    stages = [p["stage"] for p in emitted]
+    assert "started" in stages
+    assert "thinking" in stages
+    assert "tool_use" in stages
+    # tool_use payload má tool_name
+    tu = next(p for p in emitted if p["stage"] == "tool_use")
+    assert tu["tool_name"] == "Read"
+
+
+@pytest.mark.asyncio
+async def test_model_hint_from_ctx(monkeypatch, tmp_path):
+    """Pokud args nemají model, použij ctx.model_hint (router decision)."""
+    stream_lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s", "model": "claude-sonnet-4-6"}) + "\n",
+        json.dumps({"type": "result", "subtype": "success",
+                    "result": "ok", "is_error": False,
+                    "model": "claude-sonnet-4-6"}) + "\n",
+    ]
+    proc = _FakeProcess(
+        stdout_chunks=[s.encode() for s in stream_lines],
+        stderr_chunks=[], returncode=0,
+    )
+    captured = _patch_subprocess(monkeypatch, proc)
+    _patch_killpg(monkeypatch)
+
+    ctx = ExecuteContext(
+        turn_id="t", cancel_event=None, workdir=tmp_path, resolved_path=None,
+        model_hint="sonnet",
+    )
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, ctx)
+    assert r["ok"] is True
+    # Argv obsahuje resolved sonnet alias
+    assert "claude-sonnet-4-6" in captured["argv"]
+
+
+@pytest.mark.asyncio
+async def test_args_model_overrides_ctx_hint(monkeypatch, tmp_path):
+    """args.model má prioritu nad ctx.model_hint."""
+    stream_lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s", "model": "claude-haiku-4-5"}) + "\n",
+        json.dumps({"type": "result", "subtype": "success",
+                    "result": "ok", "is_error": False}) + "\n",
+    ]
+    proc = _FakeProcess(
+        stdout_chunks=[s.encode() for s in stream_lines],
+        stderr_chunks=[], returncode=0,
+    )
+    captured = _patch_subprocess(monkeypatch, proc)
+    _patch_killpg(monkeypatch)
+
+    ctx = ExecuteContext(
+        turn_id="t", cancel_event=None, workdir=tmp_path, resolved_path=None,
+        model_hint="sonnet",
+    )
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi", "model": "haiku"}, ctx)
+    assert r["ok"] is True
+    assert "claude-haiku-4-5" in captured["argv"]
+    assert "claude-sonnet-4-6" not in captured["argv"]
 
 
 @pytest.mark.asyncio
 async def test_system_via_argv(monkeypatch):
     """System prompt jde přes --append-system-prompt argv (CLI 2.1.x nemá file flag)."""
-    response = json.dumps({"result": "ok", "is_error": False})
-    proc = _FakeProcess(stdout_chunks=[response.encode()], stderr_chunks=[])
+    stream_lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s", "model": "claude-opus-4-7"}) + "\n",
+        json.dumps({"type": "result", "subtype": "success",
+                    "result": "ok", "is_error": False}) + "\n",
+    ]
+    proc = _FakeProcess(
+        stdout_chunks=[s.encode() for s in stream_lines],
+        stderr_chunks=[],
+    )
     captured = _patch_subprocess(monkeypatch, proc)
     _patch_killpg(monkeypatch)
 
@@ -329,10 +600,147 @@ async def test_nonzero_exit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_invalid_json_output(monkeypatch):
-    """CLI vrátil garbled output → invalid JSON error."""
+async def test_readline_overflow_real_streamreader():
+    """Codex iter-5 HIGH: real asyncio.StreamReader s limit=1024 → readline
+    pro >1024 byte řádek raises ValueError v Pythonu 3.11+. _read_stream_capped
+    MUSÍ to chytit jako overflow (signal event, kill via main race).
+    Bez fixu by spadlo do generic except → no result event."""
+    from voice.agent.claude_bridge import _read_stream_capped
+
+    # Real asyncio StreamReader s malým limitem
+    reader = asyncio.StreamReader(limit=1024)
+    big_line = b"X" * 2048 + b"\n"
+    reader.feed_data(big_line)
+    reader.feed_eof()
+
+    # Fake proc just for pid (killpg ignored - overflow path doesn't kill here,
+    # caller does via main race).
+    class _FakeProc:
+        pid = 99999
+        stdout = reader
+
+    state = {"assistant_text": "", "tool_uses": []}
+    overflow_event = asyncio.Event()
+    result = await _read_stream_capped(
+        _FakeProc(), cap_bytes=10000, progress_cb=None,
+        state=state, overflow_event=overflow_event,
+    )
+    assert result is None  # žádný result event
+    assert state.get("overflow") is True, "overflow state MUSÍ být set"
+    assert overflow_event.is_set(), "overflow_event MUSÍ být set (race signal)"
+
+
+@pytest.mark.asyncio
+async def test_parser_skips_nested_non_dict():
+    """Codex iter-6: nested non-dict v stream_event/assistant/user → skip,
+    ne AttributeError crash. Malicious/buggy CLI by mohl emit
+    `{"type":"stream_event","event":[]}` apod."""
+    from voice.agent.claude_bridge import _parse_stream_event
+    # event jako list místo dict
+    state = {"assistant_text": "", "tool_uses": []}
+    assert _parse_stream_event(
+        {"type": "stream_event", "event": [1, 2]}, state
+    ) is None
+    # assistant.message jako string místo dict
+    assert _parse_stream_event(
+        {"type": "assistant", "message": "should be dict"}, state
+    ) is None
+    # assistant.message.content jako string místo list
+    assert _parse_stream_event(
+        {"type": "assistant", "message": {"content": "bad"}}, state
+    ) is None
+    # user.message jako int
+    assert _parse_stream_event(
+        {"type": "user", "message": 42}, state
+    ) is None
+    # content_block jako list
+    assert _parse_stream_event(
+        {"type": "stream_event", "event": {
+            "type": "content_block_start", "content_block": [1, 2]
+        }}, state,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_parser_skips_non_dict_json():
+    """Codex iter-5 MEDIUM: stream-json line co je validní JSON ale ne dict
+    (např. `[1,2,3]` nebo `"string"`) MUSÍ být skipnutá, ne hodit AttributeError."""
+    from voice.agent.claude_bridge import _read_stream_capped
+
+    reader = asyncio.StreamReader(limit=128 * 1024)
+    # Mix: non-dict líny (skip), valid system init (dispatch), result (terminal)
+    lines = [
+        b'[1, 2, 3]\n',
+        b'"just a string"\n',
+        b'42\n',
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s", "model": "m"}).encode() + b"\n",
+        json.dumps({"type": "result", "subtype": "success",
+                    "result": "ok", "is_error": False}).encode() + b"\n",
+    ]
+    for ln in lines:
+        reader.feed_data(ln)
+    reader.feed_eof()
+
+    class _FakeProc:
+        pid = 99998
+        stdout = reader
+
+    state = {"assistant_text": "", "tool_uses": []}
+    overflow_event = asyncio.Event()
+    result = await _read_stream_capped(
+        _FakeProc(), cap_bytes=10000, progress_cb=None,
+        state=state, overflow_event=overflow_event,
+    )
+    assert result is not None
+    assert result.get("type") == "result"
+    assert not state.get("overflow"), "no overflow expected"
+    assert state.get("session_id") == "s", "init event MUSÍ dispatched"
+
+
+@pytest.mark.asyncio
+async def test_large_result_line_within_cap(monkeypatch):
+    """Codex iter-3 HIGH: stream-json result line může být > 64 KiB (default
+    asyncio readline limit). Bridge nastavuje limit na output_cap+16K, aby
+    legitimní velký result prošel. Bez fixu by readline raised ValueError
+    a vrátili bychom 'no result event'."""
+    big_text = "X" * (100 * 1024)  # 100 KiB text v result
+    stream_lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s", "model": "claude-opus-4-7"}) + "\n",
+        json.dumps({"type": "result", "subtype": "success",
+                    "result": big_text, "is_error": False}) + "\n",
+    ]
+    # output_cap musí být > big_text + JSON overhead
     proc = _FakeProcess(
-        stdout_chunks=[b"not valid json {{"],
+        stdout_chunks=[s.encode() for s in stream_lines],
+        stderr_chunks=[], returncode=0,
+    )
+    captured = _patch_subprocess(monkeypatch, proc)
+    _patch_killpg(monkeypatch)
+
+    # CLAUDE_OUTPUT_CAP_BYTES default je dostatečný (256 KiB)
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "give me a lot"}, _make_ctx())
+    assert r["ok"] is True, f"big result failed: {r}"
+    assert len(r["text"]) == 100 * 1024
+    # Codex iter-4: ověř že bridge nastavil `limit=` v create_subprocess_exec
+    # ať asyncio readline nepadl na default 64KiB limit. Bez tohoto assertu
+    # by test prošel i bez produkčního fixu (fake_exec limit ignoruje).
+    captured_limit = captured.get("limit")
+    from voice.agent.config import CLAUDE_OUTPUT_CAP_BYTES
+    assert captured_limit is not None and captured_limit >= CLAUDE_OUTPUT_CAP_BYTES, (
+        f"limit={captured_limit} musí být >= output_cap {CLAUDE_OUTPUT_CAP_BYTES}"
+    )
+    assert captured_limit >= 256 * 1024, f"limit={captured_limit} pod min 256KiB"
+
+
+@pytest.mark.asyncio
+async def test_no_result_event_is_protocol_error(monkeypatch):
+    """Codex audit HIGH: bridge MUSÍ vrátit ok=False pokud stream skončil bez
+    result eventu. Mlčení by maskovalo invalid JSON / CLI drift / partial
+    výsledek v edit módu."""
+    proc = _FakeProcess(
+        stdout_chunks=[b"not valid json {{\n", b"another bad line\n"],
         stderr_chunks=[],
         returncode=0,
     )
@@ -341,16 +749,21 @@ async def test_invalid_json_output(monkeypatch):
 
     r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
     assert r["ok"] is False
-    assert "invalid JSON" in r["error"]
+    assert "no result event" in r["error"]
 
 
 @pytest.mark.asyncio
 async def test_is_error_flag(monkeypatch):
-    """JSON má is_error=True → ok=False s message z result."""
-    response = json.dumps({
-        "result": "API quota exceeded", "is_error": True,
-    })
-    proc = _FakeProcess(stdout_chunks=[response.encode()], stderr_chunks=[])
+    """result event s is_error=True → ok=False s message z result."""
+    stream_lines = [
+        json.dumps({"type": "system", "subtype": "init",
+                    "session_id": "s", "model": "claude-opus-4-7"}) + "\n",
+        json.dumps({"type": "result", "subtype": "error_quota",
+                    "result": "API quota exceeded",
+                    "is_error": True}) + "\n",
+    ]
+    proc = _FakeProcess(stdout_chunks=[s.encode() for s in stream_lines],
+                        stderr_chunks=[])
     _patch_subprocess(monkeypatch, proc)
     _patch_killpg(monkeypatch)
 
@@ -410,18 +823,25 @@ async def test_cancel_event(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_output_cap_kills_process(monkeypatch):
-    """Stdout > cap_bytes → on_overflow zavolá killpg, buffer truncated."""
+    """Per-line accumulated stdout > cap → overflow_event → killpg + ok=False.
+    wait_delay > 0 simuluje reálný proces co po overflow nedoběhne sám -
+    musí ho zabít killpg eskalace v main coroutine."""
     monkeypatch.setattr("voice.agent.tools.claude.CLAUDE_OUTPUT_CAP_BYTES", 1024)
-    # 2 KiB chunk = překročí 1 KiB cap
-    huge = b"X" * (2 * 1024)
-    proc = _FakeProcess(stdout_chunks=[huge], stderr_chunks=[])
+    # Mnoho řádků dohromady > 1 KiB cap
+    big_lines = [(b"X" * 200 + b"\n")] * 10  # 2 KiB total
+    proc = _FakeProcess(stdout_chunks=big_lines, stderr_chunks=[],
+                        wait_delay=2.0)
     _patch_subprocess(monkeypatch, proc)
     killpg_calls = _patch_killpg(monkeypatch)
 
     r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
     assert r["ok"] is False
     assert "exceeded" in r["error"]
-    assert any(c[0] == "killpg" for c in killpg_calls)
+    # Codex iter-4: killpg MUSÍ být volán v main coroutine race
+    # (přes overflow_event), ne interně v reader task.
+    assert any(c[0] == "killpg" for c in killpg_calls), (
+        f"expected killpg call, got {killpg_calls}"
+    )
 
 
 # ─────────────────── Env scrubbing (security: no secret leak) ───────────────────
