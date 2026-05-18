@@ -22,7 +22,6 @@ from voice.agent.config import (
     CLAUDE_DEFAULT_MODEL,
     CLAUDE_MAX_PROMPT_BYTES,
     CLAUDE_MAX_SYSTEM_BYTES,
-    CLAUDE_OUTPUT_CAP_BYTES,
     CLAUDE_TIMEOUT_SEC,
 )
 from voice.agent.tools.base import ExecuteContext, Tool
@@ -154,7 +153,6 @@ async def _ask_claude_exec(args: dict, ctx: ExecuteContext) -> dict:
         prompt=prompt, system=system_arg,
         model=model, mode=mode, workdir=workdir,
         timeout_sec=CLAUDE_TIMEOUT_SEC,
-        output_cap_bytes=CLAUDE_OUTPUT_CAP_BYTES,
         claude_bin=CLAUDE_CLI_BIN,
         cancel_event=cancel_event,
         progress_callback=progress_cb,

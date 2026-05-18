@@ -294,49 +294,44 @@ def _parse_stream_event(
     return None  # rate_limit_event, mcp_*, unknown → skip
 
 
-async def _read_stream_capped(
+async def _read_stream(
     proc: asyncio.subprocess.Process,
-    cap_bytes: int,
     progress_cb: Callable[[dict], Awaitable[None]] | None,
     state: dict,
-    overflow_event: asyncio.Event,
 ) -> dict | None:
     """Čte NDJSON ze stdout řádek po řádku, dispatch events. Vrací finální
     `result` event obj (nebo None pokud stream skončil bez result).
 
-    Při překročení capu nebo asyncio LimitOverrunError (line > stream_limit):
-    set state["overflow"], signal overflow_event, return None. Caller pak
-    race-detekuje overflow a killpg eskaluje.
-    """
-    def _signal_overflow():
-        state["overflow"] = True
-        overflow_event.set()
+    Žádný total-bytes cap (user policy: pro Opus implementace by hard kill
+    při X MB stream rušil reálnou práci). Bezpečnostní mechanismy:
+      - timeout (CLAUDE_TIMEOUT_SEC) zabije runaway proces
+      - cancel_event umožní user/UI abort kdykoli
+      - asyncio.StreamReader má per-line limit nastavený caller-side
+        (= ochrana proti jednomu nekonečnému řádku)
+      - file work v edit módu je už zapsaný na disk během streamu, takže
+        se nikdy neztratí ani když downstream truncate.
 
-    total = 0
+    Pokud readline() raise (LimitOverrunError / ValueError v 3.11+) =
+    jeden řádek > stream limit → log warning, ale pokračujeme dalším
+    řádkem (drain). Single oversized line je sice nestandardní, ale
+    nemá smysl kvůli němu zabíjet celý proces co může napsal soubory.
+    """
     while True:
         try:
             line = await proc.stdout.readline()
         except (asyncio.LimitOverrunError, ValueError) as e:
-            # Codex iter-4/5 HIGH: StreamReader.readline() při overflow limitu
-            # v Pythonu 3.11+ raises plain ValueError (ne LimitOverrunError jak
-            # bych myslel). Treat as overflow (ne tichý break → "no result").
-            log.warning("claude stream line exceeded asyncio limit: %s", e)
-            _signal_overflow()
-            try:
-                await proc.stdout.read(-1)  # drain rest
-            except Exception:
-                pass
-            break
+            # Single line překročil per-line StreamReader limit. V Pythonu
+            # 3.11+ raises plain ValueError (ne LimitOverrunError); StreamReader
+            # interně discardne ten řádek a další readline() vrátí další.
+            # Pokračuj - může to být jeden velký tool_result, ale další eventy
+            # stále chceme zpracovat (zejm. final `result`).
+            log.warning("claude stream single-line limit exceeded (skip): %s", e)
+            continue
         except Exception as e:
             log.warning("claude stdout read error: %s", e)
             break
         if not line:
             break  # EOF
-        total += len(line)
-        if total > cap_bytes:
-            log.warning("claude stream exceeded %d bytes - overflow", cap_bytes)
-            _signal_overflow()
-            break
         try:
             obj = json.loads(line.decode("utf-8", errors="replace").rstrip())
         except (ValueError, UnicodeDecodeError):
@@ -376,7 +371,7 @@ async def ask_claude_oneshot(
     mode: str,                                         # "consult" | "edit"
     workdir: Path | None,                              # required for mode=edit
     timeout_sec: float,
-    output_cap_bytes: int,
+    output_cap_bytes: int = 0,                         # deprecated, ignored
     claude_bin: str = "claude",
     cancel_event: asyncio.Event | None = None,
     progress_callback: Callable[[dict], Awaitable[None]] | None = None,
@@ -418,12 +413,13 @@ async def ask_claude_oneshot(
         log.info("claude spawn mode=%s model=%s cwd=%s", mode, model, cwd)
 
         try:
-            # Codex audit HIGH: default asyncio StreamReader limit ~64 KiB per
-            # line. Validní finální `result` event může mít text > 64 KiB
-            # → ValueError → parser zhroutí, vrátí "no result event". Nastavit
-            # limit na output_cap (s rezervou) ať readline zvládne jakýkoli
-            # legitimní line. Cap stejně chrání proti unbounded RAM.
-            stream_limit = max(output_cap_bytes + 16 * 1024, 256 * 1024)
+            # asyncio StreamReader default limit per line je 64 KiB. Validní
+            # event může mít text > 64 KiB (tool_result s velkým souborem,
+            # finální assistant text). Nastavíme limit dostatečně vysoko
+            # (32 MiB per line) ať readline zvládne jakýkoli rozumný řádek.
+            # Pokud single řádek překročí, _read_stream skipne ten řádek a
+            # pokračuje (ne kill subprocesu).
+            stream_limit = 32 * 1024 * 1024
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE,
@@ -450,12 +446,8 @@ async def ask_claude_oneshot(
         # init+status events okamžitě), `proc.stdin.drain()` by visel navždy
         # protože nikdo nečte stdout. Timeout/cancel race ještě neběží.
         state: dict = {"assistant_text": "", "tool_uses": []}
-        # overflow_event je signál ze _read_stream_capped → main coroutine,
-        # aby okamžitě killpg eskalovala (jinak by čekala na timeout).
-        overflow_event = asyncio.Event()
         stdout_task = asyncio.create_task(
-            _read_stream_capped(proc, output_cap_bytes, progress_callback,
-                                state, overflow_event)
+            _read_stream(proc, progress_callback, state)
         )
         stderr_task = asyncio.create_task(_drain_stderr(proc, 64 * 1024))
 
@@ -473,11 +465,7 @@ async def ask_claude_oneshot(
                 log.warning("stdin write failed: %s", e)
         stdin_task = asyncio.create_task(_write_stdin())
         wait_task = asyncio.create_task(proc.wait())
-        # Codex iter-4 HIGH: overflow_event MUSÍ být v race waiters. Jinak
-        # main čeká až do timeout_sec, i když reader už dávno detekoval cap
-        # overflow a SIGTERM mohl být eskalován okamžitě.
-        overflow_task = asyncio.create_task(overflow_event.wait())
-        waiters: list[asyncio.Task] = [wait_task, overflow_task]
+        waiters: list[asyncio.Task] = [wait_task]
         cancel_task = None
         if cancel_event is not None:
             cancel_task = asyncio.create_task(cancel_event.wait())
@@ -495,14 +483,11 @@ async def ask_claude_oneshot(
             raise
 
         was_canceled = cancel_task is not None and cancel_task in done
-        overflow_triggered = overflow_task in done
-        timed_out = wait_task not in done and not was_canceled and not overflow_triggered
-        if timed_out or was_canceled or overflow_triggered:
+        timed_out = wait_task not in done and not was_canceled
+        if timed_out or was_canceled:
             await _kill_process_group(proc)
         if cancel_task is not None and not cancel_task.done():
             cancel_task.cancel()
-        if not overflow_task.done():
-            overflow_task.cancel()
         # Stdin task pravděpodobně už doběhl (proc.wait() se vrátí po jeho
         # close); pokud ne, cancel ho.
         if not stdin_task.done():
@@ -542,20 +527,6 @@ async def ask_claude_oneshot(
                     f"mohou vyžadovat víc času - env AGENT_CLAUDE_TIMEOUT_SEC."
                 ),
                 "timeout": True,
-                "duration_ms": duration_ms, "exit_code": exit_code,
-            }
-        if state.get("overflow"):
-            mb = output_cap_bytes / (1024 * 1024)
-            return {
-                "ok": False, "mode": mode,
-                "error": (
-                    f"Claude vygeneroval příliš velkou odpověď (přes "
-                    f"{mb:.1f} MB raw stream). Zkus rozdělit úkol na menší "
-                    f"kroky - např. nejdřív průzkum projektu, pak postupně "
-                    f"jednotlivé sekce dokumentu. Pokud máš víc paměti, jde "
-                    f"zvednout env AGENT_CLAUDE_OUTPUT_CAP_BYTES."
-                ),
-                "overflow": True,
                 "duration_ms": duration_ms, "exit_code": exit_code,
             }
         if exit_code != 0:

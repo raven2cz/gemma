@@ -175,12 +175,13 @@ CLAUDE_MAX_TOKENS_DEFAULT: int = int(os.environ.get("AGENT_CLAUDE_MAX_TOKENS", "
 CLAUDE_MAX_TOKENS_LIMIT: int = int(os.environ.get("AGENT_CLAUDE_MAX_TOKENS_LIMIT", "4096"))
 CLAUDE_MAX_PROMPT_BYTES: int = int(os.environ.get("AGENT_CLAUDE_MAX_PROMPT_BYTES", str(64 * 1024)))
 CLAUDE_MAX_SYSTEM_BYTES: int = int(os.environ.get("AGENT_CLAUDE_MAX_SYSTEM_BYTES", str(16 * 1024)))
-# Cap je RAW stream-json velikost (incremental deltas, tool_use, tool_result
-# eventy), ne jen finální text. Každý token Claude wrapped v JSON eventu s
-# metadaty - reálný nárůst je 5-10x oproti finálnímu textu. 16 MiB pokryje
-# i komplexní úkoly s mnoha tool_uses (Read file × 10 + design doc × 50 KB).
-# Pokud subprocess překročí cap, je zabit a vrácena hláška o velikosti.
-CLAUDE_OUTPUT_CAP_BYTES: int = int(os.environ.get("AGENT_CLAUDE_OUTPUT_CAP_BYTES", str(16 * 1024 * 1024)))
+# Deprecated: dříve hard cap na total stream bytes, nyní bridge žádný cap
+# nepoužívá (user policy: pro Opus implementace by hard kill při X MB rušil
+# reálnou práci - soubory už jsou zapsané, ale my bychom vrátili "fail").
+# Bezpečnostní mechanismy: timeout (CLAUDE_TIMEOUT_SEC) + cancel_event +
+# asyncio per-line StreamReader limit. Konstanta zůstává pro backward compat
+# a downstream tool_output cap (v loop.py, 4 MB) ji nevyužívá - má vlastní.
+CLAUDE_OUTPUT_CAP_BYTES: int = 0  # deprecated, ignored by bridge
 
 ANTHROPIC_API_KEY_FILE: str = os.environ.get(
     "ANTHROPIC_API_KEY_FILE", str(Path.home() / ".anthropic-api-key"),

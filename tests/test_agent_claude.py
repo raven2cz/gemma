@@ -600,34 +600,41 @@ async def test_nonzero_exit(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_readline_overflow_real_streamreader():
-    """Codex iter-5 HIGH: real asyncio.StreamReader s limit=1024 → readline
-    pro >1024 byte řádek raises ValueError v Pythonu 3.11+. _read_stream_capped
-    MUSÍ to chytit jako overflow (signal event, kill via main race).
-    Bez fixu by spadlo do generic except → no result event."""
-    from voice.agent.claude_bridge import _read_stream_capped
+async def test_oversized_line_skipped_continues_reading():
+    """User policy: bridge nemá hard kill cap. Pokud jeden řádek přesáhne
+    asyncio StreamReader limit, _read_stream ho SKIPNE a pokračuje dalším
+    řádkem - process běží dál, finální result event se chytí, files psané
+    do té doby zůstanou.
 
-    # Real asyncio StreamReader s malým limitem
+    Před změnou (output cap mechanism): overflow_event → killpg → ok=False.
+    User said: 'ten cap si nejsem jist, ze je uplne dobry napad' → odstraněn.
+    """
+    from voice.agent.claude_bridge import _read_stream
+
+    # Real StreamReader s malým per-line limitem (1024 B)
     reader = asyncio.StreamReader(limit=1024)
-    big_line = b"X" * 2048 + b"\n"
+    big_line = b"X" * 2048 + b"\n"  # překročí per-line limit
+    # Po něm validní result event - bridge ho má najít
+    good_result = json.dumps({
+        "type": "result", "subtype": "success",
+        "result": "completed", "is_error": False,
+    }).encode() + b"\n"
     reader.feed_data(big_line)
+    reader.feed_data(good_result)
     reader.feed_eof()
 
-    # Fake proc just for pid (killpg ignored - overflow path doesn't kill here,
-    # caller does via main race).
     class _FakeProc:
         pid = 99999
         stdout = reader
 
     state = {"assistant_text": "", "tool_uses": []}
-    overflow_event = asyncio.Event()
-    result = await _read_stream_capped(
-        _FakeProc(), cap_bytes=10000, progress_cb=None,
-        state=state, overflow_event=overflow_event,
-    )
-    assert result is None  # žádný result event
-    assert state.get("overflow") is True, "overflow state MUSÍ být set"
-    assert overflow_event.is_set(), "overflow_event MUSÍ být set (race signal)"
+    result = await _read_stream(_FakeProc(), progress_cb=None, state=state)
+    # Result MUSÍ být chycený přestože jeden řádek se přeskočil
+    assert result is not None, "oversized line should not abort reading"
+    assert result.get("type") == "result"
+    assert result.get("result") == "completed"
+    # Žádný overflow state - mechanism odstraněn
+    assert not state.get("overflow")
 
 
 @pytest.mark.asyncio
@@ -665,7 +672,7 @@ async def test_parser_skips_nested_non_dict():
 async def test_parser_skips_non_dict_json():
     """Codex iter-5 MEDIUM: stream-json line co je validní JSON ale ne dict
     (např. `[1,2,3]` nebo `"string"`) MUSÍ být skipnutá, ne hodit AttributeError."""
-    from voice.agent.claude_bridge import _read_stream_capped
+    from voice.agent.claude_bridge import _read_stream
 
     reader = asyncio.StreamReader(limit=128 * 1024)
     # Mix: non-dict líny (skip), valid system init (dispatch), result (terminal)
@@ -687,14 +694,9 @@ async def test_parser_skips_non_dict_json():
         stdout = reader
 
     state = {"assistant_text": "", "tool_uses": []}
-    overflow_event = asyncio.Event()
-    result = await _read_stream_capped(
-        _FakeProc(), cap_bytes=10000, progress_cb=None,
-        state=state, overflow_event=overflow_event,
-    )
+    result = await _read_stream(_FakeProc(), progress_cb=None, state=state)
     assert result is not None
     assert result.get("type") == "result"
-    assert not state.get("overflow"), "no overflow expected"
     assert state.get("session_id") == "s", "init event MUSÍ dispatched"
 
 
@@ -719,19 +721,16 @@ async def test_large_result_line_within_cap(monkeypatch):
     captured = _patch_subprocess(monkeypatch, proc)
     _patch_killpg(monkeypatch)
 
-    # CLAUDE_OUTPUT_CAP_BYTES default je dostatečný (16 MiB)
     r = await ASK_CLAUDE_TOOL.execute({"prompt": "give me a lot"}, _make_ctx())
     assert r["ok"] is True, f"big result failed: {r}"
     assert len(r["text"]) == 100 * 1024
     # Codex iter-4: ověř že bridge nastavil `limit=` v create_subprocess_exec
-    # ať asyncio readline nepadl na default 64KiB limit. Bez tohoto assertu
-    # by test prošel i bez produkčního fixu (fake_exec limit ignoruje).
+    # dostatečně vysoký aby asyncio readline nepadl na default 64KiB limit.
+    # Po odstranění output capu používáme fixní 32 MiB per-line limit.
     captured_limit = captured.get("limit")
-    from voice.agent.config import CLAUDE_OUTPUT_CAP_BYTES
-    assert captured_limit is not None and captured_limit >= CLAUDE_OUTPUT_CAP_BYTES, (
-        f"limit={captured_limit} musí být >= output_cap {CLAUDE_OUTPUT_CAP_BYTES}"
+    assert captured_limit is not None and captured_limit >= 16 * 1024 * 1024, (
+        f"per-line stream limit moc nízký: {captured_limit}"
     )
-    assert captured_limit >= 256 * 1024, f"limit={captured_limit} pod min 256KiB"
 
 
 @pytest.mark.asyncio
@@ -823,26 +822,45 @@ async def test_cancel_event(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_output_cap_kills_process(monkeypatch):
-    """Per-line accumulated stdout > cap → overflow_event → killpg + ok=False.
-    wait_delay > 0 simuluje reálný proces co po overflow nedoběhne sám -
-    musí ho zabít killpg eskalace v main coroutine."""
-    monkeypatch.setattr("voice.agent.tools.claude.CLAUDE_OUTPUT_CAP_BYTES", 1024)
-    # Mnoho řádků dohromady > 1 KiB cap
-    big_lines = [(b"X" * 200 + b"\n")] * 10  # 2 KiB total
-    proc = _FakeProcess(stdout_chunks=big_lines, stderr_chunks=[],
-                        wait_delay=2.0)
+async def test_no_output_cap_large_stream_completes(monkeypatch):
+    """User policy: bridge nemá total-bytes cap. Velký stream prochází bez
+    overflow killu, dokud subprocess sám doběhne (result event). Reálný
+    Opus implementation task generuje 10-50 MB stream-json - dřívější
+    256 KiB resp. 16 MiB cap byl pro to nedostatečný.
+
+    Test: 10 MB stream nepřeruší zpracování, ok=True, result event chycený.
+    """
+    # 50 řádků × 200 KiB = ~10 MB total stream
+    big_text = "Y" * (200 * 1024)
+    stream_lines = []
+    for _ in range(50):
+        # Každý řádek je incremental text delta event
+        stream_lines.append(json.dumps({
+            "type": "stream_event",
+            "event": {"type": "content_block_delta",
+                      "delta": {"type": "text_delta", "text": big_text}},
+        }) + "\n")
+    # Final result event
+    stream_lines.append(json.dumps({
+        "type": "result", "subtype": "success",
+        "result": "completed huge task", "is_error": False,
+    }) + "\n")
+
+    proc = _FakeProcess(
+        stdout_chunks=[s.encode() for s in stream_lines],
+        stderr_chunks=[], returncode=0,
+    )
     _patch_subprocess(monkeypatch, proc)
     killpg_calls = _patch_killpg(monkeypatch)
 
-    r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
-    assert r["ok"] is False
-    assert r.get("overflow") is True, f"overflow flag missing: {r}"
-    assert "příliš velkou" in r["error"] or "exceeded" in r["error"]
-    # Codex iter-4: killpg MUSÍ být volán v main coroutine race
-    # (přes overflow_event), ne interně v reader task.
-    assert any(c[0] == "killpg" for c in killpg_calls), (
-        f"expected killpg call, got {killpg_calls}"
+    r = await ASK_CLAUDE_TOOL.execute({"prompt": "huge"}, _make_ctx())
+    # Žádný overflow kill - process doběhl normálně
+    assert r["ok"] is True, f"large stream selhal: {r}"
+    assert r["text"] == "completed huge task"
+    assert r.get("overflow") is not True
+    # killpg se NEMĚL volat (žádný cap-based kill)
+    assert not any(c[0] == "killpg" for c in killpg_calls), (
+        f"unexpected killpg call: {killpg_calls}"
     )
 
 

@@ -62,7 +62,6 @@ async def test_e2e_consult_simple_arithmetic():
         mode="consult",
         workdir=None,
         timeout_sec=90.0,
-        output_cap_bytes=256 * 1024,
         claude_bin=_CLAUDE_BIN,
         cancel_event=None,
         progress_callback=None,
@@ -100,7 +99,6 @@ async def test_e2e_edit_creates_file_in_workdir(tmp_workdir):
         mode="edit",
         workdir=tmp_workdir,
         timeout_sec=180.0,
-        output_cap_bytes=256 * 1024,
         claude_bin=_CLAUDE_BIN,
         cancel_event=None,
         progress_callback=progress,
@@ -143,7 +141,6 @@ async def test_e2e_consult_does_not_see_workdir_files(tmp_workdir):
         mode="consult",
         workdir=None,  # consult nesmí dostat workdir
         timeout_sec=90.0,
-        output_cap_bytes=256 * 1024,
         claude_bin=_CLAUDE_BIN,
         cancel_event=None,
         progress_callback=None,
@@ -181,7 +178,6 @@ async def test_e2e_edit_cancel_via_event(tmp_workdir):
         mode="edit",
         workdir=tmp_workdir,
         timeout_sec=180.0,
-        output_cap_bytes=256 * 1024,
         claude_bin=_CLAUDE_BIN,
         cancel_event=cancel_event,
         progress_callback=None,
@@ -203,10 +199,11 @@ async def test_e2e_edit_cancel_via_event(tmp_workdir):
 async def test_e2e_edit_design_doc_does_not_overflow(tmp_workdir):
     """Regression test: user task "navrhni design dokument" generoval cca
     256+ KB stream-json (Read několika souborů + 30 KB markdown). Při starém
-    capu 256 KiB byl proces zabit (overflow). Nový default 16 MiB pokrývá.
+    capu 256 KiB byl proces zabit (overflow). Cap byl odstraněn úplně (user
+    policy: pro Opus implementace velkých úkolů by hard kill rušil práci).
 
     Test simuluje realistický flow: pár souborů ke čtení + požadavek na
-    delší markdown dokument. Ověř ok=True, soubor vznikl, žádný overflow.
+    delší markdown dokument. Ověř ok=True, soubor vznikl, žádný overflow flag.
     """
     _skip_if_no_claude()
     # Vytvoříme pár sample CSV souborů (OHLCV-style, jako user měl v projektu)
@@ -234,7 +231,6 @@ async def test_e2e_edit_design_doc_does_not_overflow(tmp_workdir):
         mode="edit",
         workdir=tmp_workdir,
         timeout_sec=300.0,  # 5 min - design tasks can be slow
-        output_cap_bytes=16 * 1024 * 1024,  # 16 MiB - new default
         claude_bin=_CLAUDE_BIN,
         cancel_event=None,
         progress_callback=None,
