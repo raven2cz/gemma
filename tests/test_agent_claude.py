@@ -719,7 +719,7 @@ async def test_large_result_line_within_cap(monkeypatch):
     captured = _patch_subprocess(monkeypatch, proc)
     _patch_killpg(monkeypatch)
 
-    # CLAUDE_OUTPUT_CAP_BYTES default je dostatečný (256 KiB)
+    # CLAUDE_OUTPUT_CAP_BYTES default je dostatečný (16 MiB)
     r = await ASK_CLAUDE_TOOL.execute({"prompt": "give me a lot"}, _make_ctx())
     assert r["ok"] is True, f"big result failed: {r}"
     assert len(r["text"]) == 100 * 1024
@@ -788,7 +788,8 @@ async def test_timeout(monkeypatch):
 
     r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
     assert r["ok"] is False
-    assert "timeout" in r["error"]
+    assert r.get("timeout") is True, f"timeout flag missing: {r}"
+    assert "nestihl odpovědět" in r["error"] or "timeout" in r["error"]
     # killpg byl zavolán
     assert any(c[0] == "killpg" for c in killpg_calls)
 
@@ -836,7 +837,8 @@ async def test_output_cap_kills_process(monkeypatch):
 
     r = await ASK_CLAUDE_TOOL.execute({"prompt": "hi"}, _make_ctx())
     assert r["ok"] is False
-    assert "exceeded" in r["error"]
+    assert r.get("overflow") is True, f"overflow flag missing: {r}"
+    assert "příliš velkou" in r["error"] or "exceeded" in r["error"]
     # Codex iter-4: killpg MUSÍ být volán v main coroutine race
     # (přes overflow_event), ne interně v reader task.
     assert any(c[0] == "killpg" for c in killpg_calls), (

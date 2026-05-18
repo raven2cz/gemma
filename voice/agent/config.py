@@ -167,12 +167,20 @@ MAX_TOOL_CALLS_PER_TURN: int = int(os.environ.get("AGENT_MAX_TOOL_CALLS", "32"))
 # CLI passuje klíč svým HTTPS klientem.
 CLAUDE_CLI_BIN: str = os.environ.get("CLAUDE_CLI_BIN", "claude")
 CLAUDE_DEFAULT_MODEL: str = os.environ.get("AGENT_CLAUDE_MODEL", "claude-opus-4-7")
-CLAUDE_TIMEOUT_SEC: float = float(os.environ.get("AGENT_CLAUDE_TIMEOUT_SEC", "60"))
+# 600s = 10 min. Complex tasks (design dokument, multi-file refaktor) lehce
+# vyžadují 2-5 min reálného běhu Claude CLI (čtení souborů, thinking, generování).
+# Dřívější 60s default odpaloval žádost o design doc dřív než stihla doběhnout.
+CLAUDE_TIMEOUT_SEC: float = float(os.environ.get("AGENT_CLAUDE_TIMEOUT_SEC", "600"))
 CLAUDE_MAX_TOKENS_DEFAULT: int = int(os.environ.get("AGENT_CLAUDE_MAX_TOKENS", "1024"))
 CLAUDE_MAX_TOKENS_LIMIT: int = int(os.environ.get("AGENT_CLAUDE_MAX_TOKENS_LIMIT", "4096"))
 CLAUDE_MAX_PROMPT_BYTES: int = int(os.environ.get("AGENT_CLAUDE_MAX_PROMPT_BYTES", str(64 * 1024)))
 CLAUDE_MAX_SYSTEM_BYTES: int = int(os.environ.get("AGENT_CLAUDE_MAX_SYSTEM_BYTES", str(16 * 1024)))
-CLAUDE_OUTPUT_CAP_BYTES: int = int(os.environ.get("AGENT_CLAUDE_OUTPUT_CAP_BYTES", str(256 * 1024)))
+# Cap je RAW stream-json velikost (incremental deltas, tool_use, tool_result
+# eventy), ne jen finální text. Každý token Claude wrapped v JSON eventu s
+# metadaty - reálný nárůst je 5-10x oproti finálnímu textu. 16 MiB pokryje
+# i komplexní úkoly s mnoha tool_uses (Read file × 10 + design doc × 50 KB).
+# Pokud subprocess překročí cap, je zabit a vrácena hláška o velikosti.
+CLAUDE_OUTPUT_CAP_BYTES: int = int(os.environ.get("AGENT_CLAUDE_OUTPUT_CAP_BYTES", str(16 * 1024 * 1024)))
 
 ANTHROPIC_API_KEY_FILE: str = os.environ.get(
     "ANTHROPIC_API_KEY_FILE", str(Path.home() / ".anthropic-api-key"),

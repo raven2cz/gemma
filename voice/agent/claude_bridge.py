@@ -536,13 +536,26 @@ async def ask_claude_oneshot(
         if timed_out:
             return {
                 "ok": False, "mode": mode,
-                "error": f"timeout after {timeout_sec:.0f}s",
+                "error": (
+                    f"Claude nestihl odpovědět do {timeout_sec:.0f}s. "
+                    f"Komplexní úkoly (design dokument, multi-file refaktor) "
+                    f"mohou vyžadovat víc času - env AGENT_CLAUDE_TIMEOUT_SEC."
+                ),
+                "timeout": True,
                 "duration_ms": duration_ms, "exit_code": exit_code,
             }
         if state.get("overflow"):
+            mb = output_cap_bytes / (1024 * 1024)
             return {
                 "ok": False, "mode": mode,
-                "error": f"response exceeded {output_cap_bytes} bytes - proces zabit",
+                "error": (
+                    f"Claude vygeneroval příliš velkou odpověď (přes "
+                    f"{mb:.1f} MB raw stream). Zkus rozdělit úkol na menší "
+                    f"kroky - např. nejdřív průzkum projektu, pak postupně "
+                    f"jednotlivé sekce dokumentu. Pokud máš víc paměti, jde "
+                    f"zvednout env AGENT_CLAUDE_OUTPUT_CAP_BYTES."
+                ),
+                "overflow": True,
                 "duration_ms": duration_ms, "exit_code": exit_code,
             }
         if exit_code != 0:

@@ -197,3 +197,64 @@ async def test_e2e_edit_cancel_via_event(tmp_workdir):
             f"ok=False ale nevypadá to na cancel: {result}"
         )
     # Else: Claude dokončil rychleji než 2s - rare ale OK
+
+
+@pytest.mark.asyncio
+async def test_e2e_edit_design_doc_does_not_overflow(tmp_workdir):
+    """Regression test: user task "navrhni design dokument" generoval cca
+    256+ KB stream-json (Read několika souborů + 30 KB markdown). Při starém
+    capu 256 KiB byl proces zabit (overflow). Nový default 16 MiB pokrývá.
+
+    Test simuluje realistický flow: pár souborů ke čtení + požadavek na
+    delší markdown dokument. Ověř ok=True, soubor vznikl, žádný overflow.
+    """
+    _skip_if_no_claude()
+    # Vytvoříme pár sample CSV souborů (OHLCV-style, jako user měl v projektu)
+    for i in range(3):
+        (tmp_workdir / f"data_{i}.csv").write_text(
+            "date,open,high,low,close,volume\n"
+            + "\n".join(
+                f"2024-01-{d:02d},100.{d},105.{d},99.{d},103.{d},{1000+d}"
+                for d in range(1, 21)
+            )
+        )
+
+    result = await ask_claude_oneshot(
+        prompt=(
+            "1. Read all CSV files in this directory using Glob+Read tools. "
+            "2. Identify the data format (it's OHLCV: open/high/low/close/volume). "
+            "3. Create design.md in this directory with a markdown design document "
+            "describing: data schema, recommended chart types for OHLCV (candlestick), "
+            "tech stack (HTML+Chart.js or similar), file structure proposal. "
+            "Be thorough - aim for at least 50 lines of markdown. "
+            "4. Respond with 'DONE' when finished."
+        ),
+        system=None,
+        model="claude-haiku-4-5",
+        mode="edit",
+        workdir=tmp_workdir,
+        timeout_sec=300.0,  # 5 min - design tasks can be slow
+        output_cap_bytes=16 * 1024 * 1024,  # 16 MiB - new default
+        claude_bin=_CLAUDE_BIN,
+        cancel_event=None,
+        progress_callback=None,
+    )
+
+    # Hlavní assertion: žádný overflow ani timeout
+    assert result.get("overflow") is not True, (
+        f"OVERFLOW! Cap nestačil: {result.get('error')}"
+    )
+    assert result.get("timeout") is not True, (
+        f"TIMEOUT! Bridge nedoběhl: {result.get('error')}"
+    )
+    assert result.get("ok") is True, f"failed: {result}"
+
+    # Design doc vznikl
+    design_md = tmp_workdir / "design.md"
+    assert design_md.exists(), (
+        f"design.md NEVZNIKL; obsah workdir: {list(tmp_workdir.iterdir())}"
+    )
+    content = design_md.read_text()
+    assert len(content) > 500, f"design.md je moc krátký ({len(content)} B)"
+    # Měl by zmínit OHLCV
+    assert any(kw in content.lower() for kw in ("ohlcv", "candlestick", "open", "close"))
