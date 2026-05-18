@@ -772,16 +772,21 @@ def test_ask_claude_edit_mode_destructive(tmp_path: Path):
     assert "FULL SHELL DELEGATION" in r.reason
 
 
-def test_ask_claude_edit_denied_for_readonly_prompt(tmp_path: Path):
-    """Codex audit CRITICAL: nemůžeme downgrade label (execute by stejně použil
-    edit args). DENY hned. Gemma uvidí error v tool_result a opraví."""
+def test_ask_claude_edit_allowed_for_any_prompt(tmp_path: Path):
+    """User policy: v agent módu vždy mode='edit' (loop override). Classifier
+    už nesmí blokovat read-only prompty v edit módu - jinak by override v
+    loopu spadl na DENY pro nevinné otázky typu 'Co dělá tahle funkce?'.
+
+    Předchozí guard (modify_kw) byl odstraněn; bypass-via-downgrade hrozba
+    je obsolete protože loop override mění args PŘED classifierem (žádná
+    asymmetrie mezi tím co classifier viděl a co execute spustil)."""
     r = decide("ask_claude", {
         "prompt": "Co dělá tahle funkce?",  # žádný modify keyword
         "mode": "edit",
     }, tmp_path)
-    assert r.decision == Decision.DENY
-    assert "modifikační keyword" in r.reason
-    assert "consult" in r.reason  # navod jak opravit
+    assert r.decision == Decision.ASK
+    assert r.risk == "destructive"
+    assert r.requires_explicit is True
 
 
 def test_ask_claude_consult_default_medium(tmp_path: Path):

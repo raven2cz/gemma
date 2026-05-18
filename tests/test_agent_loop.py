@@ -787,3 +787,107 @@ async def test_loop_malformed_args_does_not_execute_tool(tmp_path: Path):
         assert json.loads(tr["content"])["_parse_error"] == "invalid_json"
     finally:
         perm._CLASSIFIERS.pop("counting_destructive_unique", None)
+
+
+# ──────────────── ask_claude agent-mode policy: vždy mode="edit" ────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gemma_mode,expected_in_event", [
+    ("consult", "edit"),  # Gemma poslala consult → override na edit
+    (None, "edit"),       # Gemma neposlala mode vůbec → default na edit
+    ("edit", "edit"),     # Gemma poslala edit → ponechat
+])
+async def test_loop_ask_claude_agent_mode_always_edit(
+    tmp_path: Path, gemma_mode, expected_in_event,
+):
+    """User directive: v agent módu ask_claude VŽDY běží mode='edit'.
+
+    Loop musí přepsat args["mode"] PŘED tool_call eventem a classifier.
+    Verify že:
+      - tool_call event ukazuje mode="edit" (UI vidí pravdu)
+      - approval_resolver dostane args.mode="edit" (= destructive ASK flow)
+      - když user denies, tool neproběhne (sanity check že override nezpůsobil bypass)
+    """
+    args_payload = {"prompt": "do something"}
+    if gemma_mode is not None:
+        args_payload["mode"] = gemma_mode
+
+    scripts = [[
+        _ollama_line(
+            tool_calls=[{
+                "id": "tc_claude",
+                "function": {"name": "ask_claude", "arguments": args_payload},
+            }],
+            done=True,
+        ),
+    ], [
+        _ollama_line(content="ok"), _ollama_line(done=True),
+    ]]
+
+    turn_state = {"id": "t1", "canceled": False, "cancel_event": asyncio.Event()}
+    loop = AgentLoop(
+        model="test",
+        messages=[{"role": "user", "content": "udělej přes Claude něco"}],
+        registry=default_registry("agent"),
+        turn_state=turn_state,
+        workdir=tmp_path,  # workdir = agent mode aktivní
+    )
+
+    # Capture args jak je vidí approval_resolver. Deny = tool se nespustí
+    # (nebudeme volat real claude CLI).
+    captured: dict = {}
+
+    async def resolver(approval_id: str, event: dict) -> bool:
+        captured["args"] = event.get("args")
+        captured["risk"] = event.get("risk")
+        captured["requires_explicit"] = event.get("requires_explicit")
+        return False  # deny → tool exec skipped
+
+    loop.set_approval_resolver(resolver)
+
+    with patch("voice.agent.loop.httpx.AsyncClient", return_value=_FakeClient(scripts)):
+        events = [ev async for ev in loop.run()]
+
+    # tool_call event už má override aplikovaný (UI vidí pravdu)
+    tc = next(e for e in events if e["type"] == "tool_call")
+    assert tc["name"] == "ask_claude"
+    assert tc["args"].get("mode") == expected_in_event, (
+        f"tool_call event mode={tc['args'].get('mode')!r}, expected {expected_in_event!r}"
+    )
+
+    # Approval resolver dostal args.mode="edit"
+    assert captured["args"]["mode"] == "edit"
+    # mode=edit = destructive risk + requires_explicit (security model intact)
+    assert captured["risk"] == "destructive"
+    assert captured["requires_explicit"] is True
+
+    # User denied → tool_result ok=False, denied
+    tr = next(e for e in events if e["type"] == "tool_result")
+    assert tr["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_loop_ask_claude_override_not_applied_without_workdir(tmp_path: Path):
+    """Defense: override smí běžet jen v agent módu (workdir nastaven).
+    Bez workdir by ask_claude stejně failnul classifierem (mode=edit vyžaduje
+    workdir), ale override nesmí měnit args když není agent kontext.
+
+    Test: workdir=None ve smyslu loopu = override NE.
+    Pozn.: loop tady použijeme s workdir nastaveným, protože AgentLoop ho
+    vyžaduje. Místo toho ověříme přímo execute_one path s patched workdir.
+    """
+    # Tento test je placeholder pro zdokumentování že override je vázán
+    # na self.workdir. AgentLoop konstruktor vyžaduje workdir, takže nelze
+    # snadno vyrobit "no workdir" scenario v loop. Override condition v
+    # kódu: `if name == "ask_claude" and self.workdir and isinstance(args, dict)`.
+    # Pokud někdo v budoucnu doplní chat-mode-with-tools, musí workdir být None
+    # nebo falsy a override se neaktivuje.
+    from voice.agent.loop import AgentLoop
+    # Sanity check že kontrolovaný atribut existuje
+    loop = AgentLoop(
+        model="m", messages=[], registry=default_registry("agent"),
+        turn_state={"id": "x", "cancel_event": asyncio.Event()},
+        workdir=tmp_path,
+    )
+    assert loop.workdir == tmp_path

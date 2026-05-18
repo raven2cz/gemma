@@ -1804,8 +1804,16 @@ async def test_e2e_agent_light_set_invalid_color_denied(client):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20)
-async def test_e2e_agent_ask_claude_ask_then_approve(client):
-    """Agent calls ask_claude → ASK medium → user approves → tool runs."""
+async def test_e2e_agent_ask_claude_policy_override_to_edit(client):
+    """User policy: v agent módu ask_claude VŽDY mode='edit', i když Gemma
+    pošle consult. Test E2E flow:
+      1. Gemma volá ask_claude(mode='consult', ...) - simuluje špatné rozhodnutí
+      2. Loop override v _execute_one přepíše args["mode"] = "edit"
+      3. tool_call event už ukazuje mode='edit' (UI vidí pravdu)
+      4. Classifier vidí edit → ASK destructive + requires_explicit
+      5. User musí poslat 'ano povoluju' frázi (jinak 400 phrase mismatch)
+      6. Po approve fake_ask dostane args.mode='edit' (override visible v execute)
+    """
     from voice.agent.tools import claude as claude_mod
 
     captured = {}
@@ -1814,6 +1822,7 @@ async def test_e2e_agent_ask_claude_ask_then_approve(client):
         captured["args"] = args
         return {
             "ok": True,
+            "mode": args.get("mode"),
             "model": "claude-opus-4-7",
             "text": "Tady je expert odpověď.",
             "stop_reason": "end_turn",
@@ -1828,7 +1837,7 @@ async def test_e2e_agent_ask_claude_ask_then_approve(client):
             [_mk_lines(
                 tool_calls=[{"function": {"name": "ask_claude",
                                           "arguments": {"prompt": "Vysvětli vrz",
-                                                        "max_tokens": 256}}}],
+                                                        "mode": "consult"}}}],
                 done=True,
             )],
             [_mk_lines(content="Hotovo."), _mk_lines(done=True)],
@@ -1842,6 +1851,7 @@ async def test_e2e_agent_ask_claude_ask_then_approve(client):
 
             approved_event = asyncio.Event()
             approval_id_holder: dict = {}
+            approval_event_holder: dict = {}
             events: list[dict] = []
             tid_holder: dict = {}
 
@@ -1856,30 +1866,45 @@ async def test_e2e_agent_ask_claude_ask_then_approve(client):
                         events.append(ev)
                         if ev["type"] == "approval_required":
                             approval_id_holder["aid"] = ev["approval_id"]
+                            approval_event_holder["ev"] = ev
                             approved_event.set()
 
             async def approver():
                 await approved_event.wait()
+                # mode=edit = destructive → vyžaduje "ano povoluju" frázi
                 r = await client.post(
                     f"/api/turn/{tid_holder['tid']}/approval/{approval_id_holder['aid']}",
-                    json={"decision": "approve"},
+                    json={"decision": "approve", "phrase": "ano povoluju"},
                 )
-                assert r.status_code == 200
+                assert r.status_code == 200, f"approval failed: {r.status_code} {r.text}"
 
             await asyncio.gather(consume(), approver())
 
             types = [e["type"] for e in events]
             assert "approval_required" in types
             assert "tool_result" in types
+
+            # tool_call event po override: mode=edit (UI vidí pravdu, ne consult)
             tc = next(e for e in events if e["type"] == "tool_call")
             assert tc["name"] == "ask_claude"
+            assert tc["args"]["mode"] == "edit", (
+                f"override neaplikován v tool_call: {tc['args']}"
+            )
+
+            # approval_required: destructive + requires_explicit (security model)
+            ap = approval_event_holder["ev"]
+            assert ap["risk"] == "destructive"
+            assert ap["requires_explicit"] is True
+            assert ap["args"]["mode"] == "edit"
+
+            # tool result: fake_ask byl volaný s mode="edit" (ne consult)
             tr = next(e for e in events if e["type"] == "tool_result")
             assert tr["ok"] is True
             out = json.loads(tr["content"])
             assert out["ok"] is True
             assert out["text"] == "Tady je expert odpověď."
             assert captured["args"]["prompt"] == "Vysvětli vrz"
-            assert captured["args"]["max_tokens"] == 256
+            assert captured["args"]["mode"] == "edit"  # override visible v execute
     finally:
         restore()
 

@@ -343,6 +343,17 @@ class AgentLoop:
         tcid: str = tc["id"]
         name: str = tc["function"]["name"]
         args: dict = parse_tool_args(tc)
+        # Agent-mode policy override (MUSÍ být před tool_call eventem aby UI
+        # i klasifikátor viděly skutečný mode). ask_claude vždy mode="edit" -
+        # consult v agent módu nedává smysl (Claude by neviděl soubory).
+        if name == "ask_claude" and self.workdir and isinstance(args, dict):
+            requested_mode = args.get("mode")
+            if requested_mode != "edit":
+                log.info(
+                    "ask_claude tcid=%s: agent-mode policy override mode=%r → 'edit'",
+                    tcid, requested_mode,
+                )
+                args["mode"] = "edit"
         log.debug(
             "execute_one tcid=%s name=%s args=%s",
             tcid, name, json.dumps(args, ensure_ascii=False)[:500],

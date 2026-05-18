@@ -1173,32 +1173,12 @@ def _cls_ask_claude(args: dict, workdir: Path) -> PermissionResult:
             risk="high",
         )
 
-    # Mode-edit safety (Codex audit CRITICAL): nemůžeme jen "downgradovat"
-    # label permission výsledku - tool execute pak použije původní args["mode"]
-    # a stejně spustí edit. To by byl bypass destructive phrase.
-    # Místo toho DENY když Gemma navrhla mode=edit ale prompt nemá modificační
-    # keywords. Gemma uvidí error v tool_result, opraví a zkusí znova s
-    # mode=consult (nebo s lepším promptem, pokud user opravdu chtěl edit).
-    if mode == "edit":
-        modify_kw = (
-            "uprav", "změn", "změň", "edituj", "vytvor", "vytvoř", "naprogramuj",
-            "naimplementuj", "implement", "smaz", "smaž", "delete", "remove",
-            "refaktor", "refactor", "fix", "oprav", "přidej", "pridej", "add",
-            "create", "write", "modify", "change", "build", "generat", "rewrite",
-            "přepiš", "prepis",
-        )
-        prompt_lower = prompt.lower()
-        if not any(kw in prompt_lower for kw in modify_kw):
-            return PermissionResult(
-                decision=Decision.DENY,
-                reason=(
-                    "mode='edit' vyžaduje modifikační keyword v promptu "
-                    "(vytvor, uprav, fix, refactor, ...). Tvůj prompt vypadá "
-                    "jako read-only otázka; použij mode='consult' pro jen radu."
-                ),
-                summary=f'ask_claude EDIT odmítnut: read-only prompt "{prompt[:40]}…"',
-                risk="high",
-            )
+    # Pozn.: dřívější guard "mode=edit vyžaduje modifikační keyword v promptu"
+    # byl odstraněn po user policy: "v agent módu vždy mode='edit'". Loop
+    # override (voice/agent/loop.py::_execute_one) přepíše args["mode"] na
+    # "edit" PŘED classifierem, takže consult v agent módu nikdy nenastane
+    # a původní obava o downgrade bypass (Codex audit) je obsolete. Read-only
+    # otázky v edit módu prostě nevolají Write tooly (Claude se přizpůsobí).
 
     # Codex iter-9: model arg runtime allowlist (sdílený s execute path).
     model_arg = args.get("model")

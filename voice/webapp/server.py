@@ -1532,27 +1532,17 @@ async def _run_agent_turn(
     inject_directive = ""
     if _route.target == "claude" and _route.confidence == "high":
         model_arg = f', model="{_route.model_hint}"' if _route.model_hint else ""
-        # Pokud router detekoval edit intent (akční slovesa: udělej/vytvoř/spusť/…),
-        # TVRDĚ injectneme mode="edit" do volání - Gemma má jinak tendenci jít
-        # cestou consult defaultu a Claude pak hlásí "v consult módu nevidím soubory".
-        if _route.mode_hint == "edit":
-            mode_arg = ', mode="edit"'
-            mode_explain = (
-                "Volej s `mode=\"edit\"` - user chce aby Claude SKUTEČNĚ něco "
-                "udělal v projektu (číst/editovat/spustit), ne jen poradil. "
-                "Edit mode dá Claudovi přístup k aktuálnímu workdir."
-            )
-        else:
-            mode_arg = ', mode="consult"'
-            mode_explain = (
-                "Volej s `mode=\"consult\"` - user chce expert review/poradu, "
-                "ne modifikaci souborů. Claude v consult módu nemá FS přístup."
-            )
+        # Agent-mode policy: vždy mode="edit", consult zde nedává smysl
+        # (Claude by neměl FS přístup a user se ptal proč nevidí soubory).
+        # Defense-in-depth: loop.py override stejně přepne consult → edit
+        # pokud Gemma direktivu ignoruje.
         inject_directive = (
             "\n\nUŽIVATEL EXPLICITNĚ POŽÁDAL O DELEGACI NA CLAUDE. "
             "JAKO PRVNÍ a JEDINOU akci v tomto turnu zavolej tool "
-            f"`ask_claude(prompt=<celý user dotaz>{mode_arg}{model_arg})`. "
-            f"{mode_explain} "
+            f"`ask_claude(prompt=<celý user dotaz>, mode=\"edit\"{model_arg})`. "
+            "VŽDY používej `mode=\"edit\"` - Claude tak má přístup k workdir "
+            "a může reálně číst/editovat/spustit věci. NIKDY nepoužívej "
+            "`mode=\"consult\"` v agent módu (Claude by neviděl soubory). "
             "NEDĚLEJ nic jiného před tímto voláním (žádné fs_read, žádné run_bash)."
         )
     # Uložit model_hint do turn_state - loop ho propaguje do ExecuteContext.
