@@ -1911,6 +1911,127 @@ async def test_e2e_agent_ask_claude_policy_override_to_edit(client):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20)
+async def test_e2e_agent_ask_claude_progress_events_visible_in_stream(client):
+    """Regression test: bridge → loop → server NDJSON stream chain pro
+    tool_progress eventy MUSÍ doručit progress (thinking/tool_use/text) až
+    do response stream, jinak user nevidí co Claude dělá.
+
+    Bug zachycený userem: 'vubec ale neni videt, co dela, ani thinking,
+    nebo co zpracovava'.
+
+    Test simuluje bridge co emituje 4 progress eventy přes ctx.progress_emitter
+    (přesně tak jak to dělá reálný bridge přes progress_callback). Verify že
+    všechny 4 vyletí ven jako `tool_progress` NDJSON s payload + tool_call_id.
+    """
+    from voice.agent.tools import claude as claude_mod
+
+    async def fake_ask_with_progress(args, ctx):
+        # Simuluje sekvenci progress eventů z reálného Claude stream-json.
+        # Pokud tato linka nefunguje, user uvidí jen "tool start" a pak
+        # nakonec result - žádný náhled co se dělo.
+        await ctx.progress_emitter({
+            "stage": "started",
+            "message": "Claude claude-haiku-4-5 session abc",
+            "session_id": "abc-123",
+            "model": "claude-haiku-4-5",
+        })
+        await ctx.progress_emitter({"stage": "thinking", "message": "přemýšlí…"})
+        await ctx.progress_emitter({
+            "stage": "tool_use", "tool_name": "Read",
+            "input": {"file_path": "/x.py"},
+        })
+        await ctx.progress_emitter({
+            "stage": "tool_result",
+            "content": "file content here",
+        })
+        return {
+            "ok": True, "mode": "edit",
+            "model": "claude-haiku-4-5",
+            "text": "hotovo",
+            "tool_uses": ["Read"],
+            "duration_ms": 500,
+        }
+
+    _orig, restore = _swap_tool_execute(
+        claude_mod.ASK_CLAUDE_TOOL, fake_ask_with_progress,
+    )
+    try:
+        script = [
+            [_mk_lines(
+                tool_calls=[{"function": {"name": "ask_claude",
+                                          "arguments": {"prompt": "udělej něco"}}}],
+                done=True,
+            )],
+            [_mk_lines(content="Hotovo."), _mk_lines(done=True)],
+        ]
+        with _patch_ollama(script):
+            payload = {
+                "model": "m", "mode": "agent",
+                "messages": [{"role": "user", "content": "udělej přes Claude něco"}],
+                "want_tts": False,
+            }
+
+            approved_event = asyncio.Event()
+            approval_id_holder: dict = {}
+            events: list[dict] = []
+            tid_holder: dict = {}
+
+            async def consume():
+                async with client.stream("POST", "/api/turn", json=payload) as r:
+                    assert r.status_code == 200
+                    tid_holder["tid"] = r.headers["x-turn-id"]
+                    async for line in r.aiter_lines():
+                        if not line.strip():
+                            continue
+                        ev = json.loads(line)
+                        events.append(ev)
+                        if ev["type"] == "approval_required":
+                            approval_id_holder["aid"] = ev["approval_id"]
+                            approved_event.set()
+
+            async def approver():
+                await approved_event.wait()
+                r = await client.post(
+                    f"/api/turn/{tid_holder['tid']}/approval/{approval_id_holder['aid']}",
+                    json={"decision": "approve", "phrase": "ano povoluju"},
+                )
+                assert r.status_code == 200
+
+            await asyncio.gather(consume(), approver())
+
+            # KLÍČOVÝ assert: progress eventy se dostaly do response streamu
+            progress_events = [e for e in events if e["type"] == "tool_progress"]
+            assert len(progress_events) == 4, (
+                f"očekáváno 4 tool_progress eventy (started/thinking/tool_use/tool_result), "
+                f"got {len(progress_events)}. Všechny event types: "
+                f"{[e['type'] for e in events]}"
+            )
+
+            stages = [e["payload"]["stage"] for e in progress_events]
+            assert stages == ["started", "thinking", "tool_use", "tool_result"], (
+                f"špatné stage pořadí: {stages}"
+            )
+
+            # Každý event MUSÍ mít tool_call_id + tool name (jinak UI nenavázat
+            # progress na konkrétní tool kartu).
+            tc = next(e for e in events if e["type"] == "tool_call")
+            for pe in progress_events:
+                assert pe["tool_call_id"] == tc["id"], (
+                    f"progress event nemá správné tool_call_id: {pe}"
+                )
+                assert pe["tool"] == "ask_claude"
+
+            # tool_use event přenesl tool_name + input (UI to potřebuje pro detaily)
+            tool_use_ev = next(e for e in progress_events
+                               if e["payload"]["stage"] == "tool_use")
+            assert tool_use_ev["payload"]["tool_name"] == "Read"
+            assert tool_use_ev["payload"]["input"]["file_path"] == "/x.py"
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(20)
 async def test_e2e_agent_ask_claude_empty_prompt_denied(client):
     """Empty prompt → classifier DENY → no execute, no approval."""
     script = [

@@ -1369,28 +1369,79 @@ function fillToolResult(ev) {
   pre.hidden = false;
 }
 
-/** Update inline progress text na tool kartě podle tool_progress eventu.
- * Vytvoří subline element pokud ještě neexistuje. */
+// Limit progress eventů zobrazených v UI per tool card. Bez něj by ask_claude
+// s desítkami tool_uses zaplnil DOM. Posledních N stačí pro orientaci.
+const _PROGRESS_LOG_MAX = 12;
+
+const _STAGE_ICONS = {
+  started: '▶',       // ▶
+  thinking: '…',      // …
+  tool_use: '⚙',      // ⚙
+  tool_result: '✓',   // ✓
+  text: '✍',          // ✍
+  cost: '$',
+};
+
+/** Update progress activity log na tool kartě podle tool_progress eventu.
+ * Místo overwriting textu udržujeme scrolling log posledních N eventů,
+ * každý s ikonou stage + jeho message/tool_name. User vidí kontinuálně co
+ * Claude dělá (Read X, Edit Y, Bash Z, ...). */
 function updateToolProgress(ev) {
   const card = findToolCard(ev.tool_call_id);
   if (!card) return;
-  let progEl = card.querySelector('.tool-card-progress');
-  if (!progEl) {
-    progEl = document.createElement('div');
-    progEl.className = 'tool-card-progress';
+  let logEl = card.querySelector('.tool-card-progress-log');
+  if (!logEl) {
+    logEl = document.createElement('div');
+    logEl.className = 'tool-card-progress-log';
     // Vložit pod status, před result.
     const status = card.querySelector('.tool-card-status');
     if (status && status.parentNode) {
-      status.parentNode.insertBefore(progEl, status.nextSibling);
+      status.parentNode.insertBefore(logEl, status.nextSibling);
     } else {
-      card.appendChild(progEl);
+      card.appendChild(logEl);
     }
   }
   const p = ev.payload || {};
   const stage = p.stage || 'work';
-  const message = p.message || '';
-  progEl.textContent = message ? `${stage}: ${message}` : stage;
-  progEl.dataset.stage = stage;
+  const icon = _STAGE_ICONS[stage] || '•';  // bullet fallback
+
+  // Sestav label: stage + message/tool_name detail
+  let detail = '';
+  if (stage === 'tool_use') {
+    // message obsahuje "Read /file.py" nebo "Bash: ls -la" etc.
+    detail = p.message || p.tool_name || '';
+  } else if (stage === 'tool_result') {
+    detail = (p.ok === false) ? 'tool selhal' : (p.message || 'tool OK');
+  } else if (stage === 'text') {
+    const t = (p.text || '').replace(/\s+/g, ' ').slice(0, 80);
+    detail = t ? `"${t}${(p.text || '').length > 80 ? '…' : ''}"` : '';
+  } else if (stage === 'cost') {
+    const cost = p.cost_usd != null ? `$${Number(p.cost_usd).toFixed(4)}` : '?';
+    const dur = p.duration_ms != null ? `${(p.duration_ms / 1000).toFixed(1)}s` : '?';
+    detail = `${cost} · ${dur}`;
+  } else {
+    detail = p.message || '';
+  }
+
+  const row = document.createElement('div');
+  row.className = 'tool-card-progress-row';
+  row.dataset.stage = stage;
+  const stageEl = document.createElement('span');
+  stageEl.className = 'tool-card-progress-icon';
+  stageEl.textContent = icon;
+  const labelEl = document.createElement('span');
+  labelEl.className = 'tool-card-progress-text';
+  labelEl.textContent = detail ? `${stage}: ${detail}` : stage;
+  row.appendChild(stageEl);
+  row.appendChild(labelEl);
+  logEl.appendChild(row);
+
+  // Trim na posledních N
+  while (logEl.childElementCount > _PROGRESS_LOG_MAX) {
+    logEl.removeChild(logEl.firstChild);
+  }
+  // Autoscroll na nejnovější
+  logEl.scrollTop = logEl.scrollHeight;
 }
 
 /** Pokud tool_result je z ask_claude, vykresli pod kartu speciální blok

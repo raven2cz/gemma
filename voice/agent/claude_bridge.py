@@ -235,20 +235,54 @@ def _parse_stream_event(
                 state["last_thinking_emit"] = now
                 return {"stage": "thinking", "message": "přemýšlí…"}
             if cbt == "tool_use":
-                # Codex iter-8: name scalar guard.
+                # input ještě není kompletní (přijde přes input_json_delta).
+                # Uložíme block state pro pozdější emit na content_block_stop.
                 name_raw = cb.get("name")
                 name = name_raw if isinstance(name_raw, str) else "?"
-                summary = _short_tool_input_summary(name, cb.get("input"))
+                idx = ev.get("index")
+                blocks = state.setdefault("blocks", {})
+                blocks[idx] = {"name": name, "input_buf": ""}
                 state.setdefault("tool_uses", []).append(name)
-                return {
-                    "stage": "tool_use",
-                    "message": summary,
-                    "tool_name": name,
-                }
+                return None  # počkáme až bude input kompletní
             if cbt == "text":
                 # Nový text block - neemit tady, počkáme až bude něco akumulované
                 state["text_block_started"] = True
                 return None
+        if et == "content_block_delta":
+            # Accumulate tool_use input bytes (Claude streams je incrementálně
+            # jako input_json_delta). Bez tohoto bychom při content_block_stop
+            # měli prázdný input a UI by nevidělo file_path/command/atd.
+            delta = ev.get("delta")
+            if not isinstance(delta, dict):
+                return None
+            if delta.get("type") == "input_json_delta":
+                partial = delta.get("partial_json")
+                idx = ev.get("index")
+                blocks = state.get("blocks") or {}
+                blk = blocks.get(idx)
+                if blk is not None and isinstance(partial, str):
+                    blk["input_buf"] = blk.get("input_buf", "") + partial
+            return None
+        if et == "content_block_stop":
+            # Emit tool_use progress s kompletním inputem (file_path, command, ...).
+            idx = ev.get("index")
+            blocks = state.get("blocks") or {}
+            blk = blocks.pop(idx, None)
+            if blk is None:
+                return None
+            name = blk.get("name", "?")
+            buf = blk.get("input_buf", "")
+            try:
+                inp = json.loads(buf) if buf else None
+            except (ValueError, TypeError):
+                inp = None
+            summary = _short_tool_input_summary(name, inp)
+            return {
+                "stage": "tool_use",
+                "message": summary,
+                "tool_name": name,
+                "input": inp if isinstance(inp, dict) else None,
+            }
         return None  # ostatní stream_event subtypes (deltas, stops) → skip
 
     if t == "assistant":

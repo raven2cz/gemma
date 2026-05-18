@@ -1159,17 +1159,72 @@ body {
 .tool-card[data-status="error"] .tool-card-status { color: var(--error); }
 
 /* Inline progress text z dlouhých subagent calls (ask_claude stream events) */
-.tool-card-progress {
-  margin-top: 4px;
+/* Activity log na tool kartě: scrolling list posledních N progress eventů.
+   Místo přepisování jednoho řádku zachováváme historii - user vidí co
+   Claude všechno dělal (Read X, Edit Y, Bash Z, ...) i když si přečte
+   až po dokončení. Pro ask_claude v edit módu klíčové. */
+.tool-card-progress-log {
+  margin-top: 6px;
+  padding: 6px 8px;
+  background: rgba(15, 23, 42, 0.5);  /* lehce tmavší pozadí */
+  border-left: 2px solid rgba(148, 163, 184, 0.4);
+  border-radius: 3px;
+  max-height: 180px;
+  overflow-y: auto;
   font-size: 11.5px;
   font-family: 'JetBrains Mono', monospace;
-  color: var(--fg-dim);
-  font-style: italic;
+  line-height: 1.55;
 }
-.tool-card-progress[data-stage="thinking"] { color: #cbd5e1; }
-.tool-card-progress[data-stage="tool_use"] { color: #fbbf24; }
-.tool-card-progress[data-stage="tool_result"] { color: #4ade80; }
-.tool-card-progress[data-stage="started"] { color: #93c5fd; }
+
+.tool-card-progress-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-card-progress-icon {
+  display: inline-block;
+  width: 1.1em;
+  text-align: center;
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+
+.tool-card-progress-text {
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Per-stage barvy. Aktivní (poslední) řádek lehce zvýrazněný. */
+.tool-card-progress-row[data-stage="thinking"] .tool-card-progress-text { color: #cbd5e1; font-style: italic; }
+.tool-card-progress-row[data-stage="tool_use"] .tool-card-progress-text { color: #fbbf24; }
+.tool-card-progress-row[data-stage="tool_result"] .tool-card-progress-text { color: #4ade80; }
+.tool-card-progress-row[data-stage="started"] .tool-card-progress-text { color: #93c5fd; }
+.tool-card-progress-row[data-stage="text"] .tool-card-progress-text { color: #e2e8f0; }
+.tool-card-progress-row[data-stage="cost"] .tool-card-progress-text { color: #a78bfa; }
+
+/* Pulsing indikátor na aktivním (running) tool cardu - user vidí že
+   subagent stále pracuje i bez aktuálního progress eventu. */
+.tool-card[data-status="running"] .tool-card-progress-log::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--speaking, #fbbf24);
+  margin-right: 6px;
+  animation: pulse-dot 1.2s ease-in-out infinite;
+  vertical-align: middle;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.3; transform: scale(0.7); }
+}
 
 /* Claude result card - speciální blok pod tool kartou pro ask_claude.
    Fialový border, monospace text, žádné TTS. Uživatel vidí celou Claudovu

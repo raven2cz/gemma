@@ -254,3 +254,58 @@ async def test_e2e_edit_design_doc_does_not_overflow(tmp_workdir):
     assert len(content) > 500, f"design.md je moc krátký ({len(content)} B)"
     # Měl by zmínit OHLCV
     assert any(kw in content.lower() for kw in ("ohlcv", "candlestick", "open", "close"))
+
+
+@pytest.mark.asyncio
+async def test_e2e_real_bridge_emits_progress_events_for_each_tool_use(tmp_workdir):
+    """User regression: 'vubec ale neni videt, co dela'. Test ověří že
+    bridge progress_callback DOSTANE event PRO KAŽDÝ tool_use Claude udělá
+    (Read, Write, Bash, ...) - ne jen 1-2 generic eventy.
+
+    Tohle je důkaz pro UI: pokud progress_callback dostal N tool_uses, pak
+    server stream taky doručí N tool_progress eventů, a UI je má co zobrazit.
+    """
+    _skip_if_no_claude()
+    # 2 sample CSV soubory ke čtení
+    (tmp_workdir / "a.csv").write_text("x,y\n1,2\n3,4\n")
+    (tmp_workdir / "b.csv").write_text("a,b\n5,6\n7,8\n")
+
+    progress_events: list[dict] = []
+
+    async def progress(payload: dict):
+        progress_events.append(payload)
+
+    result = await ask_claude_oneshot(
+        prompt=(
+            "Use Glob tool to find all CSV files. Then Read each one. "
+            "Then Write a summary.txt with 'found N CSVs'. Respond 'DONE'."
+        ),
+        system=None,
+        model="claude-haiku-4-5",
+        mode="edit",
+        workdir=tmp_workdir,
+        timeout_sec=180.0,
+        claude_bin=_CLAUDE_BIN,
+        cancel_event=None,
+        progress_callback=progress,
+    )
+    assert result.get("ok") is True, f"failed: {result}"
+
+    # User MUSÍ vidět progress eventy - bez nich UI ukáže prázdno
+    stages = [e.get("stage") for e in progress_events]
+    assert "started" in stages, f"no 'started' event: {stages}"
+    assert stages.count("tool_use") >= 2, (
+        f"očekáváno aspoň 2 tool_use eventy (Glob+Read+Write min), "
+        f"got {stages.count('tool_use')}. Stages: {stages}"
+    )
+
+    # Každý tool_use event MUSÍ mít tool_name + nějaký message pro UI
+    tool_uses = [e for e in progress_events if e.get("stage") == "tool_use"]
+    for tu in tool_uses:
+        assert tu.get("tool_name"), f"tool_use bez tool_name: {tu}"
+        assert tu.get("message"), f"tool_use bez message (UI bude prázdné): {tu}"
+
+    # tool_result event jako follow-up po tool_use (Claude zpracoval výsledek)
+    assert stages.count("tool_result") >= 1, (
+        f"žádný tool_result event - UI nikdy neukáže 'tool OK': {stages}"
+    )

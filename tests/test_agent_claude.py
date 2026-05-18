@@ -447,17 +447,32 @@ async def test_happy_path_edit(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_progress_callback_dispatches(monkeypatch, tmp_path):
     """progress_emitter z ctx dostane payloady pro každý dispatched stream event."""
+    # Realistic stream: content_block_start (name only, empty input) →
+    # content_block_delta (incremental input_json_delta) → content_block_stop
+    # (emit s parsed inputem). Bridge musí poskládat partial_json kousky.
     stream_lines = [
         json.dumps({"type": "system", "subtype": "init",
                     "session_id": "s1", "model": "claude-opus-4-7"}) + "\n",
         json.dumps({"type": "stream_event", "event": {
-            "type": "content_block_start",
+            "type": "content_block_start", "index": 0,
             "content_block": {"type": "thinking"}
         }}) + "\n",
         json.dumps({"type": "stream_event", "event": {
-            "type": "content_block_start",
-            "content_block": {"type": "tool_use", "name": "Read",
-                              "input": {"file_path": "x.py"}}
+            "type": "content_block_start", "index": 1,
+            "content_block": {"type": "tool_use", "name": "Read", "input": {}}
+        }}) + "\n",
+        json.dumps({"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "input_json_delta",
+                      "partial_json": '{"file_path":"'},
+        }}) + "\n",
+        json.dumps({"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "input_json_delta",
+                      "partial_json": 'x.py"}'},
+        }}) + "\n",
+        json.dumps({"type": "stream_event", "event": {
+            "type": "content_block_stop", "index": 1,
         }}) + "\n",
         json.dumps({"type": "result", "subtype": "success",
                     "result": "ok", "is_error": False}) + "\n",
@@ -485,9 +500,14 @@ async def test_progress_callback_dispatches(monkeypatch, tmp_path):
     assert "started" in stages
     assert "thinking" in stages
     assert "tool_use" in stages
-    # tool_use payload má tool_name
+    # tool_use payload má tool_name + enrichnutý message s file_path (jinak
+    # by UI ukázalo jen "Read" bez detailu).
     tu = next(p for p in emitted if p["stage"] == "tool_use")
     assert tu["tool_name"] == "Read"
+    assert "x.py" in tu["message"], (
+        f"tool_use message neobsahuje file_path: {tu}"
+    )
+    assert tu.get("input") == {"file_path": "x.py"}
 
 
 @pytest.mark.asyncio
