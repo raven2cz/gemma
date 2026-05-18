@@ -36,6 +36,12 @@ class RouterDecision:
     # "haiku"). Server propaguje do ExecuteContext.model_hint a tool ho
     # použije pokud user nezadal `model` arg.
     model_hint: str | None = None
+    # Volitelný hint pro ask_claude `mode` arg: "edit" pokud user chce aby
+    # Claude editoval/vytvořil/spustil věci, "consult" pokud chce jen review/
+    # vysvětlení. None = neurčeno (server defaultně použije consult).
+    # Server tento hint TVRDĚ injectne do system promptu - Gemma má jinak
+    # tendenci jít cestou consult defaultu i pro modify úkoly.
+    mode_hint: str | None = None
 
 
 # Priorita 1: explicit user directive → claude/high. Musí být sloveso /
@@ -48,6 +54,9 @@ _VERBS_DELEGATE = (
     r"ask|"                     # ask Claude
     r"pomocí|pomoci|"           # pomocí Clauda
     r"přes|pres|"               # přes Claude / přes Opus
+    r"spusť|spust|"             # spusť Opus (user reálně řekl)
+    r"rozjeď|rozjed|"           # rozjeď Claudea
+    r"vyřeš|vyres|"             # vyřeš přes Opus
     r"deleguj|delegate"
 )
 _RE_EXPLICIT_CLAUDE = re.compile(
@@ -81,6 +90,37 @@ def _detect_model_hint(text: str) -> str | None:
         return "sonnet"
     if _RE_MODEL_HAIKU.search(text):
         return "haiku"
+    return None
+
+
+# Edit-intent keywords. Pokud user řekne kterékoli z těchto, ask_claude má
+# použít mode="edit" (Claude potřebuje FS přístup). Czech + English.
+# Konzervativní allowlist - když nematchne, fallback na consult (bezpečnější
+# default, max user dostane "neviděl jsem soubory" a doptá se).
+_RE_EDIT_INTENT = re.compile(
+    r"(?ix)\b(?:"
+    # Czech imperativ slovesa (skloňování přes \w*)
+    r"udělej|udelej|vytvoř|vytvor|napiš|napis|"
+    r"uprav|změň|zmen|smaž|smaz|odstraň|odstran|"
+    r"spusť|spust|prove[ďd]|implementuj|opravi?|"
+    r"refaktoruj|refactoruj|přidej|pridej|odeber|"
+    r"oprav\w*|zapiš|zapis|"
+    # "podívej se" / "koukni" - implies reading workdir files
+    r"podívej\s+se|podivej\s+se|koukni|prohlédni|prohledni|"
+    r"vypiš|vypis|zobraz|"
+    # English
+    r"create|write|edit|modify|change|delete|remove|"
+    r"implement|fix|refactor|add|update|run|execute|"
+    r"look\s+at|check|review\s+(?:the|my|this)\s+(?:file|code|repo|project)"
+    r")\b"
+)
+
+
+def _detect_mode_hint(text: str) -> str | None:
+    """Vrátí "edit" pokud text obsahuje akční slovesa indikující FS modifikaci
+    / spuštění / čtení projektu. Jinak None (server použije consult default)."""
+    if _RE_EDIT_INTENT.search(text):
+        return "edit"
     return None
 
 # Priorita 2: rychlé lokální úkony → local/high.
@@ -173,6 +213,7 @@ def decide_route(messages: list[dict]) -> RouterDecision:
             reason="explicit user directive (@claude / použij claude/opus/sonnet)",
             confidence="high",
             model_hint=_detect_model_hint(text),
+            mode_hint=_detect_mode_hint(text),
         )
 
     if _RE_LOCAL_FASTPATH.search(text):

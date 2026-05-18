@@ -1532,13 +1532,28 @@ async def _run_agent_turn(
     inject_directive = ""
     if _route.target == "claude" and _route.confidence == "high":
         model_arg = f', model="{_route.model_hint}"' if _route.model_hint else ""
+        # Pokud router detekoval edit intent (akční slovesa: udělej/vytvoř/spusť/…),
+        # TVRDĚ injectneme mode="edit" do volání - Gemma má jinak tendenci jít
+        # cestou consult defaultu a Claude pak hlásí "v consult módu nevidím soubory".
+        if _route.mode_hint == "edit":
+            mode_arg = ', mode="edit"'
+            mode_explain = (
+                "Volej s `mode=\"edit\"` - user chce aby Claude SKUTEČNĚ něco "
+                "udělal v projektu (číst/editovat/spustit), ne jen poradil. "
+                "Edit mode dá Claudovi přístup k aktuálnímu workdir."
+            )
+        else:
+            mode_arg = ', mode="consult"'
+            mode_explain = (
+                "Volej s `mode=\"consult\"` - user chce expert review/poradu, "
+                "ne modifikaci souborů. Claude v consult módu nemá FS přístup."
+            )
         inject_directive = (
             "\n\nUŽIVATEL EXPLICITNĚ POŽÁDAL O DELEGACI NA CLAUDE. "
             "JAKO PRVNÍ a JEDINOU akci v tomto turnu zavolej tool "
-            f"`ask_claude(prompt=<celý user dotaz>{model_arg})`. "
-            "Pokud user chce abys něco editoval/vytvořil/spustil v projektu, "
-            "použij `mode=\"edit\"`. Jinak `mode=\"consult\"` (default). "
-            "NEDĚLEJ nic jiného před tímto voláním."
+            f"`ask_claude(prompt=<celý user dotaz>{mode_arg}{model_arg})`. "
+            f"{mode_explain} "
+            "NEDĚLEJ nic jiného před tímto voláním (žádné fs_read, žádné run_bash)."
         )
     # Uložit model_hint do turn_state - loop ho propaguje do ExecuteContext.
     turn_state["model_hint"] = _route.model_hint

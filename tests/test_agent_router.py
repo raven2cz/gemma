@@ -402,3 +402,48 @@ def test_router_no_false_positive_on_passive_mention(text):
         assert r.confidence == "low", (
             f"text={text!r}: got claude/high (false positive!)"
         )
+
+
+# ──────────────── v3: mode_hint detekce (edit vs consult) ────────────────
+
+
+@pytest.mark.parametrize("text,expected_mode", [
+    # Edit intent: akční slovesa indikující FS modifikaci nebo spuštění
+    ("Použij Claude a udělej refaktoring api.py", "edit"),
+    ("Použij Opus a vytvoř hello.py", "edit"),
+    ("Pouzij Claude a uprav konfiguraci", "edit"),
+    ("Použij Sonnet a spusť testy v projektu", "edit"),
+    ("Použij Claude a oprav ten bug v server.py", "edit"),
+    ("Udělej přes Opus implementaci streamingu", "edit"),
+    ("Použij Claude a podívej se na ten soubor", "edit"),
+    ("Použij Claude a vypiš soubory", "edit"),
+    ("@claude create a new test file", "edit"),
+    ("@claude fix the bug in router.py", "edit"),
+    ("@claude implement caching", "edit"),
+    ("@claude run the tests", "edit"),
+    # Consult intent: pouze review/poradenství, žádná modifikace
+    ("Použij Claude na názor", None),
+    ("Použij Opus, mám otázku ohledně architektury", None),
+    ("@claude what do you think about this approach?", None),
+    ("Použij Sonnet, potřebuju druhý názor", None),
+])
+def test_router_mode_hint_detection(text, expected_mode):
+    """mode_hint=edit když user chce aby Claude něco UDĚLAL, jinak None."""
+    r = decide_route(_u(text))
+    assert r.target == "claude", f"text={text!r}: expected claude, got {r.target}"
+    assert r.mode_hint == expected_mode, (
+        f"text={text!r}: expected mode_hint={expected_mode!r}, got {r.mode_hint!r}"
+    )
+
+
+def test_router_decision_has_mode_hint_field():
+    r = decide_route(_u("ahoj"))
+    assert hasattr(r, "mode_hint")
+    assert r.mode_hint is None or isinstance(r.mode_hint, str)
+
+
+def test_router_mode_hint_none_for_non_claude_route():
+    """Lokální route nesmí mít mode_hint - není relevantní."""
+    r = decide_route(_u("rozsviť obývák"))
+    assert r.target == "local"
+    assert r.mode_hint is None
