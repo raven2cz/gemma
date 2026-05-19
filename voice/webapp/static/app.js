@@ -1725,11 +1725,6 @@ function maybeRenderClaudeResultCard(ev) {
   }
 }
 
-function escapeHtml(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-  }[c]));
-}
 
 // ──────────── Approval modal
 // Approval phrase config - fetchnuto z `/api/approval_config` při startu UI,
