@@ -55,8 +55,15 @@ def test_detect_edit_intent_negative():
 
 def test_claude_ui_state_default(monkeypatch, tmp_path):
     """Default state v isolated XDG_STATE_HOME (codex iter-7)."""
-    monkeypatch.setenv("AGENT_WORKDIR", str(tmp_path))
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
+    # Sibling dirs: workdir a xdg_state pod tmp_path ale OBA navzájem mimo
+    # (= xdg NENÍ child workdiru). Jinak by hardening guard ho odmítl a
+    # fallbacknul na REÁLNÝ HOME (= test polluje user state).
+    wd = tmp_path / "workdir"
+    wd.mkdir()
+    xdg = tmp_path / "xdg_state"
+    xdg.mkdir()
+    monkeypatch.setenv("AGENT_WORKDIR", str(wd))
+    monkeypatch.setenv("XDG_STATE_HOME", str(xdg))
     import importlib
     from voice.agent import config
     importlib.reload(config)
@@ -71,8 +78,15 @@ def test_claude_ui_state_default(monkeypatch, tmp_path):
 
 
 def test_claude_ui_state_persist_round_trip(monkeypatch, tmp_path):
-    monkeypatch.setenv("AGENT_WORKDIR", str(tmp_path))
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
+    # Sibling dirs: workdir a xdg_state pod tmp_path ale OBA navzájem mimo
+    # (= xdg NENÍ child workdiru). Jinak by hardening guard ho odmítl a
+    # fallbacknul na REÁLNÝ HOME (= test polluje user state).
+    wd = tmp_path / "workdir"
+    wd.mkdir()
+    xdg = tmp_path / "xdg_state"
+    xdg.mkdir()
+    monkeypatch.setenv("AGENT_WORKDIR", str(wd))
+    monkeypatch.setenv("XDG_STATE_HOME", str(xdg))
     import importlib
     from voice.agent import config
     importlib.reload(config)
@@ -93,8 +107,15 @@ def test_claude_ui_state_persist_round_trip(monkeypatch, tmp_path):
 
 
 def test_claude_ui_state_corrupt_file(monkeypatch, tmp_path):
-    monkeypatch.setenv("AGENT_WORKDIR", str(tmp_path))
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
+    # Sibling dirs: workdir a xdg_state pod tmp_path ale OBA navzájem mimo
+    # (= xdg NENÍ child workdiru). Jinak by hardening guard ho odmítl a
+    # fallbacknul na REÁLNÝ HOME (= test polluje user state).
+    wd = tmp_path / "workdir"
+    wd.mkdir()
+    xdg = tmp_path / "xdg_state"
+    xdg.mkdir()
+    monkeypatch.setenv("AGENT_WORKDIR", str(wd))
+    monkeypatch.setenv("XDG_STATE_HOME", str(xdg))
     import importlib
     from voice.agent import config
     importlib.reload(config)
@@ -112,11 +133,15 @@ def test_claude_ui_state_corrupt_file(monkeypatch, tmp_path):
     assert state["destructive_approved"] is False
 
 
-def test_claude_ui_state_path_outside_workdir(monkeypatch, tmp_path):
-    """codex iter-7 CRITICAL: state path MUSÍ být mimo workdir (agent
-    write_file by ho jinak mohl přepsat bez approval)."""
-    monkeypatch.setenv("AGENT_WORKDIR", str(tmp_path))
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
+def test_claude_ui_state_path_sibling_xdg_accepted(monkeypatch, tmp_path):
+    """codex iter-7: state path MUSÍ být mimo workdir. Sibling XDG dir
+    (= mimo workdir) je VALID, nemá triggerovat hardening fallback."""
+    wd = tmp_path / "workdir"
+    wd.mkdir()
+    xdg = tmp_path / "xdg_state"
+    xdg.mkdir()
+    monkeypatch.setenv("AGENT_WORKDIR", str(wd))
+    monkeypatch.setenv("XDG_STATE_HOME", str(xdg))
     import importlib
     from voice.agent import config
     importlib.reload(config)
@@ -124,25 +149,61 @@ def test_claude_ui_state_path_outside_workdir(monkeypatch, tmp_path):
     importlib.reload(server)
 
     path = server._claude_ui_state_path()
-    # Pokud XDG je uvnitř workdir, hardening fallback by ho měl odmítnout.
-    # tmp_path / xdg_state je technicky UVNITŘ tmp_path = workdir, takže
-    # path by měl fallback na HOME-based location nebo /tmp.
+    # Sibling xdg dir přijatý - path má být POD xdg_state, NE pod home
+    assert str(xdg) in str(path), f"sibling xdg ignored: path={path}, xdg={xdg}"
+    # A naopak NESMÍ být pod workdir (security invariant)
     workdir_resolved = config.WORKDIR.resolve()
     try:
         path.resolve().relative_to(workdir_resolved)
-        # Pokud jsme tady, path je v workdir → security fail
         assert False, f"path {path} je v workdir {workdir_resolved}"
     except ValueError:
-        # Path je MIMO workdir = OK
-        pass
+        pass  # OK - path mimo workdir
+
+
+def test_claude_ui_state_path_xdg_inside_workdir_rejected(monkeypatch, tmp_path):
+    """codex iter-8 adversarial scenario: pokud user nastaví XDG_STATE_HOME
+    UVNITŘ workdiru, hardening guard MUSÍ ho odmítnout a fallbacknout."""
+    wd = tmp_path / "workdir"
+    wd.mkdir()
+    bad_xdg = wd / "xdg_inside"  # uvnitř workdiru
+    bad_xdg.mkdir()
+    # Nastavit fake HOME taky mimo workdir aby fallback nešel do real HOME
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("AGENT_WORKDIR", str(wd))
+    monkeypatch.setenv("XDG_STATE_HOME", str(bad_xdg))
+    monkeypatch.setenv("HOME", str(fake_home))
+    import importlib
+    from voice.agent import config
+    importlib.reload(config)
+    from voice.webapp import server
+    importlib.reload(server)
+
+    path = server._claude_ui_state_path()
+    # Path NESMÍ být v adversarial xdg (= uvnitř workdir)
+    workdir_resolved = config.WORKDIR.resolve()
+    try:
+        path.resolve().relative_to(workdir_resolved)
+        assert False, f"hardening failed: path {path} v workdir {workdir_resolved}"
+    except ValueError:
+        pass  # OK - guard fallbacknul mimo workdir
+    # Fallback by měl skončit v fake_home/.local/state/...
+    assert str(fake_home) in str(path) or "/tmp" in str(path)
 
 
 def test_claude_ui_phrase_smuggling_rejected(monkeypatch, tmp_path):
     """codex iter-6 HIGH regression: `ano povolujunapiš X` NESMÍ být
     valid přihláška k edit. Phrase MUSÍ končit whitespace/punctuation
     boundary."""
-    monkeypatch.setenv("AGENT_WORKDIR", str(tmp_path))
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
+    # Sibling dirs: workdir a xdg_state pod tmp_path ale OBA navzájem mimo
+    # (= xdg NENÍ child workdiru). Jinak by hardening guard ho odmítl a
+    # fallbacknul na REÁLNÝ HOME (= test polluje user state).
+    wd = tmp_path / "workdir"
+    wd.mkdir()
+    xdg = tmp_path / "xdg_state"
+    xdg.mkdir()
+    monkeypatch.setenv("AGENT_WORKDIR", str(wd))
+    monkeypatch.setenv("XDG_STATE_HOME", str(xdg))
     import importlib
     from voice.agent import config
     importlib.reload(config)
