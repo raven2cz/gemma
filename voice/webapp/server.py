@@ -727,8 +727,18 @@ async def claude_ui_state():
 
 @app.post("/api/claude_ui_state/reset")
 async def claude_ui_state_reset():
-    """Reset Claude mode state (revoke approval, force consult)."""
+    """Reset Claude mode state (revoke approval, force consult).
+
+    Per codex iter-11 HIGH: revoke MUSÍ killnout existující Claude session,
+    jinak edit-capable Claude process běží dál v tmux registry. Order:
+    1) Read old session_id pod lockem
+    2) Write fresh consult state (snapshot stop-the-world)
+    3) Kill old session v adapter mimo lock (kill je async, nedržíme lock).
+    """
+    old_sid: str | None = None
     async with _CLAUDE_STATE_LOCK:
+        cur = _load_claude_ui_state()
+        old_sid = cur.get("claude_session_id")
         _save_claude_ui_state({
             "permission_mode": "consult",
             "destructive_approved": False,
@@ -736,7 +746,14 @@ async def claude_ui_state_reset():
             "model": "opus",
             "approved_at": None,
         })
-    return {"ok": True}
+    # Kill old session v adapter (mimo lock - kill_session může dlouho trvat)
+    if old_sid and _CLAUDE_ADAPTER is not None:
+        try:
+            await _CLAUDE_ADAPTER.kill_session(old_sid)
+            log.info("revoke killed claude session %s", old_sid)
+        except Exception as e:
+            log.warning("revoke kill_session %s failed: %s", old_sid, e)
+    return {"ok": True, "killed_session": old_sid}
 
 
 @app.get("/api/approval_config")
@@ -1861,6 +1878,11 @@ def _load_claude_ui_state() -> dict:
 # HIGH #2 reset race fix).
 _CLAUDE_STATE_LOCK = asyncio.Lock()
 
+# Codex iter-11 HIGH: per-Claude-mode serialization. Bez tohoto dva turny
+# z multi-tab nebo dvojkliku vyrobí dvě tmux sessions s session_id=None,
+# poslední dokončený zápis vyhraje a kontext se ztratí.
+_CLAUDE_TURN_LOCK = asyncio.Lock()
+
 
 def _save_claude_ui_state(state: dict) -> None:
     """Atomic write claude mode state (rename via tmpfile) do XDG_STATE_HOME.
@@ -2117,42 +2139,60 @@ async def _run_claude_turn(
         })
 
     async def driver() -> None:
-        """Run adapter.ask() + push events do out_queue."""
+        """Run adapter.ask() + push events do out_queue.
+
+        Wrapped v _CLAUDE_TURN_LOCK (codex iter-11 HIGH): jeden Claude turn
+        naráz. Multi-tab/dvojklik → druhý request čeká na první.
+        """
         try:
-            # Emit started event so UI sees activity
-            await out_queue.put({
-                "type": "claude_turn_started",
-                "model": model_label,
-                "mode": current_perm,
-            })
-            result = await adapter.ask(
-                prompt=user_text,
-                model=full_model,
-                mode=current_perm,
-                workdir=WORKDIR if current_perm == "edit" else None,
-                session_id=ui_state.get("claude_session_id"),
-                timeout_sec=600.0,
-                cancel_event=turn_state.get("cancel_event"),
-                progress_callback=progress_callback,
-            )
-            # Save session_id pro continuity. Pass current_perm jako expected
-            # aby reset/revoke během turnu nepřepsal session_id zpět (codex iter-6).
-            if result.session_id:
-                await _update_claude_session_id(result.session_id, current_perm)
-            # Emit claude_result event
-            await out_queue.put({
-                "type": "claude_result",
-                "ok": result.ok,
-                "text": result.text,
-                "model": result.model,
-                "mode": result.mode,
-                "session_id": result.session_id,
-                "duration_ms": result.duration_ms,
-                "tool_uses": list(result.tool_uses),
-                "total_cost_usd": result.total_cost_usd,
-                "error": result.error,
-                "adapter": result.adapter,
-            })
+            # Serialize concurrent turns
+            async with _CLAUDE_TURN_LOCK:
+                # Re-read ui_state AŽ pod lockem (state mohl mezi tím změnit
+                # další turn nebo revoke endpoint). Snapshot pro tento turn.
+                fresh_ui_state = _load_claude_ui_state()
+                # Pokud permission_mode mezi tím změnil (= reset proběhl) a
+                # current_perm je edit, abortneme - user musí poslat phrase znovu.
+                if current_perm == "edit" and fresh_ui_state.get("permission_mode") != "edit":
+                    await out_queue.put({
+                        "type": "error",
+                        "msg": "Edit oprávnění bylo zrušeno během turnu. Pošli prompt znovu s 'ano povoluju'.",
+                    })
+                    return
+                effective_session_id = fresh_ui_state.get("claude_session_id")
+                # Emit started event so UI sees activity
+                await out_queue.put({
+                    "type": "claude_turn_started",
+                    "model": model_label,
+                    "mode": current_perm,
+                })
+                result = await adapter.ask(
+                    prompt=user_text,
+                    model=full_model,
+                    mode=current_perm,
+                    workdir=WORKDIR if current_perm == "edit" else None,
+                    session_id=effective_session_id,
+                    timeout_sec=600.0,
+                    cancel_event=turn_state.get("cancel_event"),
+                    progress_callback=progress_callback,
+                )
+                # Save session_id pro continuity. Pass current_perm jako expected
+                # aby reset/revoke během turnu nepřepsal session_id zpět.
+                if result.session_id:
+                    await _update_claude_session_id(result.session_id, current_perm)
+                # Emit claude_result event
+                await out_queue.put({
+                    "type": "claude_result",
+                    "ok": result.ok,
+                    "text": result.text,
+                    "model": result.model,
+                    "mode": result.mode,
+                    "session_id": result.session_id,
+                    "duration_ms": result.duration_ms,
+                    "tool_uses": list(result.tool_uses),
+                    "total_cost_usd": result.total_cost_usd,
+                    "error": result.error,
+                    "adapter": result.adapter,
+                })
         except SessionDead as e:
             await out_queue.put({
                 "type": "claude_session_dead",

@@ -1104,21 +1104,29 @@ async function runTurn() {
             // Final result z Claude adapter - render jako claude_result_card.
             ctx.streamDone = true;
             const card = renderClaudeResultBlock(ev);
+            // Per codex iter-11 HIGH #3: card MUSÍ být v `transcript` (= scrollable),
+            // ne v `.stage` (overflow:hidden grid container = clipped).
             if (card) {
-              const stage = document.querySelector('.stage');
-              if (stage) stage.appendChild(card);
+              transcript.appendChild(card);
+              transcript.scrollTop = transcript.scrollHeight;
             }
-            // Add text do assistant message pokud máme
+            // Add text do assistant message pokud máme + persist pro reload
             if (ev.ok && ev.text) {
               if (state.currentAssistantEl) {
                 const body = document.createElement('div');
                 body.className = 'claude-assistant-text';
                 body.textContent = ev.text;
                 state.currentAssistantEl.appendChild(body);
+              } else {
+                addMessage('assistant', ev.text);
               }
               state.messages.push({ role: 'assistant', content: ev.text });
+              // Persist - bez tohoto Claude turny po reloadu zmizí
+              persistMessages();
             } else if (!ev.ok) {
               addMessage('assistant', `Chyba: ${ev.error || 'unknown'}`);
+              state.messages.push({ role: 'assistant', content: `Chyba: ${ev.error || 'unknown'}` });
+              persistMessages();
             }
             // Refresh permission badge (state mohl být upgrade-ovaný)
             refreshClaudePermBadge();
