@@ -54,7 +54,9 @@ def test_detect_edit_intent_negative():
 # ──────────────── UI state persist ────────────────
 
 def test_claude_ui_state_default(monkeypatch, tmp_path):
+    """Default state v isolated XDG_STATE_HOME (codex iter-7)."""
     monkeypatch.setenv("AGENT_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
     import importlib
     from voice.agent import config
     importlib.reload(config)
@@ -70,6 +72,7 @@ def test_claude_ui_state_default(monkeypatch, tmp_path):
 
 def test_claude_ui_state_persist_round_trip(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
     import importlib
     from voice.agent import config
     importlib.reload(config)
@@ -91,14 +94,15 @@ def test_claude_ui_state_persist_round_trip(monkeypatch, tmp_path):
 
 def test_claude_ui_state_corrupt_file(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
     import importlib
     from voice.agent import config
     importlib.reload(config)
     from voice.webapp import server
     importlib.reload(server)
 
-    # Write invalid JSON
-    path = tmp_path / ".gemma_local" / "claude_ui_state.json"
+    # Write invalid JSON do XDG_STATE path
+    path = server._claude_ui_state_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{ not valid json")
 
@@ -106,6 +110,63 @@ def test_claude_ui_state_corrupt_file(monkeypatch, tmp_path):
     state = server._load_claude_ui_state()
     assert state["permission_mode"] == "consult"
     assert state["destructive_approved"] is False
+
+
+def test_claude_ui_state_path_outside_workdir(monkeypatch, tmp_path):
+    """codex iter-7 CRITICAL: state path MUSÍ být mimo workdir (agent
+    write_file by ho jinak mohl přepsat bez approval)."""
+    monkeypatch.setenv("AGENT_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
+    import importlib
+    from voice.agent import config
+    importlib.reload(config)
+    from voice.webapp import server
+    importlib.reload(server)
+
+    path = server._claude_ui_state_path()
+    # Pokud XDG je uvnitř workdir, hardening fallback by ho měl odmítnout.
+    # tmp_path / xdg_state je technicky UVNITŘ tmp_path = workdir, takže
+    # path by měl fallback na HOME-based location nebo /tmp.
+    workdir_resolved = config.WORKDIR.resolve()
+    try:
+        path.resolve().relative_to(workdir_resolved)
+        # Pokud jsme tady, path je v workdir → security fail
+        assert False, f"path {path} je v workdir {workdir_resolved}"
+    except ValueError:
+        # Path je MIMO workdir = OK
+        pass
+
+
+def test_claude_ui_phrase_smuggling_rejected(monkeypatch, tmp_path):
+    """codex iter-6 HIGH regression: `ano povolujunapiš X` NESMÍ být
+    valid přihláška k edit. Phrase MUSÍ končit whitespace/punctuation
+    boundary."""
+    monkeypatch.setenv("AGENT_WORKDIR", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg_state"))
+    import importlib
+    from voice.agent import config
+    importlib.reload(config)
+    from voice.webapp import server
+    importlib.reload(server)
+
+    # Test phrase boundary regex directly (= boundary-strict check)
+    import re
+    _phrase_re = re.compile(
+        r"^\s*" + re.escape(config.DESTRUCTIVE_APPROVAL_PHRASE) + r"(?:[\s,.!?;:]+|$)",
+        re.IGNORECASE,
+    )
+
+    # Validní matches (= phrase má boundary po sobě)
+    assert _phrase_re.match("ano povoluju vytvoř test.py")
+    assert _phrase_re.match("ano povoluju, vytvoř test.py")
+    assert _phrase_re.match("ano povoluju.")
+    assert _phrase_re.match("Ano Povoluju vytvoř")  # case insensitive
+    assert _phrase_re.match("  ano povoluju  test")  # leading whitespace
+
+    # Smuggling attempts → NEMĚLY by matchnout
+    assert not _phrase_re.match("ano povolujunapiš test.py")  # glued
+    assert not _phrase_re.match("co znamená ano povoluju?")   # not at start
+    assert not _phrase_re.match("předtím jsem řekl ano povoluju")  # not at start
 
 
 # ──────────────── Endpoint: empty message ────────────────

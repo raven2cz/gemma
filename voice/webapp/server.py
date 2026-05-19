@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -1776,9 +1777,39 @@ async def _run_agent_turn(
 # gate. Místo toho používáme XDG state dir (~/.local/state/gemma/) co agent
 # nemůže přepsat (mimo sandbox).
 def _claude_ui_state_path() -> Path:
-    """Vrátí cestu k state file MIMO WORKDIR (agent ho nemůže přepsat)."""
-    xdg = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
-    return Path(xdg) / "gemma" / "claude_ui_state.json"
+    """Vrátí cestu k state file MIMO WORKDIR (agent ho nemůže přepsat).
+
+    Hardening (codex iter-7): pokud by user nastavil XDG_STATE_HOME UVNITŘ
+    workdir, security invariant by padl. Resolved path MUSÍ být mimo WORKDIR;
+    pokud overlap → fallback na HOME-based path.
+    """
+    from voice.agent.config import WORKDIR
+    xdg_env = os.environ.get("XDG_STATE_HOME")
+    candidates = []
+    if xdg_env:
+        candidates.append(Path(xdg_env) / "gemma" / "claude_ui_state.json")
+    candidates.append(Path.home() / ".local" / "state" / "gemma" / "claude_ui_state.json")
+
+    workdir_resolved = WORKDIR.resolve()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            # Path may not exist yet - check parent
+            resolved = candidate.parent.resolve() / candidate.name
+        # Reject pokud je uvnitř (nebo == ) workdir
+        try:
+            resolved.relative_to(workdir_resolved)
+            log.warning(
+                "claude_ui_state path %s is inside WORKDIR %s - falling back",
+                candidate, workdir_resolved,
+            )
+            continue
+        except ValueError:
+            return candidate
+    # Pokud všechny kandidáty selhaly, použij /tmp jako last resort
+    log.error("no safe claude_ui_state path found - using /tmp")
+    return Path("/tmp") / "gemma_claude_ui_state.json"
 
 
 def _default_claude_ui_state() -> dict:
