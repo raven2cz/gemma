@@ -4,6 +4,60 @@
  * State machine:  idle → recording → transcribing → thinking → speaking → idle
  * Any state → error (banner, retry)
  */
+
+// ──────────── Diagnostic logging (musí být PRVNÍ věc před import) ────────────
+// Capture všechny JS errors + unhandled promise rejections + log key init steps.
+// Bez tohoto, když init shodí (např. missing element, syntax error, network
+// fail), UI zůstane prázdné s `…` placeholders a žádná diagnostic info.
+const _APP_INIT_LOG = [];
+function logInit(stage, detail) {
+  const ts = new Date().toISOString().slice(11, 23);
+  const msg = `[init ${ts}] ${stage}` + (detail ? `: ${detail}` : '');
+  _APP_INIT_LOG.push(msg);
+  console.log(msg);
+}
+function logError(label, err) {
+  const detail = err && err.stack ? err.stack : String(err);
+  const msg = `[ERROR ${label}] ${detail}`;
+  _APP_INIT_LOG.push(msg);
+  console.error(msg);
+  // Send to server for webapp.log (best-effort, ne await).
+  try {
+    fetch('/api/client_log', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ level: 'error', label, detail, log: _APP_INIT_LOG.slice(-20) }),
+    }).catch(() => {});
+  } catch {}
+  // Visible banner v UI aby user věděl že něco selhalo i bez DevTools.
+  showInitErrorBanner(label, detail);
+}
+function showInitErrorBanner(label, detail) {
+  try {
+    if (document.getElementById('init-error-banner')) return;
+    const banner = document.createElement('div');
+    banner.id = 'init-error-banner';
+    banner.style.cssText = (
+      'position:fixed;top:0;left:0;right:0;z-index:99999;'
+      + 'background:#7c2d12;color:#fff;padding:10px 16px;'
+      + 'font-family:monospace;font-size:12px;border-bottom:2px solid #ef4444;'
+    );
+    banner.innerHTML = `<strong>App init error [${label}]:</strong> `
+      + `<span style="opacity:0.9">${(detail || '').slice(0, 400)}</span> `
+      + `<button onclick="this.parentNode.remove()" style="float:right;background:transparent;border:1px solid #fff;color:#fff;padding:2px 8px;cursor:pointer">×</button>`;
+    document.body.insertBefore(banner, document.body.firstChild);
+  } catch {}
+}
+window.addEventListener('error', (ev) => {
+  logError('window.onerror',
+    `${ev.message} at ${ev.filename}:${ev.lineno}:${ev.colno}`
+    + (ev.error && ev.error.stack ? '\n' + ev.error.stack : ''));
+});
+window.addEventListener('unhandledrejection', (ev) => {
+  logError('unhandledrejection', ev.reason);
+});
+logInit('script loaded');
+
 import { GlowingOrb } from './orb.js';
 
 const AVATARS = {
@@ -2180,13 +2234,35 @@ transcript.addEventListener('click', (e) => {
   });
 });
 
-// ──────────── Init
+// ──────────── Init (s comprehensive logging - bez něj UI selže tiše)
 (async () => {
-  configureMarked();
-  autoGrowTextarea();
-  setPhase('idle');
-  applyMode(state.mode);
-  await loadHealth();
-  await Promise.all([loadModels(), loadVoices()]);
-  restoreMessages();
+  logInit('init: start');
+  try {
+    logInit('init: configureMarked');
+    configureMarked();
+
+    logInit('init: autoGrowTextarea');
+    autoGrowTextarea();
+
+    logInit('init: setPhase(idle)');
+    setPhase('idle');
+
+    logInit('init: applyMode', state.mode);
+    applyMode(state.mode);
+
+    logInit('init: loadHealth');
+    await loadHealth();
+    logInit('init: loadHealth OK');
+
+    logInit('init: loadModels + loadVoices parallel');
+    await Promise.all([loadModels(), loadVoices()]);
+    logInit('init: models+voices OK');
+
+    logInit('init: restoreMessages');
+    restoreMessages();
+
+    logInit('init: COMPLETE');
+  } catch (err) {
+    logError('init', err);
+  }
 })();

@@ -696,6 +696,28 @@ async def health():
 
 # Single source of truth pro voice approval fráze. Frontend si je natáhne při
 # startu - fallback constants v app.js, ale primárně server (žádný drift).
+@app.post("/api/client_log")
+async def client_log(req: Request):
+    """Frontend posílá JS errors + init log sem aby šlo do webapp.log.
+    Bez tohoto se UI errors ztrácejí v browser console (= invisible)."""
+    try:
+        body = await req.json()
+    except Exception:
+        return {"ok": False}
+    level = (body.get("level") or "info").lower()
+    label = body.get("label", "")
+    detail = body.get("detail", "")
+    log_tail = body.get("log") or []
+    msg = f"[client {label}] {detail}"
+    if level == "error":
+        log.error(msg)
+        for line in log_tail[-10:]:
+            log.error("  %s", line)
+    else:
+        log.info(msg)
+    return {"ok": True}
+
+
 @app.get("/api/claude_ui_state")
 async def claude_ui_state():
     """Vrátí persistent Claude mode state (permission_mode, model, ...).
