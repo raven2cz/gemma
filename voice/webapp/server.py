@@ -1959,15 +1959,31 @@ async def _update_claude_session_id(session_id: str | None, expected_mode: str) 
 
 # Edit intent detection - keywords v user message co indikují edit operaci.
 # Per codex iter-3 #2: bez explicit "ano povoluju" Claude nesmí získat Write/Bash.
+#
+# REÁLNÝ BUG (2026-05-19): User napsal "zkus vytvořit hello2.py" - regex
+# `\bvytvoř\b` nematchoval kvůli word boundary za `ř`. Czech skloňování
+# vyžaduje `\w*` suffix wildcard po kořeni (vytvořit/vytvořím/vytvořila/...).
+# Testy s "vytvoř soubor" (imperativ) prošly, ale "vytvořit" (infinitiv) ne.
 import re as _re
+# Czech kořeny (skloňování přes \w* za kořenem):
+_CZ_ROOTS = (
+    r"vytvo[řr]", r"naps[aá]", r"nap[ií][šs]", r"sma[žz]", r"smaza?",
+    r"uprav", r"zm[eě]n", r"odstra[ňn]", r"odebra?",
+    r"spus[ťt]", r"spou[šs]t", r"prove[ďd]", r"implementuj", r"implementov",
+    r"oprav", r"refaktoruj", r"refactoruj", r"p[řr]idej", r"p[řr]id[aá]",
+    r"zapi[šs]", r"zap[íi][šs]", r"zaps[aá]",
+    r"p[řr]epi[šs]", r"p[řr]ep[íi][šs]", r"p[řr]epsa?",
+    r"genera?", r"vygenera?", r"ud[eě]l",  # udělej/udělat/uděláme/udělal
+)
+# English roots (modify/run/...) - žádné skloňování, ale `\w*` pro -ing/-ed/-s:
+_EN_ROOTS = (
+    r"creat", r"writ", r"wrote", r"edit", r"modif", r"chang",
+    r"delet", r"remov", r"implement", r"fix",
+    r"refactor", r"add", r"updat", r"run", r"ran", r"execut",
+    r"generat", r"build", r"built",
+)
 _CLAUDE_EDIT_INTENT_RE = _re.compile(
-    r"(?ix)\b(?:"
-    r"vytvoř|vytvor|napiš|napis|uprav|změň|zmen|smaž|smaz|"
-    r"odstraň|odstran|spusť|spust|provedl?|implementuj|opravi?|"
-    r"refaktoruj|refactoruj|přidej|pridej|odeber|zapiš|zapis|"
-    r"create|write|edit|modify|change|delete|remove|implement|fix|"
-    r"refactor|add|update|run|execute"
-    r")\b"
+    r"(?ix)\b(?:" + "|".join(r + r"\w*" for r in _CZ_ROOTS + _EN_ROOTS) + r")\b"
 )
 
 

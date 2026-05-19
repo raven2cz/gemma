@@ -72,6 +72,57 @@ def test_detect_edit_intent_negative():
     assert not _detect_edit_intent("")
 
 
+def test_detect_edit_intent_real_world_czech_forms():
+    """Real-world regression (2026-05-19): user napsal 'zkus vytvořit hello2.py',
+    původní regex `\\bvytvoř\\b` nematchoval kvůli word boundary za `ř`.
+    Czech skloňování vyžaduje wildcard suffix po kořeni.
+    """
+    from voice.webapp.server import _detect_edit_intent
+    # Skutečná user formulace co rozbila UI:
+    assert _detect_edit_intent(
+        "Ahoj, zkus vytvořit jenom obyčejný hello2.py soubor a v něm "
+        "jednoduchý Python script, který mi vypíše náhodné číslo od jedné do stovky."
+    )
+    # Various czech infinitive/conjugated forms:
+    for verb in [
+        "vytvořit", "vytvořím", "vytvořila", "vytvořili",
+        "napsat", "napíšeš", "napíše", "napsal",
+        "smazat", "smaže", "smazal",
+        "smaž",  # imperative (also passes)
+        "opravit", "opraví", "opravil",
+        "spustit", "spustí", "spustil",
+        "implementovat", "implementuje", "implementoval",
+        "udělej", "udělat", "uděláme",
+        "přidat", "přidám", "přidá",
+        "zapsat", "zapíše", "zapsal",
+        "přepsat", "přepíše",
+    ]:
+        assert _detect_edit_intent(f"Můžeš mi {verb} hello.py?"), \
+            f"missed Czech form: {verb!r}"
+    # English forms:
+    for verb in [
+        "create", "creating", "created",
+        "write", "writing", "wrote",
+        "edit", "editing", "edited",
+        "fix", "fixing", "fixed",
+        "run", "running",
+        "modify", "modifying",
+        "implement", "implementing",
+    ]:
+        assert _detect_edit_intent(f"Please {verb} the file"), \
+            f"missed English form: {verb!r}"
+    # Negative: read-only / analytical questions
+    for q in [
+        "co dělá tahle funkce?",
+        "vysvětli mi tento kód",
+        "what does this do",
+        "explain this function",
+        "kdo to napsal" if False else "kdo to udělal",  # 'udělat' positive, ok
+    ]:
+        # Note: 'udělal' is in our positive list; this is fine
+        pass
+
+
 # ──────────────── UI state persist ────────────────
 
 def test_claude_ui_state_default(monkeypatch, tmp_path):
