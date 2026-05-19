@@ -1554,32 +1554,13 @@ async def _run_agent_turn(
     # (user uvidí text v UI, ne uslyší).
     effective_tts = want_tts and tts_scope != "off"
 
-    # Per-turn router rozhodnutí + injection do system promptu pro deterministic
-    # delegaci na ask_claude když user explicitně řekl "použij Claude/Opus/Sonnet".
-    # Bez tohoto Gemma může explicit directive ignorovat (soft routing nestačí).
+    # Fáze 6: inject_directive odstraněn. Aktivační fráze "použij Claude/Opus/
+    # Sonnet" se v agent módu už netrigerují ask_claude tool call (ten je pryč),
+    # ale na frontendu spustí mode switch na claude (voice intent detection).
+    # Router stále existuje pro analytics/audit log, ale neovlivňuje turn.
     from voice.agent.router import decide_route
     _route = decide_route(messages)
-    inject_directive = ""
-    if _route.target == "claude" and _route.confidence == "high":
-        model_arg = f', model="{_route.model_hint}"' if _route.model_hint else ""
-        # Agent-mode policy: vždy mode="edit", consult zde nedává smysl
-        # (Claude by neměl FS přístup a user se ptal proč nevidí soubory).
-        # Defense-in-depth: loop.py override stejně přepne consult → edit
-        # pokud Gemma direktivu ignoruje.
-        inject_directive = (
-            "\n\nUŽIVATEL EXPLICITNĚ POŽÁDAL O DELEGACI NA CLAUDE. "
-            "JAKO PRVNÍ a JEDINOU akci v tomto turnu zavolej tool "
-            f"`ask_claude(prompt=<celý user dotaz>, mode=\"edit\"{model_arg})`. "
-            "VŽDY používej `mode=\"edit\"` - Claude tak má přístup k workdir "
-            "a může reálně číst/editovat/spustit věci. NIKDY nepoužívej "
-            "`mode=\"consult\"` v agent módu (Claude by neviděl soubory). "
-            "NEDĚLEJ nic jiného před tímto voláním (žádné fs_read, žádné run_bash)."
-        )
-    # Uložit model_hint do turn_state - loop ho propaguje do ExecuteContext.
-    turn_state["model_hint"] = _route.model_hint
-
-    history = _build_agent_messages(messages, user_lang, effective_tts,
-                                    extra_system=inject_directive)
+    history = _build_agent_messages(messages, user_lang, effective_tts)
     audit_log = AuditLog(AUDIT_DIR)
     agent = AgentLoop(
         model=model,

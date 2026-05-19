@@ -792,11 +792,13 @@ async def test_loop_malformed_args_does_not_execute_tool(tmp_path: Path):
 # ──────────────── ask_claude agent-mode policy: vždy mode="edit" ────────────────
 
 
+@pytest.mark.skip(reason="Fáze 6: ask_claude tool odstraněn z agent registry; "
+                        "Claude přístupný jen přes mode=claude server endpoint")
 @pytest.mark.asyncio
 @pytest.mark.parametrize("gemma_mode,expected_in_event", [
-    ("consult", "edit"),  # Gemma poslala consult → override na edit
-    (None, "edit"),       # Gemma neposlala mode vůbec → default na edit
-    ("edit", "edit"),     # Gemma poslala edit → ponechat
+    ("consult", "edit"),
+    (None, "edit"),
+    ("edit", "edit"),
 ])
 async def test_loop_ask_claude_agent_mode_always_edit(
     tmp_path: Path, gemma_mode, expected_in_event,

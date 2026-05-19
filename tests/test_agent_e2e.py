@@ -1804,6 +1804,7 @@ async def test_e2e_agent_light_set_invalid_color_denied(client):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20)
+@pytest.mark.skip(reason="Fáze 6: ask_claude tool odstraněn; testy migrované do tests/test_claude_mode_endpoint.py")
 async def test_e2e_agent_ask_claude_policy_override_to_edit(client):
     """User policy: v agent módu ask_claude VŽDY mode='edit', i když Gemma
     pošle consult. Test E2E flow:
@@ -1911,6 +1912,7 @@ async def test_e2e_agent_ask_claude_policy_override_to_edit(client):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(20)
+@pytest.mark.skip(reason="Fáze 6: ask_claude tool odstraněn; progress events teď v claude mode")
 async def test_e2e_agent_ask_claude_progress_events_visible_in_stream(client):
     """Regression test: bridge → loop → server NDJSON stream chain pro
     tool_progress eventy MUSÍ doručit progress (thinking/tool_use/text) až
