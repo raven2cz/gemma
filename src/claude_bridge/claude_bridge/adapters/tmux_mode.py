@@ -151,19 +151,36 @@ class TmuxAdapter:
         self._metadata_path: Path | None = None
         if config.metadata_dir:
             self._metadata_path = Path(config.metadata_dir) / "claude_sessions.json"
+        # Dedicated tmux socket - izolace od user's default tmux server (codex
+        # iter-3 CRITICAL #1). Bez `-L` by jsme sdíleli env tmux serveru +
+        # mohli zabít user's sessions. Socket name odvozený od session prefix.
+        self._tmux_socket_name = f"claude_bridge_{config.tmux_session_prefix.rstrip('_')}"
+
+    def _build_scrubbed_env(self) -> dict[str, str]:
+        """Filtruj parent env na allowlist + LC_*. Aplikováno na tmux subprocess
+        i na spawned claude (přes `new-session -e`)."""
+        allow = frozenset(self.config.env_allowlist)
+        out: dict[str, str] = {}
+        for k, v in os.environ.items():
+            if k in allow or k.startswith("LC_"):
+                out[k] = v
+        return out
 
     # ──────────────── tmux subprocess primitives ────────────────
 
     async def _tmux(self, *args: str, capture: bool = True,
                     timeout: float = 5.0) -> tuple[int, bytes, bytes]:
-        """Spustí tmux <args>, vrátí (returncode, stdout, stderr).
+        """Spustí tmux <args> na našem dedicated socket (`-L <socket>`).
 
-        Krátký command s timeout (5s default). Pro spawn use _tmux_spawn.
+        Izolace od user's tmux server (codex iter-3 CRITICAL #1). Tmux subprocess
+        + spawned claude běží v scrubbed env (allowlist filter).
         """
+        env = self._build_scrubbed_env()
         proc = await asyncio.create_subprocess_exec(
-            self.config.tmux_bin, *args,
+            self.config.tmux_bin, "-L", self._tmux_socket_name, *args,
             stdout=asyncio.subprocess.PIPE if capture else None,
             stderr=asyncio.subprocess.PIPE if capture else None,
+            env=env,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -200,7 +217,15 @@ class TmuxAdapter:
         `literal=True` (default) použije `-l` flag aby tmux nezpracovával
         special sequences (Enter, Ctrl-C, atd.). Použij `literal=False` pro
         explicit key names (Enter, Escape, C-c).
+
+        SECURITY (sonnet review H2): newline v literal text mode by způsobil
+        accidental Enter (= predčasný submit v Claude TUI). Replace `\\r\\n`
+        a `\\n` na single space PŘED send. Multi-line prompty MUSÍ caller
+        explicitly použít separate send + literal=False C-j (Shift+Enter).
         """
+        if literal:
+            # Strip CRLF/LF aby se neproste interpretovaly jako Enter
+            text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
         args = ["send-keys", "-t", session_id]
         if literal:
             args.append("-l")
@@ -412,26 +437,65 @@ class TmuxAdapter:
     async def reattach_persisted_sessions(self) -> None:
         """Při startu načti persisted sessions, ověř integrity, registruj.
 
-        Per codex iter-2 #9:
+        Per codex iter-2 #9 + iter-3 #5:
+        - Metadata corrupt/malformed → fail-closed: kill ALL adapter sessions
+          v tmux (= unsafe state, nevíme co je trustworthy)
         - tmux has-session neexistuje → smazat z metadata, skip
         - Integrity FAIL (phrase_hash mismatch) → kill tmux + smazat metadata
         - Tmux session bez metadata (orphan) → kill + ignore
+
+        Schema: top-level {"version": "v1", "sessions": {sid: {...}}}
+        Session: {session_id, owner, workdir, model, permission_mode,
+                  created_at, last_active, approval?, turn_count, state}
         """
         if not self._metadata_path or not self._metadata_path.exists():
             return
+
+        # Fail-closed parse
         try:
             data = json.loads(self._metadata_path.read_text())
         except (json.JSONDecodeError, OSError) as e:
-            log.warning("metadata file corrupt, ignoring: %s", e)
+            log.warning("metadata file corrupt - kill all adapter sessions: %s", e)
+            await self._kill_all_adapter_sessions()
+            return
+
+        # Schema validation
+        if not isinstance(data, dict):
+            log.warning("metadata not a dict - fail-closed")
+            await self._kill_all_adapter_sessions()
+            return
+        if data.get("version") != "v1":
+            log.warning("metadata version unsupported: %r - fail-closed",
+                        data.get("version"))
+            await self._kill_all_adapter_sessions()
+            return
+        sessions_dict = data.get("sessions")
+        if not isinstance(sessions_dict, dict):
+            log.warning("metadata.sessions not a dict - fail-closed")
+            await self._kill_all_adapter_sessions()
             return
 
         valid_ids: set[str] = set()
-        for sid, meta in (data.get("sessions") or {}).items():
+        for sid, meta in sessions_dict.items():
+            if not isinstance(sid, str) or not sid.startswith(
+                    self.config.tmux_session_prefix):
+                continue  # invalid sid
+            if not isinstance(meta, dict):
+                log.warning("metadata for %s not a dict - skip", sid)
+                continue
             if not await self._has_session(sid):
                 continue  # session zmizela, skip
             permission_mode = meta.get("permission_mode")
+            if permission_mode not in ("consult", "edit"):
+                log.warning("invalid permission_mode for %s - kill", sid)
+                await self._kill_tmux_session(sid)
+                continue
             if permission_mode == "edit":
                 approval = meta.get("approval") or {}
+                if not isinstance(approval, dict):
+                    log.warning("approval not dict for %s - kill", sid)
+                    await self._kill_tmux_session(sid)
+                    continue
                 expected_hash = self._compute_phrase_hash(sid, "ano povoluju")
                 if approval.get("phrase_hash") != expected_hash:
                     log.warning("integrity check failed for %s - killing orphan", sid)
@@ -453,7 +517,9 @@ class TmuxAdapter:
             )
             valid_ids.add(sid)
 
-        # Kill orphan tmux sessions (claude_* without metadata entry)
+        # Kill orphan tmux sessions (claude_* without metadata entry).
+        # POZN: tmux operuje na našem dedicated socket (-L), takže list-sessions
+        # vrátí JEN naše sessions, nikdy user's default tmux server.
         rc, stdout, _ = await self._tmux("list-sessions", "-F", "#{session_name}")
         if rc == 0:
             for line in stdout.decode(errors="replace").splitlines():
@@ -462,6 +528,20 @@ class TmuxAdapter:
                         and sid not in valid_ids):
                     log.warning("killing unsafe orphan session: %s", sid)
                     await self._kill_tmux_session(sid)
+
+    async def _kill_all_adapter_sessions(self) -> None:
+        """Fail-closed cleanup: zabít všechny sessions s naším prefix
+        na našem dedicated socket. Použito pokud metadata file je corrupt
+        a nemůžeme rozhodnout které sessions jsou trustworthy."""
+        rc, stdout, _ = await self._tmux("list-sessions", "-F", "#{session_name}")
+        if rc != 0:
+            return
+        for line in stdout.decode(errors="replace").splitlines():
+            sid = line.strip()
+            if sid.startswith(self.config.tmux_session_prefix):
+                log.warning("fail-closed cleanup: killing %s", sid)
+                await self._kill_tmux_session(sid)
+        self._sessions.clear()
 
     # ──────────────── ask() implementation ────────────────
 
@@ -588,17 +668,50 @@ class TmuxAdapter:
         # Count completion footers PRED send (baseline pro race fix)
         pre_completion_count = len(_TURN_COMPLETION_RE.findall(pre_capture_clean))
         while time.monotonic() < deadline:
-            # Cancel check
+            # Cancel check (codex iter-3 HIGH #4: confirm Claude actually stopped)
             if cancel_event is not None and cancel_event.is_set():
                 session._cancel_requested = True
+                session.state = "CANCELING"
                 await self._send_escape_twice(session.session_id)
-                session.state = "READY"
+                # Wait pro confirm: Claude must show idle prompt nebo new ✻ marker
+                # do 5s. Jinak označíme session DEAD (Claude ignoroval Esc).
+                cancel_deadline = time.monotonic() + 5.0
+                cancel_confirmed = False
+                while time.monotonic() < cancel_deadline:
+                    await asyncio.sleep(0.25)
+                    raw = await self._capture_pane(session.session_id)
+                    if not raw:
+                        continue
+                    raw_clean = strip_ansi(raw)
+                    # Buď spinner zmizel + ready prompt, NEBO completion footer
+                    if session.tui is not None:
+                        session.tui.feed(raw)
+                    new_completion = len(_TURN_COMPLETION_RE.findall(raw_clean))
+                    if new_completion > pre_completion_count:
+                        cancel_confirmed = True
+                        break
+                    if session.tui is not None and session.tui.is_ready() \
+                            and not session.tui.is_thinking():
+                        cancel_confirmed = True
+                        break
                 duration_ms = int((time.monotonic() - start) * 1000)
-                return ClaudeResult(
-                    ok=False, mode=session.permission_mode,
-                    error="canceled", canceled=True, adapter="tmux",
-                    session_id=session.session_id, duration_ms=duration_ms,
-                )
+                if cancel_confirmed:
+                    session.state = "READY"
+                    return ClaudeResult(
+                        ok=False, mode=session.permission_mode,
+                        error="canceled", canceled=True, adapter="tmux",
+                        session_id=session.session_id, duration_ms=duration_ms,
+                    )
+                else:
+                    # Claude ignoroval Esc → session DEAD (terminal, no retry).
+                    session.state = "DEAD"
+                    await self._persist_metadata()
+                    return ClaudeResult(
+                        ok=False, mode=session.permission_mode,
+                        error="cancel timeout - Claude ignored Esc, session DEAD",
+                        canceled=True, adapter="tmux",
+                        session_id=session.session_id, duration_ms=duration_ms,
+                    )
 
             await asyncio.sleep(_POLL_INTERVAL_SEC)
             raw = await self._capture_pane(session.session_id)
@@ -638,6 +751,9 @@ class TmuxAdapter:
             # MUSÍ být new marker (count > pre_completion_count) aby jsme
             # nezachytili starý marker z reused session scrollback.
             # Strip ANSI před regex (raw obsahuje color codes mezi znaky).
+            # Codex iter-3 HIGH #3: ●-count fallback ODSTRANĚN - byl unreliable
+            # (● je response start marker, ne completion). Jediný spolehlivý
+            # signál je `✻ <Verb> for Ns` footer (post-completion).
             raw_clean = strip_ansi(raw)
             current_completion_count = len(_TURN_COMPLETION_RE.findall(raw_clean))
             if current_completion_count > pre_completion_count:
@@ -648,17 +764,6 @@ class TmuxAdapter:
                 if raw_final:
                     session.last_capture = raw_final
                 break
-            # Backup detection: response marker count increased
-            current_marker_count = raw.count("● ") + raw.count("⏺ ")
-            if current_marker_count > pre_marker_count:
-                # New ● marker appeared (= Claude response). Wait krátce.
-                await asyncio.sleep(0.5)
-                raw_final = await self._capture_pane(session.session_id)
-                if raw_final:
-                    session.last_capture = raw_final
-                # Check že Crunched objevil (= response really done)
-                if "✻" in raw_final or raw_final.count("● ") + raw_final.count("⏺ ") > pre_marker_count:
-                    break
         else:
             # timeout - session DEAD (codex iter-2 #13, no respawn)
             session.state = "DEAD"
