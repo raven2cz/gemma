@@ -1769,32 +1769,38 @@ async def _run_agent_turn(
 #           "claude_session_id": str | None,
 #           "model": "opus"|"sonnet"|"haiku",
 #           "approved_at": timestamp | None }
-_CLAUDE_UI_STATE_FILE = ".gemma_local/claude_ui_state.json"
+#
+# CRITICAL (codex iter-6): state file MUSÍ být MIMO WORKDIR. Pokud by byl v
+# workdiru, agent write_file/edit_file (AUTO permission v sandbox) by mohl
+# přepsat permission_mode na "edit" bez user approval → bypass destructive
+# gate. Místo toho používáme XDG state dir (~/.local/state/gemma/) co agent
+# nemůže přepsat (mimo sandbox).
+def _claude_ui_state_path() -> Path:
+    """Vrátí cestu k state file MIMO WORKDIR (agent ho nemůže přepsat)."""
+    xdg = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(xdg) / "gemma" / "claude_ui_state.json"
+
+
+def _default_claude_ui_state() -> dict:
+    return {
+        "permission_mode": "consult",
+        "destructive_approved": False,
+        "claude_session_id": None,
+        "model": "opus",
+        "approved_at": None,
+    }
 
 
 def _load_claude_ui_state() -> dict:
-    """Načti persistent claude mode state z `.gemma_local/`."""
-    from voice.agent.config import WORKDIR
-    path = WORKDIR / _CLAUDE_UI_STATE_FILE
+    """Načti persistent claude mode state z XDG_STATE_HOME (NE workdir)."""
+    path = _claude_ui_state_path()
     if not path.exists():
-        return {
-            "permission_mode": "consult",
-            "destructive_approved": False,
-            "claude_session_id": None,
-            "model": "opus",
-            "approved_at": None,
-        }
+        return _default_claude_ui_state()
     try:
         return json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         log.warning("claude_ui_state.json corrupt, using defaults")
-        return {
-            "permission_mode": "consult",
-            "destructive_approved": False,
-            "claude_session_id": None,
-            "model": "opus",
-            "approved_at": None,
-        }
+        return _default_claude_ui_state()
 
 
 # Single-worker assumption (per sonnet review). Aplikujeme asyncio.Lock pro
@@ -1804,13 +1810,12 @@ _CLAUDE_STATE_LOCK = asyncio.Lock()
 
 
 def _save_claude_ui_state(state: dict) -> None:
-    """Atomic write claude mode state (rename via tmpfile).
+    """Atomic write claude mode state (rename via tmpfile) do XDG_STATE_HOME.
 
-    POZOR: pro merge logic použij `_update_claude_session_id` ne přímý save -
-    jinak konkurenční turn může přepsat reset.
+    POZOR: caller MUSÍ držet _CLAUDE_STATE_LOCK aby concurrent writes nepřepisovaly
+    stale data. Pro partial updates použij `_update_claude_session_id`.
     """
-    from voice.agent.config import WORKDIR
-    path = WORKDIR / _CLAUDE_UI_STATE_FILE
+    path = _claude_ui_state_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
@@ -1855,15 +1860,24 @@ async def _init_claude_adapter():
     return adapter
 
 
-async def _update_claude_session_id(session_id: str) -> None:
-    """Merge-update jen `claude_session_id` (codex iter-5 HIGH #2).
+async def _update_claude_session_id(session_id: str | None, expected_mode: str) -> None:
+    """Merge-update `claude_session_id` jen pokud current `permission_mode`
+    pořád odpovídá `expected_mode` (codex iter-6 HIGH).
 
-    Tím se vyhneme race: in-flight edit turn drží starý ui_state, reset
-    pozhneme state na consult, ale potom dořešený turn zapíše stale dict
-    s permission_mode=edit. Fix: re-read aktuální state před partial update.
+    Race scenario: edit turn běží + user clicked reset → state se přepne na
+    consult. Turn dokončí + zavolá update s edit session_id. Bez mode-check
+    by se edit session_id vrátil do consult state. Fix: skip update pokud
+    mode už není ten co byl při start turn (reset perspective wins).
     """
     async with _CLAUDE_STATE_LOCK:
         current = _load_claude_ui_state()
+        if current.get("permission_mode") != expected_mode:
+            log.info(
+                "skipping session_id update: mode changed (%s → %s) - "
+                "likely reset/revoke during turn",
+                expected_mode, current.get("permission_mode"),
+            )
+            return
         current["claude_session_id"] = session_id
         _save_claude_ui_state(current)
 
@@ -1955,39 +1969,43 @@ async def _run_claude_turn(
     }
     full_model = _MODEL_ALIAS[model_label]
 
-    # ClaudeModePermissionGate (codex iter-5 CRITICAL: phrase upgrade NESMÍ být
-    # standalone substring match - user dotaz "co znamená 'ano povoluju'?" by
-    # přepnul state na edit. Phrase upgrade vyžaduje BOTH:
-    #   1) explicit edit intent v user message (wants_edit)
-    #   2) phrase v user message (has_phrase)
-    # Plus: phrase musí být na začátku message (strip prefix), ne kdekoli.
-    # Tím se vyhneme i sonnet HIGH "phrase smuggling".
+    # ClaudeModePermissionGate (codex iter-5 + iter-6):
+    # Phrase upgrade vyžaduje VŠECHNY:
+    #   1) phrase na začátku user message + word boundary (codex iter-6 HIGH):
+    #      `ano povoluju ` ano, `ano povolujunapiš` NE (akceptováno by spustilo edit
+    #      bez explicit user intent).
+    #   2) edit intent v strip-nutém promptu (po phrase + boundary)
+    #   3) current_perm == "consult" (immutable invariant - upgrade jen z consult)
+    # State write pod _CLAUDE_STATE_LOCK (codex iter-6 HIGH: race fix).
     wants_edit = _detect_edit_intent(user_text)
     current_perm = ui_state.get("permission_mode", "consult")
 
-    # Check phrase: musí být na začátku user message (po stripped whitespace).
     from voice.agent.config import DESTRUCTIVE_APPROVAL_PHRASE
-    user_text_lower = user_text.lower().strip()
-    phrase_lower = DESTRUCTIVE_APPROVAL_PHRASE.lower()
-    has_phrase = user_text_lower.startswith(phrase_lower)
-    # Strip phrase z user message před forward do Claude (jinak Claude
-    # dostane "ano povoluju vytvoř test.py" - matoucí).
+    # Boundary-strict regex: phrase MUSÍ končit whitespace nebo punctuation.
+    # `re.escape` aby případné special chars v fráze neselhaly.
+    _phrase_re = _re.compile(
+        r"^\s*" + _re.escape(DESTRUCTIVE_APPROVAL_PHRASE) + r"(?:[\s,.!?;:]+|$)",
+        _re.IGNORECASE,
+    )
+    phrase_match = _phrase_re.match(user_text)
+    has_phrase = phrase_match is not None
     if has_phrase:
-        user_text_stripped = user_text.lstrip()[len(DESTRUCTIVE_APPROVAL_PHRASE):].lstrip()
-        # Re-check wants_edit na strip-nutém prompt
+        user_text_stripped = user_text[phrase_match.end():].lstrip()
         wants_edit_stripped = _detect_edit_intent(user_text_stripped)
     else:
         user_text_stripped = user_text
         wants_edit_stripped = wants_edit
 
     if has_phrase and wants_edit_stripped and current_perm == "consult":
-        # Explicit phrase + edit intent → toggle edit ON + force new session.
-        # Permission immutable per Claude process - invalidate session_id.
-        ui_state["permission_mode"] = "edit"
-        ui_state["destructive_approved"] = True
-        ui_state["approved_at"] = time.time()
-        ui_state["claude_session_id"] = None
-        _save_claude_ui_state(ui_state)
+        # Atomic state update pod lockem (codex iter-6 HIGH state lock fix)
+        async with _CLAUDE_STATE_LOCK:
+            fresh = _load_claude_ui_state()
+            fresh["permission_mode"] = "edit"
+            fresh["destructive_approved"] = True
+            fresh["approved_at"] = time.time()
+            fresh["claude_session_id"] = None
+            _save_claude_ui_state(fresh)
+            ui_state = fresh  # use fresh for rest of this turn
         current_perm = "edit"
         # Forward strip-nutý prompt do Claude
         user_text = user_text_stripped
@@ -2064,9 +2082,10 @@ async def _run_claude_turn(
                 cancel_event=turn_state.get("cancel_event"),
                 progress_callback=progress_callback,
             )
-            # Save session_id pro continuity (merge-update, codex iter-5 HIGH #2)
+            # Save session_id pro continuity. Pass current_perm jako expected
+            # aby reset/revoke během turnu nepřepsal session_id zpět (codex iter-6).
             if result.session_id:
-                await _update_claude_session_id(result.session_id)
+                await _update_claude_session_id(result.session_id, current_perm)
             # Emit claude_result event
             await out_queue.put({
                 "type": "claude_result",
@@ -2086,8 +2105,8 @@ async def _run_claude_turn(
                 "type": "claude_session_dead",
                 "msg": str(e),
             })
-            # Reset session_id (merge-style, codex iter-5 HIGH #2)
-            await _update_claude_session_id(None)
+            # Reset session_id (merge-style, mode-check)
+            await _update_claude_session_id(None, current_perm)
         except SessionBusy as e:
             await out_queue.put({
                 "type": "error",
