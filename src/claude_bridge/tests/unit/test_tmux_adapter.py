@@ -211,3 +211,51 @@ async def test_health_check_unknown_session():
     adapter = TmuxAdapter(config)
     state = await adapter.health_check("unknown_id")
     assert state == "DEAD"
+
+
+# ──────────────── Send-keys newline sanitization (sonnet H2) ────────────────
+
+@pytest.mark.asyncio
+async def test_send_keys_strips_newlines_in_literal_mode(monkeypatch):
+    """Literal text s \\n / \\r\\n musí být sanitizovaný (= replaced spaces),
+    jinak by tmux interpretoval newline jako Enter (= predčasný submit)."""
+    from claude_bridge.adapters.tmux_mode import TmuxAdapter
+    config = AdapterConfig(mode=BridgeMode.TMUX)
+    adapter = TmuxAdapter(config)
+
+    captured_args: list[tuple[str, ...]] = []
+
+    async def fake_tmux(*args, **kwargs):
+        captured_args.append(args)
+        return 0, b"", b""
+
+    monkeypatch.setattr(adapter, "_tmux", fake_tmux)
+
+    await adapter._send_keys("sid", "line1\nline2", literal=True)
+    # Args: ("send-keys", "-t", "sid", "-l", "line1 line2")
+    assert captured_args[0][-1] == "line1 line2"
+
+    captured_args.clear()
+    await adapter._send_keys("sid", "a\r\nb\r\nc", literal=True)
+    assert captured_args[0][-1] == "a b c"
+
+
+@pytest.mark.asyncio
+async def test_send_keys_preserves_newlines_in_non_literal_mode(monkeypatch):
+    """Non-literal mode (key names) - žádná sanitace (caller posílá `Enter`)."""
+    from claude_bridge.adapters.tmux_mode import TmuxAdapter
+    config = AdapterConfig(mode=BridgeMode.TMUX)
+    adapter = TmuxAdapter(config)
+
+    captured_args: list[tuple[str, ...]] = []
+
+    async def fake_tmux(*args, **kwargs):
+        captured_args.append(args)
+        return 0, b"", b""
+
+    monkeypatch.setattr(adapter, "_tmux", fake_tmux)
+
+    # literal=False = key name mode, žádný `-l` flag, žádná sanitace
+    await adapter._send_keys("sid", "Enter", literal=False)
+    assert "Enter" in captured_args[0]
+    assert "-l" not in captured_args[0]

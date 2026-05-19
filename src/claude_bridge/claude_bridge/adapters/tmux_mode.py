@@ -1,4 +1,4 @@
-"""TmuxAdapter - drive `claude` interactive v tmux session (experimental).
+r"""TmuxAdapter - drive `claude` interactive v tmux session (experimental).
 
 Detection markers (ověřeno z claude-code source 2.1.141):
 - `❯` (U+276F figures.pointer): user input prompt indicator
@@ -483,11 +483,36 @@ class TmuxAdapter:
             if not isinstance(meta, dict):
                 log.warning("metadata for %s not a dict - skip", sid)
                 continue
+            # Per-session schema validation (codex iter-4: full type checks
+            # aby malformed metadata nezpůsobila TypeError při Path(wd) etc.)
+            if meta.get("session_id") != sid:
+                log.warning("metadata sid mismatch for %s - kill", sid)
+                await self._kill_tmux_session(sid)
+                continue
             if not await self._has_session(sid):
                 continue  # session zmizela, skip
             permission_mode = meta.get("permission_mode")
             if permission_mode not in ("consult", "edit"):
                 log.warning("invalid permission_mode for %s - kill", sid)
+                await self._kill_tmux_session(sid)
+                continue
+            model = meta.get("model")
+            if not isinstance(model, str) or not model:
+                log.warning("invalid model for %s - kill", sid)
+                await self._kill_tmux_session(sid)
+                continue
+            wd = meta.get("workdir")
+            if wd is not None and not isinstance(wd, str):
+                log.warning("invalid workdir type for %s - kill", sid)
+                await self._kill_tmux_session(sid)
+                continue
+            created_at = meta.get("created_at")
+            last_active = meta.get("last_active")
+            turn_count = meta.get("turn_count", 0)
+            if not isinstance(created_at, (int, float)) \
+                    or not isinstance(last_active, (int, float)) \
+                    or not isinstance(turn_count, int):
+                log.warning("invalid timestamps/counter for %s - kill", sid)
                 await self._kill_tmux_session(sid)
                 continue
             if permission_mode == "edit":
@@ -502,16 +527,15 @@ class TmuxAdapter:
                     await self._kill_tmux_session(sid)
                     continue
             # Valid - register
-            wd = meta.get("workdir")
             self._sessions[sid] = _TmuxSession(
                 session_id=sid,
                 workdir=Path(wd) if wd else None,
-                model=meta.get("model", "claude-opus-4-7"),
-                permission_mode=permission_mode or "consult",
-                created_at=meta.get("created_at", time.time()),
-                last_active=meta.get("last_active", time.time()),
+                model=model,
+                permission_mode=permission_mode,
+                created_at=float(created_at),
+                last_active=float(last_active),
                 destructive_approved=bool(meta.get("approval")),
-                turn_count=meta.get("turn_count", 0),
+                turn_count=turn_count,
                 state="READY",
                 tui=TuiState(cols=_TMUX_COLS, rows=_TMUX_ROWS),
             )
@@ -661,11 +685,10 @@ class TmuxAdapter:
         # a wait pokud count INCREASED (nový marker = aktuální turn done).
         deadline = start + timeout_sec
         thinking_emitted = False
-        # Count `●`/`⏺` markers PRED send (baseline)
-        # POZN: raw capture obsahuje ANSI codes mezi znaky → strip_ansi PŘED count.
+        # Count completion footers PRED send (baseline pro race fix - reused
+        # tmux session má v scrollback starý `✻ <Verb> for Ns` marker, jen new
+        # marker příznak aktuálního turnu done). Strip ANSI před regex.
         pre_capture_clean = strip_ansi(before_capture)
-        pre_marker_count = pre_capture_clean.count("● ") + pre_capture_clean.count("⏺ ")
-        # Count completion footers PRED send (baseline pro race fix)
         pre_completion_count = len(_TURN_COMPLETION_RE.findall(pre_capture_clean))
         while time.monotonic() < deadline:
             # Cancel check (codex iter-3 HIGH #4: confirm Claude actually stopped)
