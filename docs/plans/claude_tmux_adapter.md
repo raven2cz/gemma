@@ -89,6 +89,74 @@ UI:
 - Toggle "Allow edit + Bash" button → modal s fráze input
 - Voice: "povol editaci" / "ano povoluju editovat" → state toggle
 
+**INVARIANT: permission_mode is immutable per Claude process (codex iter-2 critical #1):**
+
+`--permission-mode plan|acceptEdits` se nastavuje při SPAWN procesu a NELZE
+změnit za běhu. Per-session toggle "Allow edit" tedy NEMÚŽE upgradnout existující
+session - adapter MUSÍ killnout `plan` session a spawnnout novou s `acceptEdits`.
+Symetricky downgrade edit→consult vyžaduje kill+respawn.
+
+Důsledky pro design:
+- Toggle "Allow edit" v UI MUSÍ user upozornit "změna ukončí současný kontext
+  a vytvoří novou session" + confirm dialog
+- Alternativa: paralelní consult/edit session IDs pro stejný (workdir, model).
+  User si vybere kterou pokračovat. Více session management overhead.
+- **Default: kill+respawn s explicit warning** v MVP. Paralelní sessions later.
+
+Test scenarios pro tohle:
+- `test_approve_edit_kills_consult_session`: ASK approval po session start → kill+spawn
+- `test_revoke_edit_kills_session`: explicit revoke / exit → kill edit process
+- `test_no_silent_permission_change`: send-keys nemůže změnit permission_mode
+
+**Persistent metadata store (codex iter-2 critical #2):**
+
+Session metadata MUSÍ být persistentně uložená a integrity-checked. Jinak
+po server restartu by gemma mohla ztratit `destructive_approved` flag zatímco
+tmux session s `acceptEdits` přežije = ghost edit capability bez approval state.
+
+Schema `.gemma_local/claude_sessions.json` (atomic write přes tmpfile + rename):
+```json
+{
+  "version": "v1",
+  "sessions": {
+    "claude_a1b2c3d4": {
+      "session_id": "claude_a1b2c3d4",
+      "owner": "gemma",                  // identifies our spawned sessions
+      "workdir": "/home/box/git/project",
+      "model": "claude-opus-4-7",
+      "permission_mode": "acceptEdits",  // immutable for life of process
+      "permission_argv": ["--permission-mode", "acceptEdits", "--tools", "Read,Edit,Write,Bash,Glob,Grep", "--add-dir", "/home/box/git/project"],
+      "created_at": 1715944800.0,
+      "last_active": 1715948400.0,
+      "approval": {
+        "approved_at": 1715944900.0,
+        "phrase_hash": "sha256:<phrase + session_id + secret>",
+        "approval_version": "v1"
+      },
+      "turn_count": 5
+    }
+  }
+}
+```
+
+Reattach algoritmus při gemma startu:
+1. Načíst `claude_sessions.json` (pokud neexistuje, prázdný state)
+2. Pro každou file-listed session:
+   a) `tmux has-session -t <id>` → pokud false: smazat z metadata, skip
+   b) Verify integrity: pokud session měla `acceptEdits` argv, ověř že phrase_hash
+      odpovídá uloženému přístupu pro tuto session+secret
+   c) Pokud integrity check FAIL → kill tmux session + smazat metadata (unsafe orphan)
+   d) Jinak: registrovat v adapteru jako "available for continue"
+3. Pro každou tmux `claude_*` session co NENÍ v metadata → unsafe orphan, kill
+
+Test scenarios:
+- `test_reattach_with_valid_metadata`: gemma restart → existing approved edit session
+  pokračuje
+- `test_reattach_unsafe_orphan_killed`: tmux session bez metadata → kill při startup
+- `test_reattach_corrupted_metadata`: tampered phrase_hash → kill session
+- `test_secret_rotation_invalidates_old_approvals`: secret v `.gemma_local/secret`
+  rotated → všechny old `approval.phrase_hash` invalid → sessions vyžadují re-approval
+
 **Tmux session lifecycle (codex iter-1 high #3 - context contamination):**
 
 Naivní per-(workdir, model) cache by způsobila context contamination - jeden
@@ -119,7 +187,9 @@ Po **2026-06-15** Anthropic rozdělí Max plán billing:
 - **Interactive `claude` CLI v terminálu** (stdout TTY, bez `-p`) → normal Max limity
 - **`claude -p` print mode** (= náš dnešní bridge) → separátní Agent SDK pool $100/měs (Max 5x)
 
-Pro user s Max 5x je $100/měs pool nedostatečný pro Opus implementační tasky. Tmux/PTY-driven interactive mode by mohl spadat pod "interactive in terminal" kategorii → normal Max limity.
+Plán přidává **experimentální** alternativu - interactive driver přes pseudo-TTY
+(tmux). Plán neslibuje žádný billing benefit; Anthropic má diskreci klasifikovat
+jakoukoli automatizaci jako Agent SDK use. Viz **TOS Risk Disclaimer** na začátku.
 
 **User explicitly:**
 1. Konfigurační přepínač mezi `print` (= `-p`) a `tmux` adaptérem
@@ -201,7 +271,13 @@ gemma/
 [project]
 name = "claude_bridge"
 version = "0.1.0"
-dependencies = []   # zero deps - asyncio only, tmux přes subprocess
+dependencies = []   # core: asyncio only, žádné runtime deps pro print adapter
+
+[project.optional-dependencies]
+tmux = ["pyte>=0.8"]  # required jen pro tmux adapter (terminal emulator)
+
+[tool.setuptools.packages.find]
+where = ["."]
 ```
 
 avatar-engine bude moci: `pip install -e <gemma>/src/claude_bridge` nebo git submodule.
@@ -347,24 +423,38 @@ Implementuje `AbstractClaudeAdapter` interface. **Žádná funkční změna** - 
 
 ### TmuxAdapter - nová implementace
 
-**State machine per session (codex iter-1 high #4):**
+**State machine per session (codex iter-1 high #4, iter-2 high recovery policy):**
 
 ```
        ┌─ ask() ──→ RUNNING ──── prompt+complete ──→ READY
 READY ─┤
        └─ ask() during RUNNING ──→ raise SessionBusy (mutex blocks)
 
-RUNNING ─── cancel_event ──→ CANCELING ──── Esc+Esc ─→ READY (with canceled=True)
-RUNNING ─── timeout       ──→ CANCELING ──── kill+spawn ─→ DEAD (retry?)
-RUNNING ─── tmux pid gone ──→ DEAD (next ask spawns new session)
+RUNNING ─── cancel_event ──→ CANCELING ──── Esc+Esc ─→ READY (canceled=True)
+RUNNING ─── timeout       ──→ DEAD (kill bez auto-respawn)
+RUNNING ─── tmux pid gone ──→ DEAD
+
+DEAD ─── (terminal state, no auto-recovery) → next ask raises SessionDead
+                                                UI musí explicit nabídnout
+                                                fresh session start
 ```
+
+**Recovery policy: NIKDY silent recreate** (codex iter-2 high):
+Pro long-lived context musíme tichá history loss vyloučit. Pokud session
+je DEAD, adapter:
+1. Persistně označí session jako DEAD v metadata file
+2. Další `ask(session_id=X)` na DEAD session → raise `SessionDead`
+3. Server emit `session_dead` event do UI s context preview (last N turns)
+4. UI nabídne: "Start fresh session" (default) | "Try resume" (experimental)
+5. Fresh start = nový session_id, nová tmux session, čistý context
 
 Implementační detaily:
 - `asyncio.Lock` **per session_id** - žádné dvě `ask()` paralelně na stejnou
-  session. Druhý request buď čeká nebo raises `SessionBusy` (config policy).
+  session. Druhý request raises `SessionBusy` (žádné silent queueing).
 - State stored v `Session` dataclass, transitions přes `async with state_lock:`
 - `health_check()` před každým ask: `tmux has-session -t <id>` + capture-pane
-  test; pokud broken → mark DEAD a vyžaduje recreate.
+  test; pokud broken → mark DEAD persist, raise `SessionDead`.
+- `terminate_timeout()` při timeout/cancel doesn't try respawn - DEAD je terminal.
 
 **Lifecycle:**
 
@@ -377,17 +467,25 @@ Implementační detaily:
    2a. session.state = "RUNNING"
    2b. tmux send-keys -t <sid> -l "<prompt>"
    2c. tmux send-keys -t <sid> Enter
-3. Polling loop (await asyncio.sleep(0.25) iterace):
-   - capture-pane -p -e -S -100 (last 100 lines s ANSI)
-   - feed do pyte.Stream → pyte.Screen
-   - screen.display dá clean text grid
-   - detekce thinking spinner / tool_use markers / ready prompt / approval modal
-   - emit progress events (callback)
+3. **Incremental transcript collector** (codex iter-2 high #1 - 30KB output):
+   Spojuje per-tick capture-pane diffs do persistent transcript buffer. Jen
+   posledních 100 řádků by ztratilo velké odpovědi.
+   - Před send-keys: marker = capture-pane current bottom line
+   - Polling iterace (await asyncio.sleep(0.25)):
+     - capture-pane -p -e -S - (entire scrollback s ANSI)
+     - tmux session měl `set-option history-limit 100000` při spawnu
+     - feed do pyte.Stream/Screen pro per-tick state (spinner, modal, ready)
+     - APPEND nový obsah do `self._transcript_buffer[session_id]` (diff oproti
+       last capture, deduplicate header lines)
+   - emit progress events (callback) z pyte state
    - check cancel_event → state="CANCELING", send Esc Esc, break
-   - check ready marker + idle > 0.5s → break
-4. Extract response: slice screen text mezi naším send marker a current ready
-5. Strip residual ANSI, build ClaudeResult
-6. state = "READY", uvolnit lock
+   - check ready marker + idle > 0.8s → break (default, configurable)
+4. Extract response z transcript_buffer:
+   - Slice mezi marker (před send) a aktuální ready prompt
+   - Strip ANSI escapes (re-feed přes pyte alebo regex)
+   - Strip TUI chrome (borders, status lines, footer)
+   - Return clean assistant text v ClaudeResult.text
+5. state = "READY", uvolnit lock
 ```
 
 **Parser: pyte terminal emulator (codex iter-1 high #5):**
@@ -473,7 +571,7 @@ V gemma:
 ### UI switch
 
 `voice/webapp/static/index.html` + `app.js`:
-- Settings panel → "Claude bridge" radio: `Print mode (-p)` / `Tmux session (Max limits)`
+- Settings panel → "Claude bridge" radio: `Print mode (-p)` (default) / `Tmux interactive session (experimental)`
 - POST do `/api/config/claude_bridge_mode` (server persistne do `.gemma_local/`)
 - Server respektuje env var override
 
@@ -525,15 +623,19 @@ class TestTmuxAdapterReal:
         """dvě paralelní ask() na stejnou session → druhá blokuje na lock,
         ne race v send-keys"""
 
-    async def test_dead_session_recovery(self, tmp_workdir):
-        """externí kill session → next ask detekuje DEAD, raise SessionDead"""
+    async def test_dead_session_no_silent_recreate(self, tmp_workdir):
+        """externí kill session → next ask raises SessionDead.
+        Adapter NESMÍ silent respawn (kontext by se ztratil bez varování)."""
+
+    async def test_session_dead_event_emitted(self, tmp_workdir):
+        """DEAD session → UI obdrží session_dead event s context preview"""
 
     # Cancel + timeout
     async def test_cancel_via_event(self, tmp_workdir):
         """cancel během běhu → Esc Esc, session zůstane READY"""
 
-    async def test_timeout_kills_session(self, tmp_workdir):
-        """sleep timeout → adapter kill+spawn, session DEAD pak READY"""
+    async def test_timeout_marks_session_dead(self, tmp_workdir):
+        """sleep timeout > timeout_sec → session DEAD (terminal), no respawn"""
 
     # Progress events
     async def test_progress_events_emitted(self, tmp_workdir):
@@ -681,7 +783,9 @@ class TestClaudeModePermissionGate:
 3. **tmux dependency**: Vyžaduje tmux v PATH. Co když user nemá? Detection at startup + fail-fast s navodným error.
 4. **PTY alternativa**: Místo tmux použít Python `pty` modul nebo `ptyprocess` package. Méně dependency, ale tmux je battle-tested pro screen scraping.
 5. **Cost tracking**: Tmux mode nemá `total_cost_usd` (claude interactive ho neuvádí). Můžeme jen aproximovat z token counts pokud Claude exposuje. User to ale potřebuje k UI display.
-6. **Stream-json fallback**: Co kdybychom v tmux interactive shell ručně spustili `claude -p` jako sub-process **uvnitř** té tmux session? Naivně tato vrstva nedělá billing-relevant work, ale nejistý jestli Anthropic to akceptuje jako "interactive".
+6. **REJECTED** ~~Stream-json fallback s `claude -p` uvnitř tmux session~~ -
+   to by byl billing bypass attempt (Anthropic by oprávněně klasifikoval jako
+   Agent SDK use). Plán explicitně zakazuje na řádku 18.
 7. **Concurrency**: Lze poslat dvě paralelní ask() na jednu session? Pravděpodobně ne - single-tracked. Mutex per session.
 8. **Recovery z dead session**: Pokud `tmux has-session` false (kill externí) → recreate, ale ztratíme history. Acceptable degradation?
 
@@ -690,13 +794,15 @@ class TestClaudeModePermissionGate:
 | Risk | Mitigation |
 |---|---|
 | Anthropic změní TUI layout → naše TUI parser broken | Layer 3 real CLI testy chytí drift; cherry-picked fixtures přidat při každé Claude CLI version bump |
-| Anthropic eventually closes TOS workaround | Print mode adapter pořád funkční jako fallback; user může přepnout |
+| Anthropic explicit zakáže tmux/pseudo-TTY driving | Print mode adapter pořád funkční jako fallback; user může přepnout |
 | tmux v různých distrech různě se chová | Testovat na ubuntu + arch (user má arch) v CI; document requirements |
 | Long-lived session leak (memory, context) | Idle timeout cleanup, max sessions cap |
 | Send-keys lost (race) | Verify after send: capture-pane musí obsahovat poslané text |
 | Cost neviditelný v tmux | Display "N/A (interactive)" v UI, user ví že je v Max plánu |
 
-## Codex iter-1 findings - adresované
+## Codex review findings - adresované
+
+### Iter-1 (7 findings, vše adresované)
 
 | # | Severity | Issue | Resolution |
 |---|----------|-------|------------|
@@ -707,6 +813,17 @@ class TestClaudeModePermissionGate:
 | 5 | HIGH | Parser křehký (regex) | pyte terminal emulator místo regex; edge case test suite (wrap, multiline, 30KB output, modal drift, resize, CLI error) |
 | 6 | HIGH | Interface málo abstraktní | AdapterCapabilities, SessionInfo, list_sessions/clear/kill/health_check metody |
 | 7 | HIGH | Default přepnut moc brzy | Tmux opt-in až po Fázi 6 + real drift suite zelená 1 týden+ + (Anthropic OK NEBO user explicit risk awareness) |
+
+### Iter-2 (6 nových findings, vše adresované)
+
+| # | Severity | Issue | Resolution |
+|---|----------|-------|------------|
+| 8 | CRITICAL | permission_mode immutable per process | Invariant: kill+respawn pro toggle consult↔edit; explicit warning v UI před toggle; test_no_silent_permission_change |
+| 9 | CRITICAL | Reattach ztrácí approval state | Persistent metadata `.gemma_local/claude_sessions.json` s phrase_hash + integrity check; unsafe orphan kill při startup |
+| 10 | CRITICAL | Billing workaround wording | Odstraněn z motivace; UI label "Tmux interactive session (experimental)"; open question `claude -p` v tmux REJECTED |
+| 11 | HIGH | Capture ztratí dlouhé odpovědi | Incremental transcript collector (per-tick diff append); tmux history-limit=100000; test_30kb_output assertuje proti truncation |
+| 12 | HIGH | pyte dependency mismatch | pyproject `[project.optional-dependencies] tmux = ["pyte>=0.8"]`; fail-fast pokud tmux mode bez dep |
+| 13 | HIGH | Dead/timeout recovery nekonzistentní | Jednotná politika: DEAD je terminal, NIKDY silent recreate. SessionDead raise → UI nabídne fresh start s context preview |
 
 ---
 
