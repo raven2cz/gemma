@@ -183,13 +183,17 @@ doporučují `/clear` při změně tasku. Plán:
 
 ## Motivace
 
-Po **2026-06-15** Anthropic rozdělí Max plán billing:
-- **Interactive `claude` CLI v terminálu** (stdout TTY, bez `-p`) → normal Max limity
-- **`claude -p` print mode** (= náš dnešní bridge) → separátní Agent SDK pool $100/měs (Max 5x)
+Po **2026-06-15** Anthropic rozdělí Max plán billing. Anthropic dokumentace
+popisuje dva billing pooly podle CLI module:
+- `claude -p` print mode → separátní Agent SDK pool ($100/měs Max 5x)
+- Interactive `claude` v terminálu → existing subscription pool
 
 Plán přidává **experimentální** alternativu - interactive driver přes pseudo-TTY
-(tmux). Plán neslibuje žádný billing benefit; Anthropic má diskreci klasifikovat
-jakoukoli automatizaci jako Agent SDK use. Viz **TOS Risk Disclaimer** na začátku.
+(tmux). **Plán neslibuje žádný billing benefit ani Max-limit cestu**: Anthropic
+Consumer Terms zakazují automatizaci a Anthropic má diskreci klasifikovat
+jakoukoli automatizaci přes pseudo-TTY jako Agent SDK use (= $100 pool) nebo ban.
+Plán pouze popisuje technický mechanism (TTY-detection bypass v claude CLI),
+billing důsledek je čistě v rukou Anthropic. Viz **TOS Risk Disclaimer** na začátku.
 
 **User explicitly:**
 1. Konfigurační přepínač mezi `print` (= `-p`) a `tmux` adaptérem
@@ -206,7 +210,10 @@ jakoukoli automatizaci jako Agent SDK use. Viz **TOS Risk Disclaimer** na začá
 const isNonInteractive = hasPrintFlag || hasInitOnlyFlag || hasSdkUrl || !process.stdout.isTTY;
 const isInteractive = !isNonInteractive;
 ```
-→ Spustit `claude` v pseudo-terminal (tmux session) **bez** `-p` flag → `process.stdout.isTTY === true` → interactive mode → Max plan billing.
+→ Spustit `claude` v pseudo-terminal (tmux session) **bez** `-p` flag způsobí
+`process.stdout.isTTY === true` → claude CLI vstoupí do interactive code path
+(žádný Agent SDK header/marker). Billing důsledek je v rukou Anthropic - žádná
+záruka, viz **TOS Risk Disclaimer** na začátku.
 
 **Permission modes** (`types/permissions.ts`):
 - `acceptEdits` - auto-approve Edit/Write/Bash
@@ -530,8 +537,9 @@ lines = screen.display
    (mimo acceptEdits), state machine detect → emit `tool_progress("modal")`
    + raise unless `auto_yes` flag set.
 8. **Cancel** - `tmux send-keys -t <id> Escape Escape`. Pokud tool_use je
-   blocking I/O (long Bash), claude TUI musí Esc respektovat. Fallback:
-   timeout → kill+spawn.
+   blocking I/O (long Bash), claude TUI musí Esc respektovat. Pokud Esc
+   neúčinkuje do timeout: session → DEAD (kill bez respawn), raise SessionDead
+   - user musí explicit start fresh (per #13 unifikovaná policy).
 9. **Resize handling** - capture window má fixed size (cols=200, rows=50).
    Long line wrap může zmást parser. Test: prompty/odpovědi co produkují
    wrapped content.
@@ -554,8 +562,34 @@ class AdapterConfig:
     tmux_bin: str = "tmux"
     # ... more
 
+class AdapterConfigError(Exception):
+    """Raised pokud config je incomplete pro selected mode (missing deps,
+    binary not in PATH, ...). User dostane jasnou hlášku místo pozdního
+    ImportError v hot path."""
+
+
 def create_adapter(config: AdapterConfig) -> AbstractClaudeAdapter:
+    """Factory s fail-fast dependency check (codex iter-2 high #12).
+
+    Pro TMUX mode: ověř že (a) `tmux` je v PATH, (b) `pyte` lze importovat.
+    Jinak raise AdapterConfigError s navodným message - server tu hlášku
+    propaguje do UI jako 'Tmux adapter setup error: install pyte / tmux'.
+    """
     if config.mode == BridgeMode.TMUX:
+        import shutil
+        if shutil.which(config.tmux_bin) is None:
+            raise AdapterConfigError(
+                f"tmux binary {config.tmux_bin!r} not in PATH. "
+                f"Install tmux (apt install tmux / pacman -S tmux) or switch "
+                f"to print mode."
+            )
+        try:
+            import pyte  # noqa: F401
+        except ImportError as e:
+            raise AdapterConfigError(
+                f"pyte library required for tmux adapter (parsing TUI output). "
+                f"Install: pip install 'claude_bridge[tmux]'. Original error: {e}"
+            )
         from .adapters.tmux_mode import TmuxAdapter
         return TmuxAdapter(config)
     return PrintModeAdapter(config)
@@ -701,7 +735,8 @@ class TestClaudeModePermissionGate:
 ### Layer 4 - Stress tests
 - Tmux session lifecycle: 20 sessions paralelně, cleanup verifikace
 - Long-lived: 1 session, 50 turns, paměť stabilní
-- Recovery: kill tmux PID externě → adapter detect + recreate
+- Recovery: kill tmux PID externě → adapter detekuje DEAD při next ask,
+  raise SessionDead (NIKDY silent recreate per #13 policy)
 
 ### CI strategy
 - Default pytest: jen unit + integration (= žádný real claude)
@@ -786,8 +821,11 @@ class TestClaudeModePermissionGate:
 6. **REJECTED** ~~Stream-json fallback s `claude -p` uvnitř tmux session~~ -
    to by byl billing bypass attempt (Anthropic by oprávněně klasifikoval jako
    Agent SDK use). Plán explicitně zakazuje na řádku 18.
-7. **Concurrency**: Lze poslat dvě paralelní ask() na jednu session? Pravděpodobně ne - single-tracked. Mutex per session.
-8. **Recovery z dead session**: Pokud `tmux has-session` false (kill externí) → recreate, ale ztratíme history. Acceptable degradation?
+7. **RESOLVED** Concurrency: Mutex per session, druhá ask raises SessionBusy
+   (žádné silent queueing). Definováno v state machine sekci.
+8. **RESOLVED** Recovery z dead session: NIKDY silent recreate. DEAD je terminal,
+   raise SessionDead, UI nabídne fresh start s context preview. Definováno
+   v iter-2 high #13 finding.
 
 ## Risks & mitigations
 
