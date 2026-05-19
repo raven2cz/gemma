@@ -1088,19 +1088,55 @@ async function runTurn() {
           case 'claude_turn_started': {
             // Claude mode: server začal volat adapter.ask().
             setPhase('thinking');
-            const msg = `🤖 ${ev.model || 'claude'} · ${ev.mode || 'consult'}`;
+            const msg = `🤖 ${ev.model || 'claude'} · ${ev.mode || 'consult'} · čeká na odpověď…`;
             ctx.claudeStartedAt = Date.now();
-            // Add inline status to current assistant message
+            // Add inline status to current assistant message with pulsing dot
             ensureAssistantBubble(ctx);
             if (state.currentAssistantEl) {
               const ind = document.createElement('div');
-              ind.className = 'claude-status-indicator';
+              ind.className = 'claude-status-indicator claude-status-active';
+              ind.id = `claude-status-${ctx.id || 'turn'}`;
               ind.textContent = msg;
               state.currentAssistantEl.appendChild(ind);
+              // Live duration counter - user vidí kolik to běží
+              ctx.claudeStatusEl = ind;
+              ctx.claudeDurationInterval = setInterval(() => {
+                if (!ctx.claudeStartedAt) return;
+                const sec = Math.floor((Date.now() - ctx.claudeStartedAt) / 1000);
+                ind.textContent = `🤖 ${ev.model || 'claude'} · ${ev.mode || 'consult'} · ${sec}s…`;
+              }, 500);
             }
             break;
           }
+          case 'claude_approval_required': {
+            // Stop active duration counter pokud byl
+            if (ctx.claudeDurationInterval) {
+              clearInterval(ctx.claudeDurationInterval);
+              ctx.claudeDurationInterval = null;
+            }
+            // Server-side gate: user chce edit ale nedal "ano povoluju".
+            const note = `🔒 ${ev.msg}`;
+            addMessage('assistant', note);
+            state.messages.push({ role: 'assistant', content: note });
+            persistMessages();
+            setPhase('idle');
+            ctx.streamDone = true;
+            break;
+          }
           case 'claude_result': {
+            // Stop live duration counter
+            if (ctx.claudeDurationInterval) {
+              clearInterval(ctx.claudeDurationInterval);
+              ctx.claudeDurationInterval = null;
+            }
+            if (ctx.claudeStatusEl) {
+              // Mark indicator as done (remove pulsing)
+              ctx.claudeStatusEl.classList.remove('claude-status-active');
+              const sec = ctx.claudeStartedAt
+                ? Math.floor((Date.now() - ctx.claudeStartedAt) / 1000)
+                : 0;
+              ctx.claudeStatusEl.textContent = `🤖 ${ev.model || 'claude'} · ${ev.mode || 'consult'} · ${sec}s ${ev.ok ? '✓' : '✗'}`;
+            }
             // Final result z Claude adapter - render jako claude_result_card.
             ctx.streamDone = true;
             const card = renderClaudeResultBlock(ev);
@@ -1130,14 +1166,6 @@ async function runTurn() {
             }
             // Refresh permission badge (state mohl být upgrade-ovaný)
             refreshClaudePermBadge();
-            setPhase('idle');
-            break;
-          }
-          case 'claude_approval_required': {
-            // Server-side gate: user chce edit ale nedal "ano povoluju".
-            // Zobrazit jako system message (ne modal - mode-level toggle).
-            const note = `🔒 Claude session je v read-only módu. Pro editaci napiš nebo řekni "${ev.required_phrase}" + tvoji akci.`;
-            addMessage('assistant', note);
             setPhase('idle');
             break;
           }

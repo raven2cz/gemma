@@ -2101,6 +2101,28 @@ async def _run_claude_turn(
         # Forward strip-nutý prompt do Claude
         user_text = user_text_stripped
 
+    # Real-world bug (2026-05-19): user pošle SAMOTNÉ "ano povoluju" bez akce,
+    # po strip zbude "" nebo žádný edit intent → my passli to do consult adapter
+    # jako prompt "ano povoluju" → Claude opus think 2+ minuty na nesmysl.
+    # Fix: phrase BEZ akce → vrátit instrukci, ne spawn Claude.
+    if has_phrase and not wants_edit_stripped:
+        async def phrase_only_gen():
+            yield json.dumps({
+                "type": "claude_approval_required",
+                "msg": (
+                    f"Frázi \"{DESTRUCTIVE_APPROVAL_PHRASE}\" jsi poslal samotnou. "
+                    "Pošli ji v JEDNÉ zprávě spolu s konkrétní akcí, např.: "
+                    f"\"{DESTRUCTIVE_APPROVAL_PHRASE} vytvoř hello.py\""
+                ),
+                "required_phrase": DESTRUCTIVE_APPROVAL_PHRASE,
+                "current_mode": "consult",
+                "requested_mode": "edit",
+                "reason": "phrase_without_action",
+            }).encode() + b"\n"
+            yield json.dumps({"type": "agent_done"}).encode() + b"\n"
+        return StreamingResponse(phrase_only_gen(), media_type="application/x-ndjson",
+                                 headers={"X-Turn-Id": tid})
+
     # Pokud user chce edit ale (a) nedal phrase, NEBO (b) phrase je tam ale
     # bez edit intent (= confused user) → request approval
     if wants_edit and current_perm == "consult":
@@ -2109,7 +2131,8 @@ async def _run_claude_turn(
                 "type": "claude_approval_required",
                 "msg": (
                     "Claude session je v read-only módu. Pro editaci souborů "
-                    f"začni dotaz frází \"{DESTRUCTIVE_APPROVAL_PHRASE}\" + tvoji akci."
+                    f"začni dotaz frází \"{DESTRUCTIVE_APPROVAL_PHRASE}\" + tvoji akci. "
+                    f"Příklad: \"{DESTRUCTIVE_APPROVAL_PHRASE} vytvoř hello.py\""
                 ),
                 "required_phrase": DESTRUCTIVE_APPROVAL_PHRASE,
                 "current_mode": "consult",
