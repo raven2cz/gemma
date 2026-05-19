@@ -16,10 +16,20 @@ import pytest
 
 @pytest.fixture
 async def client(monkeypatch, tmp_path):
-    """FastAPI test client s tmp WORKDIR (žádný impact na real .gemma_local)."""
-    monkeypatch.setenv("AGENT_WORKDIR", str(tmp_path))
+    """FastAPI test client s isolated state dirs (codex iter-9):
+    sibling workdir + xdg_state + fake_home pod tmp_path. Bez izolace by
+    endpoint tests zapisovali do REÁLNÉHO ~/.local/state/gemma."""
+    wd = tmp_path / "workdir"
+    wd.mkdir()
+    xdg = tmp_path / "xdg_state"
+    xdg.mkdir()
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    monkeypatch.setenv("AGENT_WORKDIR", str(wd))
+    monkeypatch.setenv("XDG_STATE_HOME", str(xdg))
+    monkeypatch.setenv("HOME", str(fake_home))
     monkeypatch.setenv("AGENT_CLAUDE_BRIDGE_MODE", "print")
-    # Re-import server abychom dostali fresh WORKDIR
+    # Re-import server abychom dostali fresh WORKDIR + state path
     import importlib
     from voice.agent import config as agent_config
     importlib.reload(agent_config)
