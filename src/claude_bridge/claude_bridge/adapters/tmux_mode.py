@@ -575,19 +575,18 @@ class TmuxAdapter:
         ))
 
         # Polling loop: capture + parse + emit + check done
-        # Done detection (codex iter-2 #11 + reálný TUI observation):
-        # Claude TUI po odpovědi vyrenderuje:
-        #   ● <response text>
-        #   ✻ Crunched for Ns       <- DEFINITIVNÍ "done" marker
-        #   ──────
-        #   ❯ <empty input>
-        # Plus počet `●` markerů v screenu se INCREASES o 1 oproti
-        # pre-send stavu. Použijeme oba checks (Crunched OR new `●`).
+        # Done detection: turn completion footer `✻ <Verb> for Ns`.
+        # POZOR: scrollback v reused session může obsahovat starý completion
+        # marker z předchozího turnu. Proto musíme count baseline PŘED send
+        # a wait pokud count INCREASED (nový marker = aktuální turn done).
         deadline = start + timeout_sec
         thinking_emitted = False
         # Count `●`/`⏺` markers PRED send (baseline)
-        pre_capture = before_capture
-        pre_marker_count = pre_capture.count("● ") + pre_capture.count("⏺ ")
+        # POZN: raw capture obsahuje ANSI codes mezi znaky → strip_ansi PŘED count.
+        pre_capture_clean = strip_ansi(before_capture)
+        pre_marker_count = pre_capture_clean.count("● ") + pre_capture_clean.count("⏺ ")
+        # Count completion footers PRED send (baseline pro race fix)
+        pre_completion_count = len(_TURN_COMPLETION_RE.findall(pre_capture_clean))
         while time.monotonic() < deadline:
             # Cancel check
             if cancel_event is not None and cancel_event.is_set():
@@ -636,11 +635,13 @@ class TmuxAdapter:
                 thinking_emitted = True
 
             # Done detection: turn completion footer `✻ <Verb> for Ns`.
-            # Claude UI loží various verbs (Churned/Cooked/Crunched/Baked/...),
-            # všechny z turnCompletionVerbs.ts. Regex match capture-suit complete.
-            screen_text = "\n".join(session.tui.screen_lines)
-            if _TURN_COMPLETION_RE.search(screen_text):
-                # Found done marker. Krátká dodatečná pauza pro complete render.
+            # MUSÍ být new marker (count > pre_completion_count) aby jsme
+            # nezachytili starý marker z reused session scrollback.
+            # Strip ANSI před regex (raw obsahuje color codes mezi znaky).
+            raw_clean = strip_ansi(raw)
+            current_completion_count = len(_TURN_COMPLETION_RE.findall(raw_clean))
+            if current_completion_count > pre_completion_count:
+                # Found new done marker. Krátká dodatečná pauza pro complete render.
                 await asyncio.sleep(0.3)
                 # Refresh capture
                 raw_final = await self._capture_pane(session.session_id)
