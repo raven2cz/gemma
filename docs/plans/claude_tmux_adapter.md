@@ -452,7 +452,11 @@ je DEAD, adapter:
 1. Persistně označí session jako DEAD v metadata file
 2. Další `ask(session_id=X)` na DEAD session → raise `SessionDead`
 3. Server emit `session_dead` event do UI s context preview (last N turns)
-4. UI nabídne: "Start fresh session" (default) | "Try resume" (experimental)
+4. UI nabídne JEN: "Start fresh session" (nový session_id, čistý kontext +
+   preview last N turns z metadata)
+   - Žádné "Try resume" tlačítko pro DEAD session - to by porušilo invariant
+     "DEAD terminal, no silent recreate". Resume platí jen pro NON-DEAD
+     reattach po gemma restartu (= session co stále existuje v `tmux ls`)
 5. Fresh start = nový session_id, nová tmux session, čistý context
 
 Implementační detaily:
