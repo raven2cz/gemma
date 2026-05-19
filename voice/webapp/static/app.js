@@ -1064,9 +1064,15 @@ async function runTurn() {
             break;
           }
           case 'tool_progress': {
-            // Subagent (typicky ask_claude) emituje průběžné status updaty.
+            // Subagent (claude bridge nebo agent loop tool) emituje progress.
             // UI text only, žádné TTS.
-            updateToolProgress(ev);
+            if (ev.tool === 'claude') {
+              // Claude mode: render do claude-status-indicator (žádná tool card)
+              updateClaudeActivity(ctx, ev);
+            } else {
+              // Agent mode: má tool-card s tool_call_id pro grouping
+              updateToolProgress(ev);
+            }
             break;
           }
           case 'audio_filler': {
@@ -1659,6 +1665,52 @@ const _STAGE_ICONS = {
  * Místo overwriting textu udržujeme scrolling log posledních N eventů,
  * každý s ikonou stage + jeho message/tool_name. User vidí kontinuálně co
  * Claude dělá (Read X, Edit Y, Bash Z, ...). */
+/** Claude mode live activity: append každý progress event jako řádek v
+ * assistant bublině. User vidí v real-time co Claude dělá (thinking,
+ * Read X, Write Y, Bash Z, ...). */
+function updateClaudeActivity(ctx, ev) {
+  if (!state.currentAssistantEl) {
+    ensureAssistantBubble(ctx);
+  }
+  // Najdi/vytvoř activity log container uvnitř assistant bubble
+  let logEl = state.currentAssistantEl?.querySelector('.claude-activity-log');
+  if (!logEl) {
+    logEl = document.createElement('div');
+    logEl.className = 'claude-activity-log';
+    state.currentAssistantEl?.appendChild(logEl);
+  }
+  const p = ev.payload || {};
+  const stage = p.stage || 'work';
+  const icon = _STAGE_ICONS[stage] || '•';
+  // Sestav řádek detail
+  let detail = '';
+  if (stage === 'tool_use') {
+    detail = p.message || p.tool_name || 'tool';
+  } else if (stage === 'tool_result') {
+    detail = (p.ok === false) ? 'tool selhal' : (p.message || 'tool OK');
+  } else if (stage === 'text') {
+    const t = (p.text || '').replace(/\s+/g, ' ').slice(0, 100);
+    detail = t ? `"${t}…"` : '';
+  } else if (stage === 'started') {
+    detail = p.message || 'spawn';
+  } else {
+    detail = p.message || '';
+  }
+  const row = document.createElement('div');
+  row.className = 'claude-activity-row';
+  row.dataset.stage = stage;
+  row.innerHTML = `<span class="claude-activity-icon">${escapeHtml(icon)}</span>`
+    + `<span class="claude-activity-text">${escapeHtml(`${stage}: ${detail}`)}</span>`;
+  logEl.appendChild(row);
+  // Trim na posledních 30 řádků (avoid runaway DOM)
+  while (logEl.childElementCount > 30) {
+    logEl.removeChild(logEl.firstChild);
+  }
+  // Autoscroll do transcript
+  transcript.scrollTop = transcript.scrollHeight;
+}
+
+
 function updateToolProgress(ev) {
   const card = findToolCard(ev.tool_call_id);
   if (!card) return;
