@@ -686,6 +686,26 @@ async def health():
 
 # Single source of truth pro voice approval fráze. Frontend si je natáhne při
 # startu - fallback constants v app.js, ale primárně server (žádný drift).
+@app.get("/api/claude_ui_state")
+async def claude_ui_state():
+    """Vrátí persistent Claude mode state (permission_mode, model, ...).
+    Frontend volá při enter do claude mode pro badge refresh."""
+    return _load_claude_ui_state()
+
+
+@app.post("/api/claude_ui_state/reset")
+async def claude_ui_state_reset():
+    """Reset Claude mode state (revoke approval, force consult)."""
+    _save_claude_ui_state({
+        "permission_mode": "consult",
+        "destructive_approved": False,
+        "claude_session_id": None,
+        "model": "opus",
+        "approved_at": None,
+    })
+    return {"ok": True}
+
+
 @app.get("/api/approval_config")
 async def approval_config():
     """Vrátí seznam frází, které frontend mapuje na approve/deny rozhodnutí
@@ -1750,6 +1770,307 @@ async def _run_agent_turn(
     )
 
 
+# ──────────────── Claude mode handler (Fáze 4) ────────────────
+
+# Per-user persistent state pro Claude mode session.
+# Schema: { "permission_mode": "consult"|"edit",
+#           "destructive_approved": bool,
+#           "claude_session_id": str | None,
+#           "model": "opus"|"sonnet"|"haiku",
+#           "approved_at": timestamp | None }
+_CLAUDE_UI_STATE_FILE = ".gemma_local/claude_ui_state.json"
+
+
+def _load_claude_ui_state() -> dict:
+    """Načti persistent claude mode state z `.gemma_local/`."""
+    from voice.agent.config import WORKDIR
+    path = WORKDIR / _CLAUDE_UI_STATE_FILE
+    if not path.exists():
+        return {
+            "permission_mode": "consult",
+            "destructive_approved": False,
+            "claude_session_id": None,
+            "model": "opus",
+            "approved_at": None,
+        }
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        log.warning("claude_ui_state.json corrupt, using defaults")
+        return {
+            "permission_mode": "consult",
+            "destructive_approved": False,
+            "claude_session_id": None,
+            "model": "opus",
+            "approved_at": None,
+        }
+
+
+def _save_claude_ui_state(state: dict) -> None:
+    """Atomic write claude mode state."""
+    from voice.agent.config import WORKDIR
+    path = WORKDIR / _CLAUDE_UI_STATE_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(path)
+    except Exception as e:
+        log.warning("failed to save claude_ui_state: %s", e)
+
+
+# Edit intent detection - keywords v user message co indikují edit operaci.
+# Per codex iter-3 #2: bez explicit "ano povoluju" Claude nesmí získat Write/Bash.
+import re as _re
+_CLAUDE_EDIT_INTENT_RE = _re.compile(
+    r"(?ix)\b(?:"
+    r"vytvoř|vytvor|napiš|napis|uprav|změň|zmen|smaž|smaz|"
+    r"odstraň|odstran|spusť|spust|provedl?|implementuj|opravi?|"
+    r"refaktoruj|refactoruj|přidej|pridej|odeber|zapiš|zapis|"
+    r"create|write|edit|modify|change|delete|remove|implement|fix|"
+    r"refactor|add|update|run|execute"
+    r")\b"
+)
+
+
+def _detect_edit_intent(user_text: str) -> bool:
+    """True pokud user message obsahuje edit-intent keyword."""
+    return bool(_CLAUDE_EDIT_INTENT_RE.search(user_text or ""))
+
+
+async def _run_claude_turn(
+    *,
+    req: Request,
+    tid: str,
+    turn_state: dict,
+    body: dict,
+    user_lang: str,
+) -> StreamingResponse:
+    """Claude mode NDJSON stream: priamy dialog s Claude přes adapter.
+
+    Žádný Gemma routing per turn, žádný agent loop. Server forwarduje user
+    message do adapter.ask(), streamuje progress events + final result.
+
+    Per codex iter-3 #2 + sonnet C2: ClaudeModePermissionGate na server cestě
+    PŘED adapter.ask(). Per-session permission state v
+    `.gemma_local/claude_ui_state.json`:
+        - permission_mode: consult|edit (immutable per Claude process)
+        - destructive_approved: bool (jednou na session opt-in s "ano povoluju")
+
+    Edit intent detection: user message obsahuje vytvoř/uprav/spusť/... AND
+    permission_mode=="consult" → emit approval_required → user pošle phrase
+    → upgrade na edit + spawn new session (immutable invariant).
+
+    Adapter: print_mode default; tmux opt-in přes config (experimental).
+    """
+    from voice.agent.config import WORKDIR
+    from claude_bridge import (
+        AdapterConfig, BridgeMode, ProgressEvent, create_adapter,
+        SessionDead, SessionBusy, AdapterConfigError,
+    )
+
+    asyncio_loop = asyncio.get_running_loop()
+    out_queue: asyncio.Queue = asyncio.Queue()
+    _SENTINEL = object()
+
+    # Extract user message text + model selection
+    messages = body.get("messages") or []
+    user_text = ""
+    for m in reversed(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                user_text = c
+            elif isinstance(c, list):
+                user_text = "".join(
+                    b.get("text", "") for b in c
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+            break
+
+    if not user_text.strip():
+        async def empty_gen():
+            yield json.dumps({"type": "error", "msg": "empty user message"}).encode() + b"\n"
+            yield json.dumps({"type": "done"}).encode() + b"\n"
+        return StreamingResponse(empty_gen(), media_type="application/x-ndjson",
+                                 headers={"X-Turn-Id": tid})
+
+    # Load persistent state
+    ui_state = _load_claude_ui_state()
+    model_label = body.get("claude_model") or ui_state.get("model", "opus")
+    if model_label not in ("opus", "sonnet", "haiku"):
+        model_label = "opus"
+    _MODEL_ALIAS = {
+        "opus": "claude-opus-4-7",
+        "sonnet": "claude-sonnet-4-6",
+        "haiku": "claude-haiku-4-5",
+    }
+    full_model = _MODEL_ALIAS[model_label]
+
+    # ClaudeModePermissionGate: detect edit intent vs current permission
+    wants_edit = _detect_edit_intent(user_text)
+    current_perm = ui_state.get("permission_mode", "consult")
+    destructive_approved = bool(ui_state.get("destructive_approved"))
+
+    # Check pokud explicit phrase v user message (= toggle ON)
+    from voice.agent.config import DESTRUCTIVE_APPROVAL_PHRASE
+    has_phrase = DESTRUCTIVE_APPROVAL_PHRASE.lower() in user_text.lower()
+
+    if has_phrase:
+        # User řekl "ano povoluju" → toggle edit ON + force new session
+        ui_state["permission_mode"] = "edit"
+        ui_state["destructive_approved"] = True
+        ui_state["approved_at"] = time.time()
+        # Permission immutable per Claude process - kill old session, force new
+        ui_state["claude_session_id"] = None
+        _save_claude_ui_state(ui_state)
+        current_perm = "edit"
+        destructive_approved = True
+
+    # Pokud user chce edit ale nedal phrase → request approval
+    if wants_edit and current_perm == "consult":
+        # Emit approval_required event, frontend zobrazí modal s phrase input
+        async def gate_gen():
+            yield json.dumps({
+                "type": "claude_approval_required",
+                "msg": (
+                    "Claude session je v read-only módu. Pro editaci souborů "
+                    f"napiš nebo řekni \"{DESTRUCTIVE_APPROVAL_PHRASE}\"."
+                ),
+                "required_phrase": DESTRUCTIVE_APPROVAL_PHRASE,
+                "current_mode": "consult",
+                "requested_mode": "edit",
+            }).encode() + b"\n"
+            yield json.dumps({"type": "agent_done"}).encode() + b"\n"
+        return StreamingResponse(gate_gen(), media_type="application/x-ndjson",
+                                 headers={"X-Turn-Id": tid})
+
+    # Create adapter (print mode default until tmux opt-in stable)
+    bridge_mode_env = os.environ.get("AGENT_CLAUDE_BRIDGE_MODE", "print").lower()
+    bridge_mode = BridgeMode.TMUX if bridge_mode_env == "tmux" else BridgeMode.PRINT
+    config = AdapterConfig(
+        mode=bridge_mode,
+        metadata_dir=str(WORKDIR / ".gemma_local"),
+        default_timeout_sec=600.0,
+    )
+    try:
+        adapter = create_adapter(config)
+    except AdapterConfigError as e:
+        async def cfg_err_gen():
+            yield json.dumps({
+                "type": "error",
+                "msg": f"Claude bridge config error: {e}",
+            }).encode() + b"\n"
+            yield json.dumps({"type": "done"}).encode() + b"\n"
+        return StreamingResponse(cfg_err_gen(), media_type="application/x-ndjson",
+                                 headers={"X-Turn-Id": tid})
+
+    async def progress_callback(payload) -> None:
+        """Bridge progress → tool_progress NDJSON event (UI activity log).
+
+        Payload může být dict (print mode legacy callback) nebo ProgressEvent
+        dataclass (typed). Handle both."""
+        if isinstance(payload, ProgressEvent):
+            payload_dict = payload.to_dict()
+        elif isinstance(payload, dict):
+            payload_dict = payload
+        else:
+            return
+        await out_queue.put({
+            "type": "tool_progress",
+            "tool": "claude",  # generic tool id for UI activity log
+            "tool_call_id": tid,
+            "payload": payload_dict,
+        })
+
+    async def driver() -> None:
+        """Run adapter.ask() + push events do out_queue."""
+        try:
+            # Emit started event so UI sees activity
+            await out_queue.put({
+                "type": "claude_turn_started",
+                "model": model_label,
+                "mode": current_perm,
+            })
+            result = await adapter.ask(
+                prompt=user_text,
+                model=full_model,
+                mode=current_perm,
+                workdir=WORKDIR if current_perm == "edit" else None,
+                session_id=ui_state.get("claude_session_id"),
+                timeout_sec=600.0,
+                cancel_event=turn_state.get("cancel_event"),
+                progress_callback=progress_callback,
+            )
+            # Save session_id pro continuity (long-lived per session)
+            if result.session_id:
+                ui_state["claude_session_id"] = result.session_id
+                _save_claude_ui_state(ui_state)
+            # Emit claude_result event
+            await out_queue.put({
+                "type": "claude_result",
+                "ok": result.ok,
+                "text": result.text,
+                "model": result.model,
+                "mode": result.mode,
+                "session_id": result.session_id,
+                "duration_ms": result.duration_ms,
+                "tool_uses": list(result.tool_uses),
+                "total_cost_usd": result.total_cost_usd,
+                "error": result.error,
+                "adapter": result.adapter,
+            })
+        except SessionDead as e:
+            await out_queue.put({
+                "type": "claude_session_dead",
+                "msg": str(e),
+            })
+            # Reset session_id, user musí start fresh
+            ui_state["claude_session_id"] = None
+            _save_claude_ui_state(ui_state)
+        except SessionBusy as e:
+            await out_queue.put({
+                "type": "error",
+                "msg": f"Claude session busy: {e}",
+            })
+        except Exception as e:
+            log.exception("claude turn failed")
+            await out_queue.put({
+                "type": "error",
+                "msg": f"{type(e).__name__}: {e}",
+            })
+        finally:
+            await out_queue.put(_SENTINEL)
+
+    asyncio.create_task(driver())
+
+    async def gen() -> AsyncGenerator[bytes, None]:
+        # Emit lang first (same as chat/agent)
+        yield json.dumps({"type": "user_lang", "lang": user_lang}).encode() + b"\n"
+        while True:
+            if await req.is_disconnected() or turn_state.get("canceled"):
+                ce = turn_state.get("cancel_event")
+                if ce is not None:
+                    ce.set()
+                break
+            try:
+                ev = await asyncio.wait_for(out_queue.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # heartbeat - keep connection alive
+                continue
+            if ev is _SENTINEL:
+                break
+            yield json.dumps(ev, ensure_ascii=False).encode() + b"\n"
+        yield json.dumps({"type": "agent_done"}).encode() + b"\n"
+        await _drop_turn(tid)
+
+    return StreamingResponse(
+        gen(),
+        media_type="application/x-ndjson",
+        headers={"X-Turn-Id": tid},
+    )
+
+
 @app.post("/api/turn")
 async def turn(req: Request):
     """Jednotný NDJSON stream: LLM tokeny + (volitelně) per-sentence TTS audio URLs.
@@ -1852,6 +2173,15 @@ async def turn(req: Request):
             raise HTTPException(503, f"TTS preload selhal: {_TTS_ERROR}")
 
     tid, turn_state = await _register_turn()
+
+    if mode == "claude":
+        return await _run_claude_turn(
+            req=req,
+            tid=tid,
+            turn_state=turn_state,
+            body=body,
+            user_lang=user_lang,
+        )
 
     if mode == "agent":
         return await _run_agent_turn(

@@ -316,6 +316,42 @@ function addMessage(role, content = '') {
   return el;
 }
 
+// Claude mode helpers
+function ensureAssistantBubble(ctx) {
+  if (state.currentAssistantEl) return;
+  state.currentAssistantEl = addMessage('assistant', '');
+}
+
+function renderClaudeResultBlock(ev) {
+  if (!ev) return null;
+  const wrap = document.createElement('div');
+  wrap.className = 'claude-result-card';
+  wrap.dataset.mode = ev.mode || 'consult';
+  const head = document.createElement('div');
+  head.className = 'claude-result-head';
+  const cost = ev.total_cost_usd != null ? `$${Number(ev.total_cost_usd).toFixed(4)}` : '-';
+  const dur = ev.duration_ms != null ? `${(ev.duration_ms / 1000).toFixed(1)}s` : '-';
+  const tools = (ev.tool_uses || []).join(', ') || '-';
+  head.innerHTML = `
+    <span class="claude-result-badge">🤖 ${escapeHtml(ev.model || 'claude')} · ${escapeHtml(ev.mode || 'consult')}</span>
+    <span class="claude-result-meta">cost ${cost} · ${dur} · tools: ${escapeHtml(tools)} · adapter: ${escapeHtml(ev.adapter || '?')}</span>
+  `;
+  wrap.appendChild(head);
+  if (ev.text) {
+    const body = document.createElement('div');
+    body.className = 'claude-result-body';
+    body.textContent = ev.text;
+    wrap.appendChild(body);
+  }
+  if (!ev.ok && ev.error) {
+    const err = document.createElement('div');
+    err.className = 'claude-result-error';
+    err.textContent = `Error: ${ev.error}`;
+    wrap.appendChild(err);
+  }
+  return wrap;
+}
+
 // Rerender throttled přes rAF - markdown parsing každý token je zbytečné,
 // stačí aktualizovat max raz za frame (~16 ms). Idempotentní: parser dostane
 // aktuální state.assistantBuffer a vyrenderuje.
@@ -879,6 +915,10 @@ async function runTurn() {
         stream_tts: streamTTS,
         // Agent-mode TTS scope. V chat módu ignorováno server-side.
         tts_scope: state.ttsScope,
+        // Claude-mode model selection (opus/sonnet/haiku).
+        claude_model: state.mode === 'claude'
+          ? (document.getElementById('claude-model-select')?.value || localStorage.getItem('claudeModel') || 'opus')
+          : undefined,
       }),
       signal: abort.signal,
     });
@@ -991,6 +1031,60 @@ async function runTurn() {
           case 'agent_done':
             // Server ještě pošle 'done' event jako canonical terminator.
             break;
+          case 'claude_turn_started': {
+            // Claude mode: server začal volat adapter.ask().
+            setPhase('thinking');
+            const msg = `🤖 ${ev.model || 'claude'} · ${ev.mode || 'consult'}`;
+            ctx.claudeStartedAt = Date.now();
+            // Add inline status to current assistant message
+            ensureAssistantBubble(ctx);
+            if (state.currentAssistantEl) {
+              const ind = document.createElement('div');
+              ind.className = 'claude-status-indicator';
+              ind.textContent = msg;
+              state.currentAssistantEl.appendChild(ind);
+            }
+            break;
+          }
+          case 'claude_result': {
+            // Final result z Claude adapter - render jako claude_result_card.
+            ctx.streamDone = true;
+            const card = renderClaudeResultBlock(ev);
+            if (card) {
+              const stage = document.querySelector('.stage');
+              if (stage) stage.appendChild(card);
+            }
+            // Add text do assistant message pokud máme
+            if (ev.ok && ev.text) {
+              if (state.currentAssistantEl) {
+                const body = document.createElement('div');
+                body.className = 'claude-assistant-text';
+                body.textContent = ev.text;
+                state.currentAssistantEl.appendChild(body);
+              }
+              state.messages.push({ role: 'assistant', content: ev.text });
+            } else if (!ev.ok) {
+              addMessage('assistant', `Chyba: ${ev.error || 'unknown'}`);
+            }
+            // Refresh permission badge (state mohl být upgrade-ovaný)
+            refreshClaudePermBadge();
+            setPhase('idle');
+            break;
+          }
+          case 'claude_approval_required': {
+            // Server-side gate: user chce edit ale nedal "ano povoluju".
+            // Zobrazit jako system message (ne modal - mode-level toggle).
+            const note = `🔒 Claude session je v read-only módu. Pro editaci napiš nebo řekni "${ev.required_phrase}" + tvoji akci.`;
+            addMessage('assistant', note);
+            setPhase('idle');
+            break;
+          }
+          case 'claude_session_dead': {
+            const note = `⚠️ Claude session ukončena (${ev.msg}). Při dalším dotazu se založí nová.`;
+            addMessage('assistant', note);
+            setPhase('idle');
+            break;
+          }
           case 'audio': {
             // Codex audit HIGH: zruš audio_filler (speechSynthesis) PŘED tím,
             // než pustíme server-side TTS. Jinak by hlasy spolu mluvily.
@@ -1167,38 +1261,86 @@ function restoreMessages() {
   } catch {}
 }
 
-// ──────────── Mode toggle (chat ↔ agent)
+// ──────────── Mode toggle (chat → agent → claude → chat)
 function applyMode(mode) {
-  if (mode !== 'chat' && mode !== 'agent') mode = 'chat';
+  if (!['chat', 'agent', 'claude'].includes(mode)) mode = 'chat';
   state.mode = mode;
   localStorage.setItem('mode', mode);
   if (modeToggle) {
     modeToggle.dataset.mode = mode;
     const label = modeToggle.querySelector('.mode-chip-label');
     if (label) label.textContent = mode;
-    modeToggle.title = mode === 'agent'
-      ? 'agent mode (klik = zpět na chat)'
-      : 'chat mode (klik = přepnout na agent)';
+    const titles = {
+      chat: 'chat mode (klik → agent)',
+      agent: 'agent mode (klik → claude)',
+      claude: 'claude mode (klik → chat)',
+    };
+    modeToggle.title = titles[mode];
   }
   document.body.dataset.mode = mode;
+  // Claude model selector + permission badge - jen v claude mode
+  const modelSelect = document.getElementById('claude-model-select');
+  const permBadge = document.getElementById('claude-perm-badge');
+  if (modelSelect) {
+    modelSelect.hidden = mode !== 'claude';
+  }
+  if (permBadge) {
+    permBadge.hidden = mode !== 'claude';
+  }
+  if (mode === 'claude') {
+    refreshClaudePermBadge();
+  }
 }
 
 function toggleMode() {
-  const next = state.mode === 'agent' ? 'chat' : 'agent';
+  const next = { chat: 'agent', agent: 'claude', claude: 'chat' }[state.mode] || 'chat';
   applyMode(next);
   playModeBeep(next);
 }
 
+// Refresh permission badge - poll server pro current state.
+async function refreshClaudePermBadge() {
+  const badge = document.getElementById('claude-perm-badge');
+  if (!badge) return;
+  try {
+    const r = await fetch('/api/claude_ui_state');
+    if (!r.ok) return;
+    const state = await r.json();
+    const perm = state.permission_mode || 'consult';
+    badge.dataset.perm = perm;
+    badge.textContent = perm === 'edit' ? '✏️ edit allowed' : '🔒 read-only';
+    badge.title = perm === 'edit'
+      ? `editace povolena (approved ${new Date((state.approved_at || 0) * 1000).toLocaleTimeString()})`
+      : 'jen čtení; pro editaci napiš "ano povoluju" + akci';
+  } catch (e) {
+    console.warn('claude perm badge refresh failed', e);
+  }
+}
+
 // Voice/text intent: rozpozná příkaz typu "agent mód", "přepni do chatu" atd.
-// Vrací "agent" | "chat" | null. Match je úmyslně přísný - vyhne se falsům
-// jako "zeptej se Claudeho v agent módu" (full sentence, ne pure switch).
+// Vrací "agent" | "chat" | "claude" | null. Match je úmyslně přísný.
 const _RE_INTENT_AGENT = /^\s*(?:p(?:ř|r)epni(?:\s+(?:do|na))?\s+|aktivuj\s+|spus(?:t|ť)\s+|zapni\s+|jdi\s+do\s+)?(?:agent(?:n(?:í|i))?(?:[\s-]*(?:m(?:ó|o)d|m(?:ó|o)du|re(?:ž|z)im(?:u)?|mode))?|agent[au]?)\s*\.?\s*$/i;
 const _RE_INTENT_CHAT = /^\s*(?:p(?:ř|r)epni(?:\s+(?:do|na|zp(?:ě|e)t\s+do))?\s+|zp(?:ě|e)t\s+(?:do|na)\s+|jdi\s+(?:do|zp(?:ě|e)t\s+do)\s+)?(?:chat[auem]?(?:[\s-]*(?:m(?:ó|o)d|m(?:ó|o)du|re(?:ž|z)im(?:u)?|mode))?|norm(?:á|a)ln(?:í|i)(?:[\s-]*(?:m(?:ó|o)d|re(?:ž|z)im))?)\s*\.?\s*$/i;
+// Claude mode switch: "přepni na claude", "použij opus/sonnet/haiku", "spusť claude"
+const _RE_INTENT_CLAUDE = /^\s*(?:p(?:ř|r)epni(?:\s+(?:do|na))?\s+|pou(?:ž|z)ij\s+|spus(?:t|ť)\s+|aktivuj\s+|jdi\s+do\s+)?(?:claude|claud[au]?|opus[au]?|sonnet[au]?|sonet[au]?|haik[uau]?)\s*(?:m(?:ó|o)d[au]?)?\s*\.?\s*$/i;
+// Detekce konkrétního modelu pokud user zmínil
+const _RE_CLAUDE_OPUS = /\bopus\w*\b/i;
+const _RE_CLAUDE_SONNET = /\b(?:sonnet|sonet)\w*\b/i;
+const _RE_CLAUDE_HAIKU = /\bhaik\w*\b/i;
 
 function tryModeSwitchIntent(text) {
   if (!text) return null;
   if (_RE_INTENT_AGENT.test(text)) return 'agent';
   if (_RE_INTENT_CHAT.test(text)) return 'chat';
+  if (_RE_INTENT_CLAUDE.test(text)) return 'claude';
+  return null;
+}
+
+function detectClaudeModelFromText(text) {
+  if (!text) return null;
+  if (_RE_CLAUDE_OPUS.test(text)) return 'opus';
+  if (_RE_CLAUDE_SONNET.test(text)) return 'sonnet';
+  if (_RE_CLAUDE_HAIKU.test(text)) return 'haik' && 'haiku';
   return null;
 }
 
@@ -1207,15 +1349,27 @@ function tryModeSwitchIntent(text) {
 function handleModeSwitchIntent(userText) {
   const target = tryModeSwitchIntent(userText);
   if (!target) return false;
+  // Pokud claude target + user řekl specific model, uložit
+  if (target === 'claude') {
+    const modelHint = detectClaudeModelFromText(userText);
+    if (modelHint) {
+      const sel = document.getElementById('claude-model-select');
+      if (sel) sel.value = modelHint;
+      localStorage.setItem('claudeModel', modelHint);
+    }
+  }
   if (state.mode !== target) {
     applyMode(target);
     playModeBeep(target);
   }
   // Echo do UI ať vidíš co se stalo. Žádné LLM volání, žádný state.messages push.
   addMessage('user', userText);
-  const reply = target === 'agent'
-    ? 'Přepnuto do agent módu.'
-    : 'Přepnuto do chat módu.';
+  const replies = {
+    agent: 'Přepnuto do agent módu.',
+    chat: 'Přepnuto do chat módu.',
+    claude: 'Přepnuto do Claude módu.',
+  };
+  const reply = replies[target];
   addMessage('assistant', reply);
   // Voice response: pokud máš TTS zapnuté a vstup byl hlasový, ozvi se.
   if (state.voiceEnabled && state.inputMode === 'mic') {
@@ -1243,7 +1397,8 @@ function playModeBeep(mode) {
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.type = 'sine';
-    osc.frequency.value = mode === 'agent' ? 880 : 440;
+    const FREQS = { chat: 440, agent: 880, claude: 660 };
+    osc.frequency.value = FREQS[mode] || 440;
     osc.connect(gain).connect(ctx.destination);
     const now = ctx.currentTime;
     gain.gain.setValueAtTime(0.0001, now);
@@ -1286,6 +1441,34 @@ function playAudioFiller() {
 
 if (modeToggle) {
   modeToggle.addEventListener('click', toggleMode);
+}
+
+// Claude model selector change → persist + send v dalším turnu
+const _claudeModelSel = document.getElementById('claude-model-select');
+if (_claudeModelSel) {
+  const saved = localStorage.getItem('claudeModel');
+  if (saved && ['opus', 'sonnet', 'haiku'].includes(saved)) {
+    _claudeModelSel.value = saved;
+  }
+  _claudeModelSel.addEventListener('change', () => {
+    localStorage.setItem('claudeModel', _claudeModelSel.value);
+  });
+}
+
+// Click on permission badge → fetch + reset prompt
+const _claudePermBadge = document.getElementById('claude-perm-badge');
+if (_claudePermBadge) {
+  _claudePermBadge.addEventListener('click', async () => {
+    if (_claudePermBadge.dataset.perm === 'edit') {
+      // Allow user to revoke edit permission (= reset to consult)
+      if (confirm('Zrušit oprávnění k editaci? Aktuální Claude session bude ukončena (permission_mode je immutable per process).')) {
+        await fetch('/api/claude_ui_state/reset', { method: 'POST' });
+        refreshClaudePermBadge();
+      }
+    } else {
+      alert('Pro povolení editace napiš/řekni "ano povoluju" + tvoji akci v dalším dotazu.');
+    }
+  });
 }
 
 // ──────────── Tool cards (agent mode)

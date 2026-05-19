@@ -24,10 +24,16 @@
       <span class="brand-workdir" id="brand-workdir" title="sandbox root agenta (odkud byl spuštěn)">…</span>
     </div>
     <div class="topbar-actions">
-      <button id="mode-toggle" class="mode-chip" data-mode="chat" type="button" title="Chat / Agent mode (klik = přepnout)" aria-label="přepnout mode">
+      <button id="mode-toggle" class="mode-chip" data-mode="chat" type="button" title="Mode: chat → agent → claude (klik = cyklus)" aria-label="přepnout mode">
         <span class="mode-chip-dot" aria-hidden="true"></span>
         <span class="mode-chip-label">chat</span>
       </button>
+      <select id="claude-model-select" class="mode-claude-model" title="Claude model (jen pro Claude mode)" aria-label="Claude model" hidden>
+        <option value="opus">Opus</option>
+        <option value="sonnet">Sonnet</option>
+        <option value="haiku">Haiku</option>
+      </select>
+      <span id="claude-perm-badge" class="claude-perm-badge" hidden></span>
       <label class="tts-quick" title="TTS on/off (hlasová odpověď)">
         <input type="checkbox" id="tts-quick" checked />
         <span class="tts-quick-track" aria-hidden="true"><span class="tts-quick-thumb"></span></span>

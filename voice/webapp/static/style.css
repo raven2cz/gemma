@@ -1081,6 +1081,56 @@ body {
   background: var(--speaking);
   box-shadow: 0 0 10px var(--speaking);
 }
+.mode-chip[data-mode="claude"] {
+  background: rgba(168, 85, 247, 0.18);
+  border-color: rgba(168, 85, 247, 0.55);
+}
+.mode-chip[data-mode="claude"] .mode-chip-dot {
+  background: #c084fc;
+  box-shadow: 0 0 10px #c084fc;
+}
+
+/* Claude model selector v topbar (jen v claude mode) */
+.mode-claude-model {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid rgba(168, 85, 247, 0.45);
+  background: rgba(168, 85, 247, 0.12);
+  color: var(--fg);
+  border-radius: 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.mode-claude-model:hover {
+  background: rgba(168, 85, 247, 0.22);
+}
+
+/* Claude permission badge (read-only vs edit allowed) */
+.claude-perm-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 11px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.claude-perm-badge[data-perm="consult"] {
+  background: rgba(148, 163, 184, 0.15);
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  color: #cbd5e1;
+}
+.claude-perm-badge[data-perm="edit"] {
+  background: rgba(251, 146, 60, 0.18);
+  border: 1px solid rgba(251, 146, 60, 0.5);
+  color: #fb923c;
+}
 
 .dangerous-badge {
   display: inline-flex;
