@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import AsyncGenerator
@@ -2159,6 +2159,28 @@ async def _run_claude_turn(
         return StreamingResponse(cfg_err_gen(), media_type="application/x-ndjson",
                                  headers={"X-Turn-Id": tid})
 
+    # Track progress emit pro heartbeat: codex iter-12 root cause - Claude opus
+    # thinks 50-100s před prvním stdout → progress_callback se nevolá → UI
+    # dostal jen claude_turn_started a 88s ticho. Heartbeat každých 8s pokud
+    # žádný real event nepřišel.
+    claude_progress_state = {"last_emit_at": 0.0, "count": 0}
+
+    async def emit_claude_progress(payload_dict: dict) -> None:
+        claude_progress_state["last_emit_at"] = time.monotonic()
+        claude_progress_state["count"] += 1
+        stage = payload_dict.get("stage")
+        if stage in {"started", "tool_use", "tool_result"}:
+            log.info(
+                "claude progress tid=%s stage=%s message=%r",
+                tid, stage, payload_dict.get("message"),
+            )
+        await out_queue.put({
+            "type": "tool_progress",
+            "tool": "claude",
+            "tool_call_id": tid,
+            "payload": payload_dict,
+        })
+
     async def progress_callback(payload) -> None:
         """Bridge progress → tool_progress NDJSON event (UI activity log).
 
@@ -2170,12 +2192,7 @@ async def _run_claude_turn(
             payload_dict = payload
         else:
             return
-        await out_queue.put({
-            "type": "tool_progress",
-            "tool": "claude",  # generic tool id for UI activity log
-            "tool_call_id": tid,
-            "payload": payload_dict,
-        })
+        await emit_claude_progress(payload_dict)
 
     async def driver() -> None:
         """Run adapter.ask() + push events do out_queue.
@@ -2204,7 +2221,19 @@ async def _run_claude_turn(
                     "model": model_label,
                     "mode": current_perm,
                 })
-                result = await adapter.ask(
+                # Initial activity log entry IMMEDIATELY (codex iter-12 fix):
+                # Claude opus thinks 50-100s před prvním stdout. Bez okamžitého
+                # progress eventu UI vypadá zmrzlé. Tohle pošle "spouštím Claude
+                # CLI…" do activity log hned, plus heartbeat každých 8s.
+                await emit_claude_progress({
+                    "stage": "started",
+                    "message": f"spouštím Claude CLI ({model_label}, {current_perm})",
+                    "model": full_model,
+                    "mode": current_perm,
+                })
+
+                # Spawn adapter.ask jako task, čekej s heartbeat loop
+                ask_task = asyncio.create_task(adapter.ask(
                     prompt=user_text,
                     model=full_model,
                     mode=current_perm,
@@ -2213,7 +2242,38 @@ async def _run_claude_turn(
                     timeout_sec=600.0,
                     cancel_event=turn_state.get("cancel_event"),
                     progress_callback=progress_callback,
-                )
+                ))
+                ask_started_at = time.monotonic()
+                heartbeat_i = 0
+                try:
+                    while True:
+                        try:
+                            result = await asyncio.wait_for(
+                                asyncio.shield(ask_task), timeout=8.0,
+                            )
+                            break
+                        except asyncio.TimeoutError:
+                            now = time.monotonic()
+                            # Skip heartbeat pokud real event byl recently
+                            if now - claude_progress_state["last_emit_at"] < 7.5:
+                                continue
+                            heartbeat_i += 1
+                            await emit_claude_progress({
+                                "stage": "thinking",
+                                "message": (
+                                    "čekám na první výstup z Claude CLI…"
+                                    if claude_progress_state["count"] <= 1
+                                    else "Claude stále pracuje…"
+                                ),
+                                "elapsed_ms": int((now - ask_started_at) * 1000),
+                                "heartbeat": heartbeat_i,
+                            })
+                except BaseException:
+                    if not ask_task.done():
+                        ask_task.cancel()
+                        with suppress(BaseException):
+                            await ask_task
+                    raise
                 # Save session_id pro continuity. Pass current_perm jako expected
                 # aby reset/revoke během turnu nepřepsal session_id zpět.
                 if result.session_id:
