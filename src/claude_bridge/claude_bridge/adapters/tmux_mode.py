@@ -1,5 +1,13 @@
 """TmuxAdapter - drive `claude` interactive v tmux session (experimental).
 
+Detection markers (ověřeno z claude-code source 2.1.141):
+- `❯` (U+276F figures.pointer): user input prompt indicator
+- `●` (U+25CF) na Linux / `⏺` (U+23FA) na macOS: BLACK_CIRCLE, both
+  for tool_use markers AND assistant message prefix (`● <response>`)
+- `✻ <Verb> for Ns`: turn completion footer (claude-code/src/constants/
+  turnCompletionVerbs.ts). Verbs: Baked|Brewed|Churned|Cogitated|Cooked|
+  Crunched|Sautéed|Worked. Detection: regex `✻ \w+ for \d+\w*s`.
+
 ⚠️ TOS Risk Disclaimer:
 Anthropic Consumer Terms zakazují "automated/non-human access" mimo API key.
 Tmux pseudo-TTY driver je technicky interactive (stdout je TTY), ale
@@ -35,6 +43,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import tempfile
@@ -78,6 +87,13 @@ _IDLE_THRESHOLD = 3
 # Default tmux session window size. Velký aby long lines nepřepadly.
 _TMUX_COLS = 200
 _TMUX_ROWS = 50
+
+# Turn completion footer detection - z claude-code/src/constants/turnCompletionVerbs.ts.
+# Match: `✻ <Verb> for <duration>`, např. `✻ Churned for 6s`, `✻ Cooked for 1m 32s`.
+_TURN_COMPLETION_RE = re.compile(
+    r"✻\s+(?:Baked|Brewed|Churned|Cogitated|Cooked|Crunched|Saut[eé]ed|Worked)"
+    r"\s+for\s+\d+"
+)
 
 
 @dataclass
@@ -252,10 +268,12 @@ class TmuxAdapter:
         - consult: --permission-mode plan --tools ""
         - edit:    --permission-mode acceptEdits --tools <R/E/W/B/G/G> --add-dir <wd>
         """
+        # POZN: `--no-session-persistence` je valid JEN s `--print` (= -p) mode.
+        # V interactive mode (= tmux) musí pryč, jinak claude exit=1 hned po
+        # spawnu s "Error: --no-session-persistence can only be used with --print".
         argv = [
             self.config.claude_bin,
             "--model", model,
-            "--no-session-persistence",
         ]
         if mode == "consult":
             argv += [
@@ -557,10 +575,19 @@ class TmuxAdapter:
         ))
 
         # Polling loop: capture + parse + emit + check done
+        # Done detection (codex iter-2 #11 + reálný TUI observation):
+        # Claude TUI po odpovědi vyrenderuje:
+        #   ● <response text>
+        #   ✻ Crunched for Ns       <- DEFINITIVNÍ "done" marker
+        #   ──────
+        #   ❯ <empty input>
+        # Plus počet `●` markerů v screenu se INCREASES o 1 oproti
+        # pre-send stavu. Použijeme oba checks (Crunched OR new `●`).
         deadline = start + timeout_sec
-        idle_ticks = 0
-        last_screen_hash = 0
         thinking_emitted = False
+        # Count `●`/`⏺` markers PRED send (baseline)
+        pre_capture = before_capture
+        pre_marker_count = pre_capture.count("● ") + pre_capture.count("⏺ ")
         while time.monotonic() < deadline:
             # Cancel check
             if cancel_event is not None and cancel_event.is_set():
@@ -583,14 +610,23 @@ class TmuxAdapter:
                 session.tui = TuiState(cols=_TMUX_COLS, rows=_TMUX_ROWS)
             session.tui.feed(raw)
 
-            # Emit progress for new tool_uses
+            # Emit progress for new tool_uses. POZOR: `● <text>` v TUI je
+            # *response prefix* + tool_use markers (oba pre `●`). Tool_use
+            # follow je `Read 1 file (ctrl+o to expand)` etc - specific tool
+            # names z claude builtins. Filter podle known tool names list,
+            # skip pokud "tool_name" je něco co Claude do response napsal.
+            _KNOWN_TOOLS = {"Read", "Write", "Edit", "Bash", "Glob", "Grep",
+                            "NotebookEdit", "Task", "TodoWrite", "WebFetch",
+                            "WebSearch", "BashOutput", "KillShell"}
             for tu in session.tui.poll_tool_uses():
-                await self._emit_progress(progress_callback, ProgressEvent(
-                    stage="tool_use",
-                    tool_name=tu.tool_name,
-                    message=(f"{tu.tool_name} {tu.args_preview}"
-                             if tu.args_preview else tu.tool_name),
-                ))
+                if tu.tool_name in _KNOWN_TOOLS:
+                    msg = (f"{tu.tool_name} {tu.args_preview}"
+                           if tu.args_preview else tu.tool_name)
+                    await self._emit_progress(progress_callback, ProgressEvent(
+                        stage="tool_use",
+                        tool_name=tu.tool_name,
+                        message=msg,
+                    ))
 
             # Emit thinking progress (once per turn)
             if session.tui.is_thinking() and not thinking_emitted:
@@ -599,15 +635,29 @@ class TmuxAdapter:
                 ))
                 thinking_emitted = True
 
-            # Check done: ready prompt + idle (screen unchanged několik iter)
-            current_hash = hash(tuple(session.tui.screen_lines))
-            if current_hash == last_screen_hash:
-                idle_ticks += 1
-            else:
-                idle_ticks = 0
-                last_screen_hash = current_hash
-            if session.tui.is_ready() and idle_ticks >= _IDLE_THRESHOLD:
+            # Done detection: turn completion footer `✻ <Verb> for Ns`.
+            # Claude UI loží various verbs (Churned/Cooked/Crunched/Baked/...),
+            # všechny z turnCompletionVerbs.ts. Regex match capture-suit complete.
+            screen_text = "\n".join(session.tui.screen_lines)
+            if _TURN_COMPLETION_RE.search(screen_text):
+                # Found done marker. Krátká dodatečná pauza pro complete render.
+                await asyncio.sleep(0.3)
+                # Refresh capture
+                raw_final = await self._capture_pane(session.session_id)
+                if raw_final:
+                    session.last_capture = raw_final
                 break
+            # Backup detection: response marker count increased
+            current_marker_count = raw.count("● ") + raw.count("⏺ ")
+            if current_marker_count > pre_marker_count:
+                # New ● marker appeared (= Claude response). Wait krátce.
+                await asyncio.sleep(0.5)
+                raw_final = await self._capture_pane(session.session_id)
+                if raw_final:
+                    session.last_capture = raw_final
+                # Check že Crunched objevil (= response really done)
+                if "✻" in raw_final or raw_final.count("● ") + raw_final.count("⏺ ") > pre_marker_count:
+                    break
         else:
             # timeout - session DEAD (codex iter-2 #13, no respawn)
             session.state = "DEAD"
@@ -648,11 +698,22 @@ class TmuxAdapter:
         before_capture: str,
         marker: str,
     ) -> str:
-        """Extract assistant text z capture diff (after - before).
+        """Extract assistant text z capture po našem prompt markeru.
 
-        Strategy: najdi `marker` (náš per-turn unique string) v scrollback,
-        text od něj do dalšího prompt indicator (`❯`) = assistant odpověď.
-        Strip ANSI + trim trailing UI chrome.
+        Reálný Claude TUI layout po user message:
+            ❯ <user prompt s marker>
+            (prázdná řádka)
+            ● <Claude's response text>
+            (prázdná řádka)
+            ✻ Crunched for Ns
+            ─────────────
+            ❯  (empty next input)
+
+        Strategy:
+        1. Najdi marker v capture (= náš user prompt řádek)
+        2. Skip past user prompt block - hledej PRVNÍ `● ` po marker
+        3. Collect text od `● ` až do `✻ Churned`, `─────`, nebo `❯ ` empty
+        4. Strip leading `● ` prefix, ANSI, trailing whitespace.
         """
         after = session.last_capture or ""
         idx = after.find(marker)
@@ -660,19 +721,47 @@ class TmuxAdapter:
             # Fallback: diff before/after
             new_content = after[len(before_capture):] if len(after) > len(before_capture) else after
             return strip_ansi(new_content).strip()
-        text = after[idx + len(marker):]
-        clean = strip_ansi(text)
-        # Heuristic: stop at next prompt indicator (❯ = figures.pointer, Unix)
+        text_after_marker = after[idx + len(marker):]
+        clean = strip_ansi(text_after_marker)
         lines = clean.split("\n")
-        result_lines: list[str] = []
-        for line in lines:
-            # Najdi prompt char na začátku řádku (po případném border char)
+
+        # Find assistant response start: first line beginning with `● ` or `⏺ `
+        response_start_idx = -1
+        for i, line in enumerate(lines):
             stripped = line.lstrip()
-            # Check ❯ (figures.pointer) nebo > (Windows fallback) jako standalone
-            if stripped.startswith("❯ ") or stripped == "❯" \
-                    or stripped.startswith("> ") or stripped == ">":
+            if stripped.startswith("● ") or stripped.startswith("⏺ "):
+                response_start_idx = i
                 break
-            result_lines.append(line)
+        if response_start_idx == -1:
+            # No `● ` marker found - return what's between marker and next ❯
+            result_lines: list[str] = []
+            for line in lines:
+                stripped = line.lstrip()
+                if stripped.startswith("❯ ") or stripped == "❯":
+                    break
+                result_lines.append(line)
+            return "\n".join(result_lines).strip()
+
+        # Collect response lines until terminator
+        result_lines = []
+        first = True
+        for line in lines[response_start_idx:]:
+            stripped = line.lstrip()
+            # Terminators: ✻ Churned/Crunched, ────, next ❯
+            if stripped.startswith("✻ ") \
+                    or stripped.startswith("─") \
+                    or stripped.startswith("❯ ") or stripped == "❯":
+                break
+            if first:
+                # Strip leading `● ` or `⏺ ` from first line
+                if stripped.startswith("● "):
+                    stripped = stripped[2:]
+                elif stripped.startswith("⏺ "):
+                    stripped = stripped[2:]
+                result_lines.append(stripped)
+                first = False
+            else:
+                result_lines.append(line)
         return "\n".join(result_lines).strip()
 
     async def _emit_progress(

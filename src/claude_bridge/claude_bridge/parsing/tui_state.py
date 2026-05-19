@@ -31,9 +31,23 @@ from .ansi import contains_spinner_frame
 
 
 # Tool_use marker (figures.pointer mapping platform).
-# Pattern: BLACK_CIRCLE + whitespace + ToolName + optional (args)
-# Linux/Windows BLACK_CIRCLE = ●, macOS = ⏺. Match obě varianty.
+# Pattern 1 (loading): `● ToolName(args)` nebo `⏺ ToolName(args)` na začátku řádku.
+# Pattern 2 (collapsed/done): `  ToolName N <stuff>` BEZ marker. Used pro collapsed
+# Read/Write tool results: `  Read 1 file (ctrl+o to expand)`.
+# Pattern 1 použito v assistant message rendering Cesty load_indicator. Pattern 2
+# je collapsed result text bez load animation.
 _TOOL_USE_RE = re.compile(r"[⏺●]\s+([A-Z][A-Za-z0-9_]+)(?:\(([^)]*)\))?")
+
+# Known Claude builtin tool names - pro pattern 2 (collapsed) matching.
+# Striktní allowlist aby nematchli plain text "Read this code first" apod.
+_KNOWN_BUILTIN_TOOLS = frozenset({
+    "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+    "NotebookEdit", "Task", "TodoWrite",
+    "WebFetch", "WebSearch", "BashOutput", "KillShell",
+})
+_TOOL_USE_COLLAPSED_RE = re.compile(
+    r"^\s+(" + "|".join(_KNOWN_BUILTIN_TOOLS) + r")\s+(.+?)(?:\s+\(ctrl\+o)?$"
+)
 
 # Prompt indicator (figures.pointer = U+276F na Unix, > na Windows).
 # Match jako standalone marker - obvyklý layout: "❯ " na začátku vstupního
@@ -138,25 +152,38 @@ class TuiState:
     def is_ready(self) -> bool:
         """True pokud Claude čeká na user input.
 
-        Detekce: hledáme `❯` (figures.pointer) nebo `>` v posledních 5
-        řádcích screenu. Claude input box layout (PromptInputModeIndicator):
-        "❯ <cursor>     │" nebo bash mode "! <cursor>".
+        Detekce: hledáme `❯` (figures.pointer) v CELÉM screen content.
+        Claude TUI vyplní typicky řádky 1-18 (header + scrollback + input
+        box + footer), zbytek je prázdný whitespace. `❯` je na řádku
+        s input boxem (uprostřed screenu).
+
+        Pozor: `>` jako fallback pro Windows existuje, ale je AMBIGUOUS
+        (může být v textu, kód, Git logs, atd.). Proto pro `>` vyžadujeme
+        striktnější check: `>` na začátku řádku po stripped whitespace.
         """
-        bottom = self._screen.display[-5:]
-        for line in bottom:
-            for c in line:
-                if c in _PROMPT_INDICATOR_CHARS:
-                    # Found prompt indicator on this line - Claude waiting
+        for line in self._screen.display:
+            if "❯" in line:
+                # ❯ je platform-specific unicode pointer = unambiguous Claude marker
+                return True
+            # Windows/dumb terminal fallback: `> ` jako jediný content řádku
+            # (pyte fillne řádek trailing spaces, takže nejdřív obě strany strip)
+            stripped = line.strip()
+            if stripped == ">" or stripped.startswith("> "):
+                # `> ` na začátku po obousměrném strip + krátký content = input prompt
+                if len(stripped) < 5:
                     return True
         return False
 
     def poll_tool_uses(self) -> list[ToolUseObserved]:
         """Vrátí nově detected tool_uses od posledního volání (deduplicated).
 
-        Detekce přes regex `[⏺●] ToolName(args)` v aktuálním screen state.
+        Detekce přes dva regex patterns:
+        1. `[⏺●] ToolName(args)` - loading state (animated ToolUseLoader)
+        2. Collapsed: `^\\s+ToolName N <details>` - po completion bez marker
         """
         new_uses: list[ToolUseObserved] = []
         for idx, line in enumerate(self._screen.display):
+            # Pattern 1: explicit marker
             for m in _TOOL_USE_RE.finditer(line):
                 name = m.group(1)
                 args = (m.group(2) or "").strip()
@@ -169,6 +196,21 @@ class TuiState:
                     args_preview=args[:120],
                     line_index=idx,
                 ))
+            # Pattern 2: collapsed (only checked pokud line nemá marker)
+            if "●" not in line and "⏺" not in line:
+                m2 = _TOOL_USE_COLLAPSED_RE.match(line)
+                if m2 is not None:
+                    name = m2.group(1)
+                    details = m2.group(2).strip()
+                    key = (name, details)
+                    if key in self._seen_tool_uses:
+                        continue
+                    self._seen_tool_uses.add(key)
+                    new_uses.append(ToolUseObserved(
+                        tool_name=name,
+                        args_preview=details[:120],
+                        line_index=idx,
+                    ))
         return new_uses
 
     def check_idle(self) -> int:
