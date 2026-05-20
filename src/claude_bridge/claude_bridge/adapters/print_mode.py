@@ -164,6 +164,9 @@ async def _read_stream(
 ) -> dict | None:
     """Čte NDJSON ze stdout řádek po řádku, dispatch events. Vrací finální
     `result` event obj (nebo None pokud stream skončil bez result)."""
+    log.info("claude _read_stream START pid=%s", proc.pid)
+    lines_read = 0
+    payloads_emitted = 0
     while True:
         try:
             line = await proc.stdout.readline()
@@ -174,7 +177,12 @@ async def _read_stream(
             log.warning("claude stdout read error: %s", e)
             break
         if not line:
-            break  # EOF
+            log.info(
+                "claude _read_stream EOF pid=%s lines=%d emitted=%d",
+                proc.pid, lines_read, payloads_emitted,
+            )
+            break
+        lines_read += 1
         try:
             obj = json.loads(line.decode("utf-8", errors="replace").rstrip())
         except (ValueError, UnicodeDecodeError):
@@ -182,9 +190,14 @@ async def _read_stream(
         if not isinstance(obj, dict):
             continue
         if obj.get("type") == "result":
+            log.info(
+                "claude _read_stream RESULT pid=%s lines=%d emitted=%d",
+                proc.pid, lines_read, payloads_emitted,
+            )
             return obj
         payload = parse_stream_event(obj, state)
         if payload is not None:
+            payloads_emitted += 1
             await _safe_progress(progress_cb, payload)
     return None
 
@@ -225,6 +238,13 @@ async def ask_claude_oneshot(
     """
     if not prompt or not prompt.strip():
         return {"ok": False, "error": "empty prompt", "mode": mode}
+    if cancel_event is not None and not isinstance(cancel_event, asyncio.Event):
+        # threading.Event.wait() is sync-blocking; asyncio.create_task on it
+        # freezes the entire event loop (no subprocess I/O, no progress).
+        raise TypeError(
+            f"cancel_event must be asyncio.Event, got "
+            f"{type(cancel_event).__module__}.{type(cancel_event).__name__}"
+        )
     try:
         argv = _build_argv(
             claude_bin=claude_bin, mode=mode, model=model,

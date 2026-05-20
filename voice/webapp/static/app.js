@@ -380,14 +380,14 @@ function renderClaudeResultBlock(ev) {
   if (!ev) return null;
   const wrap = document.createElement('div');
   wrap.className = 'claude-result-card';
-  wrap.dataset.mode = ev.mode || 'consult';
+  wrap.dataset.mode = ev.mode || 'edit';
   const head = document.createElement('div');
   head.className = 'claude-result-head';
   const cost = ev.total_cost_usd != null ? `$${Number(ev.total_cost_usd).toFixed(4)}` : '-';
   const dur = ev.duration_ms != null ? `${(ev.duration_ms / 1000).toFixed(1)}s` : '-';
   const tools = (ev.tool_uses || []).join(', ') || '-';
   head.innerHTML = `
-    <span class="claude-result-badge">🤖 ${escapeHtml(ev.model || 'claude')} · ${escapeHtml(ev.mode || 'consult')}</span>
+    <span class="claude-result-badge">🤖 ${escapeHtml(ev.model || 'claude')} · ${escapeHtml(ev.mode || 'edit')}</span>
     <span class="claude-result-meta">cost ${cost} · ${dur} · tools: ${escapeHtml(tools)} · adapter: ${escapeHtml(ev.adapter || '?')}</span>
   `;
   wrap.appendChild(head);
@@ -1094,7 +1094,7 @@ async function runTurn() {
           case 'claude_turn_started': {
             // Claude mode: server začal volat adapter.ask().
             setPhase('thinking');
-            const msg = `🤖 ${ev.model || 'claude'} · ${ev.mode || 'consult'} · čeká na odpověď…`;
+            const msg = `🤖 ${ev.model || 'claude'} · ${ev.mode || 'edit'} · čeká na odpověď…`;
             ctx.claudeStartedAt = Date.now();
             // Add inline status to current assistant message with pulsing dot
             ensureAssistantBubble(ctx);
@@ -1109,24 +1109,9 @@ async function runTurn() {
               ctx.claudeDurationInterval = setInterval(() => {
                 if (!ctx.claudeStartedAt) return;
                 const sec = Math.floor((Date.now() - ctx.claudeStartedAt) / 1000);
-                ind.textContent = `🤖 ${ev.model || 'claude'} · ${ev.mode || 'consult'} · ${sec}s…`;
+                ind.textContent = `🤖 ${ev.model || 'claude'} · ${ev.mode || 'edit'} · ${sec}s…`;
               }, 500);
             }
-            break;
-          }
-          case 'claude_approval_required': {
-            // Stop active duration counter pokud byl
-            if (ctx.claudeDurationInterval) {
-              clearInterval(ctx.claudeDurationInterval);
-              ctx.claudeDurationInterval = null;
-            }
-            // Server-side gate: user chce edit ale nedal "ano povoluju".
-            const note = `🔒 ${ev.msg}`;
-            addMessage('assistant', note);
-            state.messages.push({ role: 'assistant', content: note });
-            persistMessages();
-            setPhase('idle');
-            ctx.streamDone = true;
             break;
           }
           case 'claude_result': {
@@ -1141,7 +1126,7 @@ async function runTurn() {
               const sec = ctx.claudeStartedAt
                 ? Math.floor((Date.now() - ctx.claudeStartedAt) / 1000)
                 : 0;
-              ctx.claudeStatusEl.textContent = `🤖 ${ev.model || 'claude'} · ${ev.mode || 'consult'} · ${sec}s ${ev.ok ? '✓' : '✗'}`;
+              ctx.claudeStatusEl.textContent = `🤖 ${ev.model || 'claude'} · ${ev.mode || 'edit'} · ${sec}s ${ev.ok ? '✓' : '✗'}`;
             }
             // Final result z Claude adapter - render jako claude_result_card.
             ctx.streamDone = true;
@@ -1215,14 +1200,20 @@ async function runTurn() {
     }
   } catch (e) {
     if (e.name !== 'AbortError') {
-      // Sticky = user musí mít čas přečíst (typicky stack trace nebo ollama body).
-      // Console log s plnou exception pro DevTools dive.
       console.error('Turn error:', e);
       showError(`Turn: ${e.message}`, { sticky: true });
     }
     ctx.canceled = true;
     ctx.streamDone = true;
     assistantEl.classList.remove('streaming');
+    if (ctx.claudeStatusEl) {
+      ctx.claudeStatusEl.classList.remove('claude-status-active');
+      ctx.claudeStatusEl.classList.add('claude-status-error');
+      if (ctx.claudeTimerHandle) {
+        clearInterval(ctx.claudeTimerHandle);
+        ctx.claudeTimerHandle = null;
+      }
+    }
     state.chatAbort = null;
     maybeFinishTurnCtx(ctx);
     return;
@@ -1394,20 +1385,25 @@ function toggleMode() {
   playModeBeep(next);
 }
 
-// Refresh permission badge - poll server pro current state.
+// Refresh claude session badge - shows model + session ID.
 async function refreshClaudePermBadge() {
   const badge = document.getElementById('claude-perm-badge');
   if (!badge) return;
   try {
     const r = await fetch('/api/claude_ui_state');
     if (!r.ok) return;
-    const state = await r.json();
-    const perm = state.permission_mode || 'consult';
-    badge.dataset.perm = perm;
-    badge.textContent = perm === 'edit' ? '✏️ edit allowed' : '🔒 read-only';
-    badge.title = perm === 'edit'
-      ? `editace povolena (approved ${new Date((state.approved_at || 0) * 1000).toLocaleTimeString()})`
-      : 'jen čtení; pro editaci napiš "ano povoluju" + akci';
+    const s = await r.json();
+    const model = s.model || 'opus';
+    const sid = s.claude_session_id;
+    if (sid) {
+      badge.dataset.session = 'active';
+      badge.textContent = `${model} · session ${String(sid).slice(0, 8)}`;
+      badge.title = `Claude session ${sid} (klikni Reset pro novou)`;
+    } else {
+      badge.dataset.session = 'none';
+      badge.textContent = `${model} · nová session`;
+      badge.title = 'První zpráva spustí čerstvou Claude session';
+    }
   } catch (e) {
     console.warn('claude perm badge refresh failed', e);
   }
@@ -1551,18 +1547,15 @@ if (_claudeModelSel) {
   });
 }
 
-// Click on permission badge → fetch + reset prompt
+// Click on claude session badge → reset session prompt
 const _claudePermBadge = document.getElementById('claude-perm-badge');
 if (_claudePermBadge) {
   _claudePermBadge.addEventListener('click', async () => {
-    if (_claudePermBadge.dataset.perm === 'edit') {
-      // Allow user to revoke edit permission (= reset to consult)
-      if (confirm('Zrušit oprávnění k editaci? Aktuální Claude session bude ukončena (permission_mode je immutable per process).')) {
+    if (_claudePermBadge.dataset.session === 'active') {
+      if (confirm('Zabít aktuální Claude session a startovat čerstvou? Kontext bude ztracen.')) {
         await fetch('/api/claude_ui_state/reset', { method: 'POST' });
         refreshClaudePermBadge();
       }
-    } else {
-      alert('Pro povolení editace napiš/řekni "ano povoluju" + tvoji akci v dalším dotazu.');
     }
   });
 }

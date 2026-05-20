@@ -1108,7 +1108,7 @@ body {
   background: rgba(168, 85, 247, 0.22);
 }
 
-/* Claude permission badge (read-only vs edit allowed) */
+/* Claude session badge - shows active session / fresh session, click resets. */
 .claude-perm-badge {
   display: inline-flex;
   align-items: center;
@@ -1121,15 +1121,15 @@ body {
   text-transform: uppercase;
   cursor: pointer;
 }
-.claude-perm-badge[data-perm="consult"] {
+.claude-perm-badge[data-session="none"] {
   background: rgba(148, 163, 184, 0.15);
   border: 1px solid rgba(148, 163, 184, 0.4);
   color: #cbd5e1;
 }
-.claude-perm-badge[data-perm="edit"] {
-  background: rgba(251, 146, 60, 0.18);
-  border: 1px solid rgba(251, 146, 60, 0.5);
-  color: #fb923c;
+.claude-perm-badge[data-session="active"] {
+  background: rgba(96, 165, 250, 0.18);
+  border: 1px solid rgba(96, 165, 250, 0.5);
+  color: #93c5fd;
 }
 
 /* Claude status indicator v assistant bubble - pulsing dot dokud běží */

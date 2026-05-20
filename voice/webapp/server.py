@@ -720,19 +720,18 @@ async def client_log(req: Request):
 
 @app.get("/api/claude_ui_state")
 async def claude_ui_state():
-    """Vrátí persistent Claude mode state (permission_mode, model, ...).
-    Frontend volá při enter do claude mode pro badge refresh."""
+    """Vrátí persistent Claude mode state (claude_session_id, model).
+    Frontend volá při enter do claude mode pro session badge refresh."""
     return _load_claude_ui_state()
 
 
 @app.post("/api/claude_ui_state/reset")
 async def claude_ui_state_reset():
-    """Reset Claude mode state (revoke approval, force consult).
+    """Reset Claude session: zabít tmux session + clear session_id.
 
-    Per codex iter-11 HIGH: revoke MUSÍ killnout existující Claude session,
-    jinak edit-capable Claude process běží dál v tmux registry. Order:
+    Order:
     1) Read old session_id pod lockem
-    2) Write fresh consult state (snapshot stop-the-world)
+    2) Write fresh state (session_id=None)
     3) Kill old session v adapter mimo lock (kill je async, nedržíme lock).
     """
     old_sid: str | None = None
@@ -740,29 +739,26 @@ async def claude_ui_state_reset():
         cur = _load_claude_ui_state()
         old_sid = cur.get("claude_session_id")
         _save_claude_ui_state({
-            "permission_mode": "consult",
-            "destructive_approved": False,
             "claude_session_id": None,
-            "model": "opus",
-            "approved_at": None,
+            "model": cur.get("model") or "opus",
         })
     # Kill old session v adapter (mimo lock - kill_session může dlouho trvat)
     if old_sid and _CLAUDE_ADAPTER is not None:
         try:
             await _CLAUDE_ADAPTER.kill_session(old_sid)
-            log.info("revoke killed claude session %s", old_sid)
+            log.info("reset killed claude session %s", old_sid)
         except Exception as e:
-            log.warning("revoke kill_session %s failed: %s", old_sid, e)
+            log.warning("reset kill_session %s failed: %s", old_sid, e)
     return {"ok": True, "killed_session": old_sid}
 
 
 @app.get("/api/approval_config")
 async def approval_config():
-    """Vrátí seznam frází, které frontend mapuje na approve/deny rozhodnutí
-    při hlasovém approval, a canonical destructive frázi pro `requires_explicit`
-    operace.
+    """Voice approval config pro AGENT mode tool approvals (nesouvisí s claude
+    mode - tam byla phrase odstraněna 2026-05-19).
 
-    Frontend volá při startu UI; výsledek se cachuje pro životnost stránky.
+    Agent mode destructive tool call → UI modal s [Allow] [Deny] + voice
+    fallback (user může říct "ano povoluju" místo kliku).
     """
     from voice.agent.config import (
         APPROVE_PHRASES,
@@ -1804,17 +1800,16 @@ async def _run_agent_turn(
 # ──────────────── Claude mode handler (Fáze 4) ────────────────
 
 # Per-user persistent state pro Claude mode session.
-# Schema: { "permission_mode": "consult"|"edit",
-#           "destructive_approved": bool,
-#           "claude_session_id": str | None,
-#           "model": "opus"|"sonnet"|"haiku",
-#           "approved_at": timestamp | None }
+# Schema: { "claude_session_id": str | None,
+#           "model": "opus"|"sonnet"|"haiku" }
 #
-# CRITICAL (codex iter-6): state file MUSÍ být MIMO WORKDIR. Pokud by byl v
-# workdiru, agent write_file/edit_file (AUTO permission v sandbox) by mohl
-# přepsat permission_mode na "edit" bez user approval → bypass destructive
-# gate. Místo toho používáme XDG state dir (~/.local/state/gemma/) co agent
-# nemůže přepsat (mimo sandbox).
+# Design (2026-05-19 redesign): Claude mode = vždy edit. Workdir sandbox +
+# claude --permission-mode acceptEdits chrání destruktivní ops; náš overlay
+# gate s text fází byl odstraněn (špatné UX). Budoucí UI modal pro irreversible
+# ops přijde přes MCP permission tool, ne přes text prefix.
+#
+# State file záměrně MIMO WORKDIR (XDG_STATE_HOME) aby agent mode write_file
+# nemohl přepsat session_id (cross-mode integrity).
 def _claude_ui_state_path() -> Path:
     """Vrátí cestu k state file MIMO WORKDIR (agent ho nemůže přepsat).
 
@@ -1853,11 +1848,20 @@ def _claude_ui_state_path() -> Path:
 
 def _default_claude_ui_state() -> dict:
     return {
-        "permission_mode": "consult",
-        "destructive_approved": False,
         "claude_session_id": None,
         "model": "opus",
-        "approved_at": None,
+    }
+
+
+def _normalize_claude_ui_state(state: dict) -> dict:
+    """Strip legacy permission_mode/destructive_approved/approved_at fields.
+
+    Old state files (pre-2026-05-19 redesign) may still have these — drop them
+    so they don't leak to the UI.
+    """
+    return {
+        "claude_session_id": state.get("claude_session_id"),
+        "model": state.get("model") or "opus",
     }
 
 
@@ -1867,7 +1871,8 @@ def _load_claude_ui_state() -> dict:
     if not path.exists():
         return _default_claude_ui_state()
     try:
-        return json.loads(path.read_text())
+        raw = json.loads(path.read_text())
+        return _normalize_claude_ui_state(raw)
     except (json.JSONDecodeError, OSError):
         log.warning("claude_ui_state.json corrupt, using defaults")
         return _default_claude_ui_state()
@@ -1935,61 +1940,36 @@ async def _init_claude_adapter():
     return adapter
 
 
-async def _update_claude_session_id(session_id: str | None, expected_mode: str) -> None:
-    """Merge-update `claude_session_id` jen pokud current `permission_mode`
-    pořád odpovídá `expected_mode` (codex iter-6 HIGH).
+_CLAUDE_NO_CAS = object()  # sentinel: no CAS check, unconditional write
 
-    Race scenario: edit turn běží + user clicked reset → state se přepne na
-    consult. Turn dokončí + zavolá update s edit session_id. Bez mode-check
-    by se edit session_id vrátil do consult state. Fix: skip update pokud
-    mode už není ten co byl při start turn (reset perspective wins).
+
+async def _update_claude_session_id(
+    session_id: str | None,
+    expected_prior: str | None | object = _CLAUDE_NO_CAS,
+) -> bool:
+    """Merge-update `claude_session_id` v state file pod lockem.
+
+    Pokud `expected_prior` je passnut (= ne sentinel), provede compare-and-swap:
+    write proběhne JEN když current state.claude_session_id == expected_prior.
+    Brání race kdy reset endpoint vyčistí state mid-turn a turn pak overwriteu
+    reset nazpět svým session_id (codex review 2026-05-19 HIGH #1).
+
+    Returns: True pokud write proběhl, False pokud CAS selhal.
     """
     async with _CLAUDE_STATE_LOCK:
         current = _load_claude_ui_state()
-        if current.get("permission_mode") != expected_mode:
-            log.info(
-                "skipping session_id update: mode changed (%s → %s) - "
-                "likely reset/revoke during turn",
-                expected_mode, current.get("permission_mode"),
-            )
-            return
+        if expected_prior is not _CLAUDE_NO_CAS:
+            actual_prior = current.get("claude_session_id")
+            if actual_prior != expected_prior:
+                log.info(
+                    "claude session_id CAS skip: expected_prior=%r actual=%r "
+                    "(likely reset/SessionNotFound retry mid-turn)",
+                    expected_prior, actual_prior,
+                )
+                return False
         current["claude_session_id"] = session_id
         _save_claude_ui_state(current)
-
-
-# Edit intent detection - keywords v user message co indikují edit operaci.
-# Per codex iter-3 #2: bez explicit "ano povoluju" Claude nesmí získat Write/Bash.
-#
-# REÁLNÝ BUG (2026-05-19): User napsal "zkus vytvořit hello2.py" - regex
-# `\bvytvoř\b` nematchoval kvůli word boundary za `ř`. Czech skloňování
-# vyžaduje `\w*` suffix wildcard po kořeni (vytvořit/vytvořím/vytvořila/...).
-# Testy s "vytvoř soubor" (imperativ) prošly, ale "vytvořit" (infinitiv) ne.
-import re as _re
-# Czech kořeny (skloňování přes \w* za kořenem):
-_CZ_ROOTS = (
-    r"vytvo[řr]", r"naps[aá]", r"nap[ií][šs]", r"sma[žz]", r"smaza?",
-    r"uprav", r"zm[eě]n", r"odstra[ňn]", r"odebra?",
-    r"spus[ťt]", r"spou[šs]t", r"prove[ďd]", r"implementuj", r"implementov",
-    r"oprav", r"refaktoruj", r"refactoruj", r"p[řr]idej", r"p[řr]id[aá]",
-    r"zapi[šs]", r"zap[íi][šs]", r"zaps[aá]",
-    r"p[řr]epi[šs]", r"p[řr]ep[íi][šs]", r"p[řr]epsa?",
-    r"genera?", r"vygenera?", r"ud[eě]l",  # udělej/udělat/uděláme/udělal
-)
-# English roots (modify/run/...) - žádné skloňování, ale `\w*` pro -ing/-ed/-s:
-_EN_ROOTS = (
-    r"creat", r"writ", r"wrote", r"edit", r"modif", r"chang",
-    r"delet", r"remov", r"implement", r"fix",
-    r"refactor", r"add", r"updat", r"run", r"ran", r"execut",
-    r"generat", r"build", r"built",
-)
-_CLAUDE_EDIT_INTENT_RE = _re.compile(
-    r"(?ix)\b(?:" + "|".join(r + r"\w*" for r in _CZ_ROOTS + _EN_ROOTS) + r")\b"
-)
-
-
-def _detect_edit_intent(user_text: str) -> bool:
-    """True pokud user message obsahuje edit-intent keyword."""
-    return bool(_CLAUDE_EDIT_INTENT_RE.search(user_text or ""))
+        return True
 
 
 async def _run_claude_turn(
@@ -2003,23 +1983,18 @@ async def _run_claude_turn(
     """Claude mode NDJSON stream: priamy dialog s Claude přes adapter.
 
     Žádný Gemma routing per turn, žádný agent loop. Server forwarduje user
-    message do adapter.ask(), streamuje progress events + final result.
+    message do adapter.ask() s mode="edit", streamuje progress events + final
+    result.
 
-    Per codex iter-3 #2 + sonnet C2: ClaudeModePermissionGate na server cestě
-    PŘED adapter.ask(). Per-session permission state v
-    `.gemma_local/claude_ui_state.json`:
-        - permission_mode: consult|edit (immutable per Claude process)
-        - destructive_approved: bool (jednou na session opt-in s "ano povoluju")
+    Design (2026-05-19 redesign): claude mode = vždy edit. Bezpečnost zajištěna
+    workdir sandbox (`--add-dir WORKDIR`) + claude vlastní `acceptEdits`
+    permission policy (claude sám blokuje destruktivní shell ops).
 
-    Edit intent detection: user message obsahuje vytvoř/uprav/spusť/... AND
-    permission_mode=="consult" → emit approval_required → user pošle phrase
-    → upgrade na edit + spawn new session (immutable invariant).
-
-    Adapter: print_mode default; tmux opt-in přes config (experimental).
+    Adapter: print_mode default; tmux opt-in přes AGENT_CLAUDE_BRIDGE_MODE=tmux.
     """
     from voice.agent.config import WORKDIR
     from claude_bridge import (
-        ProgressEvent, SessionDead, SessionBusy,
+        ProgressEvent, SessionDead, SessionBusy, SessionNotFound, SessionInfo,
     )
 
     asyncio_loop = asyncio.get_running_loop()
@@ -2060,87 +2035,10 @@ async def _run_claude_turn(
     }
     full_model = _MODEL_ALIAS[model_label]
 
-    # ClaudeModePermissionGate (codex iter-5 + iter-6):
-    # Phrase upgrade vyžaduje VŠECHNY:
-    #   1) phrase na začátku user message + word boundary (codex iter-6 HIGH):
-    #      `ano povoluju ` ano, `ano povolujunapiš` NE (akceptováno by spustilo edit
-    #      bez explicit user intent).
-    #   2) edit intent v strip-nutém promptu (po phrase + boundary)
-    #   3) current_perm == "consult" (immutable invariant - upgrade jen z consult)
-    # State write pod _CLAUDE_STATE_LOCK (codex iter-6 HIGH: race fix).
-    wants_edit = _detect_edit_intent(user_text)
-    current_perm = ui_state.get("permission_mode", "consult")
-
-    from voice.agent.config import DESTRUCTIVE_APPROVAL_PHRASE
-    # Boundary-strict regex: phrase MUSÍ končit whitespace nebo punctuation.
-    # `re.escape` aby případné special chars v fráze neselhaly.
-    _phrase_re = _re.compile(
-        r"^\s*" + _re.escape(DESTRUCTIVE_APPROVAL_PHRASE) + r"(?:[\s,.!?;:]+|$)",
-        _re.IGNORECASE,
-    )
-    phrase_match = _phrase_re.match(user_text)
-    has_phrase = phrase_match is not None
-    if has_phrase:
-        user_text_stripped = user_text[phrase_match.end():].lstrip()
-        wants_edit_stripped = _detect_edit_intent(user_text_stripped)
-    else:
-        user_text_stripped = user_text
-        wants_edit_stripped = wants_edit
-
-    if has_phrase and wants_edit_stripped and current_perm == "consult":
-        # Atomic state update pod lockem (codex iter-6 HIGH state lock fix)
-        async with _CLAUDE_STATE_LOCK:
-            fresh = _load_claude_ui_state()
-            fresh["permission_mode"] = "edit"
-            fresh["destructive_approved"] = True
-            fresh["approved_at"] = time.time()
-            fresh["claude_session_id"] = None
-            _save_claude_ui_state(fresh)
-            ui_state = fresh  # use fresh for rest of this turn
-        current_perm = "edit"
-        # Forward strip-nutý prompt do Claude
-        user_text = user_text_stripped
-
-    # Real-world bug (2026-05-19): user pošle SAMOTNÉ "ano povoluju" bez akce,
-    # po strip zbude "" nebo žádný edit intent → my passli to do consult adapter
-    # jako prompt "ano povoluju" → Claude opus think 2+ minuty na nesmysl.
-    # Fix: phrase BEZ akce → vrátit instrukci, ne spawn Claude.
-    if has_phrase and not wants_edit_stripped:
-        async def phrase_only_gen():
-            yield json.dumps({
-                "type": "claude_approval_required",
-                "msg": (
-                    f"Frázi \"{DESTRUCTIVE_APPROVAL_PHRASE}\" jsi poslal samotnou. "
-                    "Pošli ji v JEDNÉ zprávě spolu s konkrétní akcí, např.: "
-                    f"\"{DESTRUCTIVE_APPROVAL_PHRASE} vytvoř hello.py\""
-                ),
-                "required_phrase": DESTRUCTIVE_APPROVAL_PHRASE,
-                "current_mode": "consult",
-                "requested_mode": "edit",
-                "reason": "phrase_without_action",
-            }).encode() + b"\n"
-            yield json.dumps({"type": "agent_done"}).encode() + b"\n"
-        return StreamingResponse(phrase_only_gen(), media_type="application/x-ndjson",
-                                 headers={"X-Turn-Id": tid})
-
-    # Pokud user chce edit ale (a) nedal phrase, NEBO (b) phrase je tam ale
-    # bez edit intent (= confused user) → request approval
-    if wants_edit and current_perm == "consult":
-        async def gate_gen():
-            yield json.dumps({
-                "type": "claude_approval_required",
-                "msg": (
-                    "Claude session je v read-only módu. Pro editaci souborů "
-                    f"začni dotaz frází \"{DESTRUCTIVE_APPROVAL_PHRASE}\" + tvoji akci. "
-                    f"Příklad: \"{DESTRUCTIVE_APPROVAL_PHRASE} vytvoř hello.py\""
-                ),
-                "required_phrase": DESTRUCTIVE_APPROVAL_PHRASE,
-                "current_mode": "consult",
-                "requested_mode": "edit",
-            }).encode() + b"\n"
-            yield json.dumps({"type": "agent_done"}).encode() + b"\n"
-        return StreamingResponse(gate_gen(), media_type="application/x-ndjson",
-                                 headers={"X-Turn-Id": tid})
+    # Claude mode = vždy edit. Phrase gate odstraněn (2026-05-19 redesign).
+    # Bezpečnost: workdir sandbox (--add-dir WORKDIR) + claude --permission-mode
+    # acceptEdits (claude sám blokuje destruktivní shell ops).
+    current_perm = "edit"
 
     # Use singleton adapter (codex iter-5 HIGH #3). Tmux MUSÍ být long-lived
     # napříč turns aby session registry zůstal.
@@ -2169,11 +2067,10 @@ async def _run_claude_turn(
         claude_progress_state["last_emit_at"] = time.monotonic()
         claude_progress_state["count"] += 1
         stage = payload_dict.get("stage")
-        if stage in {"started", "tool_use", "tool_result"}:
-            log.info(
-                "claude progress tid=%s stage=%s message=%r",
-                tid, stage, payload_dict.get("message"),
-            )
+        log.info(
+            "claude emit tid=%s stage=%s count=%d message=%r",
+            tid, stage, claude_progress_state["count"], payload_dict.get("message"),
+        )
         await out_queue.put({
             "type": "tool_progress",
             "tool": "claude",
@@ -2191,8 +2088,31 @@ async def _run_claude_turn(
         elif isinstance(payload, dict):
             payload_dict = payload
         else:
+            log.warning("progress_callback: unknown payload type %s", type(payload).__name__)
             return
         await emit_claude_progress(payload_dict)
+
+    # Bridge threading.Event (turn_state) → asyncio.Event for adapter.ask.
+    # CRITICAL: bridge does asyncio.create_task(cancel_event.wait()). For
+    # threading.Event, .wait() is a SYNC blocking call that freezes the entire
+    # asyncio loop (no subprocess I/O, no progress events). asyncio.Event.wait()
+    # returns a coroutine. Mirror task watches the threading event in a thread
+    # and sets the asyncio event from the loop.
+    claude_cancel_aio = asyncio.Event()
+    threading_ce = turn_state.get("cancel_event")
+
+    async def _mirror_cancel() -> None:
+        # POZOR: NESMÍ použít run_in_executor(None, threading_ce.wait) - executor
+        # thread není cancellable a po normálním (= ne-cancel) dokončení turnu by
+        # zůstal navždy blokovaný → po pár desítkách turnů thread pool vyčerpán
+        # a celá FastAPI app uvízne (codex+gemini review 2026-05-19).
+        if threading_ce is None:
+            return
+        while not threading_ce.is_set():
+            await asyncio.sleep(0.1)
+        claude_cancel_aio.set()
+
+    mirror_task = asyncio.create_task(_mirror_cancel())
 
     async def driver() -> None:
         """Run adapter.ask() + push events do out_queue.
@@ -2203,18 +2123,42 @@ async def _run_claude_turn(
         try:
             # Serialize concurrent turns
             async with _CLAUDE_TURN_LOCK:
-                # Re-read ui_state AŽ pod lockem (state mohl mezi tím změnit
-                # další turn nebo revoke endpoint). Snapshot pro tento turn.
+                # Re-read ui_state AŽ pod lockem (reset endpoint mohl zabít
+                # session mezi tím). Snapshot pro tento turn.
                 fresh_ui_state = _load_claude_ui_state()
-                # Pokud permission_mode mezi tím změnil (= reset proběhl) a
-                # current_perm je edit, abortneme - user musí poslat phrase znovu.
-                if current_perm == "edit" and fresh_ui_state.get("permission_mode") != "edit":
-                    await out_queue.put({
-                        "type": "error",
-                        "msg": "Edit oprávnění bylo zrušeno během turnu. Pošli prompt znovu s 'ano povoluju'.",
-                    })
-                    return
                 effective_session_id = fresh_ui_state.get("claude_session_id")
+
+                # Model immutability: claude binary se spustí s `--model X` a
+                # nelze ji změnit. Pokud user změnil model selector v UI a
+                # existující session byla spawnnutá s jiným modelem, vyžádej
+                # kill+respawn (jinak user mluví s minulým modelem aniž by to
+                # věděl).
+                if effective_session_id is not None:
+                    existing: SessionInfo | None = None
+                    try:
+                        existing = await adapter.get_session(effective_session_id)
+                    except Exception as e:
+                        log.warning("get_session(%s) selhal: %s", effective_session_id, e)
+                    if existing is not None and existing.model != full_model:
+                        log.info(
+                            "claude model switch: session %s spawned s %s, "
+                            "user nyní žádá %s - kill + fresh respawn",
+                            effective_session_id, existing.model, full_model,
+                        )
+                        with suppress(Exception):
+                            await adapter.kill_session(effective_session_id)
+                        await _update_claude_session_id(
+                            None, expected_prior=effective_session_id,
+                        )
+                        effective_session_id = None
+                        await emit_claude_progress({
+                            "stage": "started",
+                            "message": (
+                                f"přepínám model z {existing.model} na {full_model} — "
+                                f"startuju novou session"
+                            ),
+                        })
+
                 # Emit started event so UI sees activity
                 await out_queue.put({
                     "type": "claude_turn_started",
@@ -2240,7 +2184,7 @@ async def _run_claude_turn(
                     workdir=WORKDIR if current_perm == "edit" else None,
                     session_id=effective_session_id,
                     timeout_sec=600.0,
-                    cancel_event=turn_state.get("cancel_event"),
+                    cancel_event=claude_cancel_aio,
                     progress_callback=progress_callback,
                 ))
                 ask_started_at = time.monotonic()
@@ -2274,10 +2218,14 @@ async def _run_claude_turn(
                         with suppress(BaseException):
                             await ask_task
                     raise
-                # Save session_id pro continuity. Pass current_perm jako expected
-                # aby reset/revoke během turnu nepřepsal session_id zpět.
+                # Save session_id pro continuity napříč turny. CAS proti
+                # effective_session_id zachytí race kdy reset endpoint mid-turn
+                # vyčistil state - nepřepíšeme reset svým novým session_id
+                # (codex review 2026-05-19 HIGH #1).
                 if result.session_id:
-                    await _update_claude_session_id(result.session_id, current_perm)
+                    await _update_claude_session_id(
+                        result.session_id, expected_prior=effective_session_id,
+                    )
                 # Emit claude_result event
                 await out_queue.put({
                     "type": "claude_result",
@@ -2297,8 +2245,60 @@ async def _run_claude_turn(
                 "type": "claude_session_dead",
                 "msg": str(e),
             })
-            # Reset session_id (merge-style, mode-check)
-            await _update_claude_session_id(None, current_perm)
+            await _update_claude_session_id(None)
+        except SessionNotFound as e:
+            # Stale session_id (typicky po přepnutí adapteru print↔tmux nebo
+            # restartu serveru). Auto-recover: clear session_id + retry s None.
+            # MUSÍ běžet UVNITŘ _CLAUDE_TURN_LOCK pokud retry-er drží lock; tady
+            # už lock jsme pustili (raise vyletěl ven), takže reacquire-neme +
+            # CAS chrání proti interleavu s jiným turn (codex HIGH #2).
+            log.info("claude session not found, clearing and retrying: %s", e)
+            await _update_claude_session_id(None)
+            await emit_claude_progress({
+                "stage": "started",
+                "message": "Předchozí Claude session expirovala, startuju novou…",
+            })
+            try:
+                async with _CLAUDE_TURN_LOCK:
+                    # Re-read state pod retry lockem - jiný turn mohl mezitím
+                    # naběhnout a vytvořit novou session. Pokud ano, použij ji.
+                    retry_ui_state = _load_claude_ui_state()
+                    retry_expected_prior = retry_ui_state.get("claude_session_id")
+                    retry_task = asyncio.create_task(adapter.ask(
+                        prompt=user_text,
+                        model=full_model,
+                        mode=current_perm,
+                        workdir=WORKDIR if current_perm == "edit" else None,
+                        session_id=retry_expected_prior,
+                        timeout_sec=600.0,
+                        cancel_event=claude_cancel_aio,
+                        progress_callback=progress_callback,
+                    ))
+                    result = await retry_task
+                    if result.session_id:
+                        await _update_claude_session_id(
+                            result.session_id,
+                            expected_prior=retry_expected_prior,
+                        )
+                    await out_queue.put({
+                        "type": "claude_result",
+                        "ok": result.ok,
+                        "text": result.text,
+                        "model": result.model,
+                        "mode": result.mode,
+                        "session_id": result.session_id,
+                        "duration_ms": result.duration_ms,
+                        "tool_uses": list(result.tool_uses),
+                        "total_cost_usd": result.total_cost_usd,
+                        "error": result.error,
+                        "adapter": result.adapter,
+                    })
+            except Exception as e2:
+                log.exception("claude turn retry failed")
+                await out_queue.put({
+                    "type": "error",
+                    "msg": f"Retry po stale session selhal: {type(e2).__name__}: {e2}",
+                })
         except SessionBusy as e:
             await out_queue.put({
                 "type": "error",
@@ -2311,26 +2311,44 @@ async def _run_claude_turn(
                 "msg": f"{type(e).__name__}: {e}",
             })
         finally:
+            if not mirror_task.done():
+                mirror_task.cancel()
+                with suppress(BaseException):
+                    await mirror_task
             await out_queue.put(_SENTINEL)
 
     asyncio.create_task(driver())
 
     async def gen() -> AsyncGenerator[bytes, None]:
         # Emit lang first (same as chat/agent)
+        log.info("claude gen tid=%s START yielding user_lang", tid)
         yield json.dumps({"type": "user_lang", "lang": user_lang}).encode() + b"\n"
+        yielded = 0
         while True:
-            if await req.is_disconnected() or turn_state.get("canceled"):
+            disc = await req.is_disconnected()
+            if disc or turn_state.get("canceled"):
+                log.info(
+                    "claude gen tid=%s BREAK (disconnected=%s canceled=%s) yielded=%d",
+                    tid, disc, turn_state.get("canceled"), yielded,
+                )
                 ce = turn_state.get("cancel_event")
                 if ce is not None:
                     ce.set()
                 break
             try:
-                ev = await asyncio.wait_for(out_queue.get(), timeout=30.0)
+                ev = await asyncio.wait_for(out_queue.get(), timeout=5.0)
             except asyncio.TimeoutError:
-                # heartbeat - keep connection alive
                 continue
             if ev is _SENTINEL:
+                log.info("claude gen tid=%s SENTINEL after %d events", tid, yielded)
                 break
+            yielded += 1
+            ev_type = ev.get("type") if isinstance(ev, dict) else "?"
+            payload_stage = (ev.get("payload") or {}).get("stage") if isinstance(ev, dict) else None
+            log.info(
+                "claude gen tid=%s YIELD #%d type=%s stage=%s",
+                tid, yielded, ev_type, payload_stage,
+            )
             yield json.dumps(ev, ensure_ascii=False).encode() + b"\n"
         yield json.dumps({"type": "agent_done"}).encode() + b"\n"
         await _drop_turn(tid)
