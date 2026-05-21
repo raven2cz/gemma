@@ -1478,10 +1478,20 @@ def _build_agent_messages(
     if want_tts:
         base += (
             "\n\nFinální odpověď uživateli (po případných tool callech) "
-            "drž v jednom odstavci bez markdown formátování - bude předčítaná."
+            "drž stručnou - bude předčítaná. Markdown formátování (tučně, "
+            "kurzíva, nadpisy, odrážky) NEPOUŽÍVEJ. VÝJIMKA: pro zobrazení "
+            "kódu nebo obsahu souboru POUŽIJ ``` jazyk ... ``` blok - TTS "
+            "ho přeskočí a UI ho zobrazí jako code block. Když ti read_file "
+            "vrátí obsah s line-number prefixy (např. `     1\\tdef ahoj`), "
+            "v code bloku ty prefixy ODSTRAŇ."
             if lang == "cs"
-            else "\n\nKeep the final answer to the user in one paragraph "
-            "without markdown - it will be read aloud."
+            else "\n\nKeep the final answer to the user concise - it will be "
+            "read aloud. Do NOT use markdown formatting (bold, italics, "
+            "headings, bullet lists). EXCEPTION: for code or file contents "
+            "USE ``` lang ... ``` fenced blocks - TTS skips them and the UI "
+            "renders them as code blocks. When read_file returns content "
+            "with line-number prefixes (e.g. `     1\\tdef hi`), strip those "
+            "prefixes inside the code block."
         )
     if extra_system:
         base += extra_system
