@@ -10,3 +10,6 @@ __pycache__/
 .venv/
 .pytest_cache/
 voice/webapp/webapp.log
+voice/.install-state/
+whisper.cpp.broken.*
+whisper.cpp.cloning.*

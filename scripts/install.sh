@@ -63,21 +63,33 @@ fi
 # ──────────────────── 1. Detekce distra ────────────────────────────────────
 step "1. Detekce distribuce"
 
-if [[ -f /etc/arch-release ]]; then
-  DISTRO="arch"
-  ok "Detekováno: Arch Linux"
-elif [[ -f /etc/debian_version ]]; then
-  DISTRO="debian"
-  ok "Detekováno: Debian / Ubuntu"
-else
-  fatal "Nepodporovaná distribuce. Skript umí jen Arch a Debian/Ubuntu."
+# Čteme /etc/os-release (ID + ID_LIKE) místo /etc/arch-release nebo
+# /etc/debian_version — pokrývá deriváty (Pop_OS, Mint, Manjaro, EndeavourOS, …).
+DISTRO=""
+if [[ -r /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  case " ${ID:-} ${ID_LIKE:-} " in
+    *" arch "*)
+      DISTRO="arch" ;;
+    *" debian "*|*" ubuntu "*)
+      DISTRO="debian" ;;
+  esac
 fi
+[[ -n "$DISTRO" ]] || fatal "Nepodporovaná distribuce. Skript umí jen Arch a Debian/Ubuntu (vč. derivátů). Zkus manuální instalaci podle README."
+
+# systemd check — Ollama install skript + my služby na něm závisí.
+[[ -d /run/systemd/system ]] || fatal "Skript vyžaduje systemd init (ollama servis). Pokud máš jiný init, instaluj manuálně."
+
+ok "Detekováno: ${PRETTY_NAME:-$DISTRO} (handler=$DISTRO)"
 
 # ──────────────────── 2. Systémové balíky ──────────────────────────────────
-step "2. Systémové balíky (base-devel, git, ffmpeg, tmux, python, cmake)"
+step "2. Systémové balíky (base-devel, git, curl, ffmpeg, tmux, python, cmake)"
 
+# `curl` MUSÍ být v required check — bez něj později spadne Ollama install
+# tichým crashem. (Gemini/Codex review 2026-05-21).
 need_install=()
-for cmd in git ffmpeg tmux cmake python3 pip; do
+for cmd in git curl ffmpeg tmux cmake python3 pip; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     need_install+=("$cmd")
   fi
@@ -88,30 +100,35 @@ if [[ ${#need_install[@]} -eq 0 ]]; then
 else
   warn "Chybí: ${need_install[*]} — instaluju..."
   if [[ "$DISTRO" == "arch" ]]; then
-    sudo pacman -S --needed --noconfirm base-devel git ffmpeg tmux \
-      python python-pip cmake
+    sudo pacman -S --needed --noconfirm base-devel git curl ca-certificates \
+      ffmpeg tmux python python-pip cmake
   else
     sudo apt update
-    sudo apt install -y build-essential git ffmpeg tmux python3 python3-venv \
-      python3-pip cmake curl
+    sudo apt install -y build-essential git curl ca-certificates ffmpeg tmux \
+      python3 python3-venv python3-pip cmake
   fi
   ok "Hotovo."
 fi
 
 # Python 3.11 přesně (Chatterbox TTS waity: 3.11 - 3.13 funguje, 3.14 ne).
 # Hledáme explicitně, nepoužíváme `python3` (system může být cokoli).
+# Codex review: každého kandidáta MUSÍME ověřit že má venv + ensurepip,
+# jinak `python3.11 -m venv` selže až za 30 minut během instalace.
 PY_BIN=""
 for cand in python3.11 python3.12 python3.13; do
-  if command -v "$cand" >/dev/null 2>&1; then
-    PY_BIN="$cand"
-    break
+  if ! command -v "$cand" >/dev/null 2>&1; then continue; fi
+  if ! "$cand" -c 'import venv, ensurepip' >/dev/null 2>&1; then
+    warn "$cand existuje, ale chybí mu venv/ensurepip modul — přeskakuju"
+    continue
   fi
+  PY_BIN="$cand"
+  break
 done
 if [[ -z "$PY_BIN" ]]; then
   if [[ "$DISTRO" == "arch" ]]; then
-    fatal "Potřebuju python3.11-3.13 (nemám ani jeden). Arch má jen 'python' (= aktuální). Zkus 'sudo pacman -S python311' z AUR, nebo si zbuilduj přes pyenv."
+    fatal "Potřebuju python3.11-3.13 s venv+ensurepip. Arch má jen 'python' (= aktuální). Zkus 'sudo pacman -S python311' z AUR, nebo si zbuilduj přes pyenv."
   else
-    fatal "Potřebuju python3.11-3.13. 'sudo apt install python3.11 python3.11-venv'"
+    fatal "Potřebuju python3.11-3.13 + venv. 'sudo apt install python3.11 python3.11-venv'"
   fi
 fi
 PY_VERSION=$("$PY_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')
@@ -135,7 +152,10 @@ EOF
   exit 1
 fi
 
-GPU_INFO=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -1)
+# `|| true` chrání před pipefail trap pokud nvidia-smi vrátí nenulový exit
+# (např. driver/library mismatch po update bez rebootu).
+GPU_INFO=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1 || true)
+[[ -n "$GPU_INFO" ]] || fatal "nvidia-smi je nainstalován, ale neumí dotaz GPU (driver/library mismatch?). Zkus reboot, pak install.sh znova."
 ok "GPU: $GPU_INFO"
 
 if ! command -v nvcc >/dev/null 2>&1; then
@@ -149,12 +169,24 @@ fi
 step "4. Ollama (LLM runtime)"
 
 if command -v ollama >/dev/null 2>&1; then
-  # `ollama --version` printne warning na stderr když daemon neběží — ignoruj.
-  OLLAMA_VER=$(ollama --version 2>/dev/null | grep -v "^Warning" | head -1)
+  # `ollama --version` může psát na stderr nebo daemon nepřipojený warning —
+  # `|| true` chrání před pipefail trap pokud grep -v nevyfiltruje nic.
+  OLLAMA_VER=$(ollama --version 2>/dev/null | grep -v "^Warning" | head -1 || true)
+  [[ -n "$OLLAMA_VER" ]] || OLLAMA_VER="(verze neznámá)"
   skip "Ollama už nainstalovaná ($OLLAMA_VER)"
 else
+  # Bezpečnější varianta `curl | sh`: stáhneme do tmp, zobrazíme hash a pak
+  # spustíme. Pořád to není pinning na konkrétní commit, ale alespoň user
+  # vidí co se chystá běžet (může si pak install.sh prohlédnout).
+  TMP_INSTALL=$(mktemp -t ollama-install-XXXXXX.sh)
+  trap 'rm -f "$TMP_INSTALL"' EXIT
   warn "Stahuju Ollama install skript z ollama.com..."
-  curl -fsSL https://ollama.com/install.sh | sh
+  curl -fsSL https://ollama.com/install.sh -o "$TMP_INSTALL"
+  ok "Stáhnuto do $TMP_INSTALL (sha256: $(sha256sum "$TMP_INSTALL" | awk '{print $1}' | head -c 16)…)"
+  warn "Spouštím install skript..."
+  sh "$TMP_INSTALL"
+  rm -f "$TMP_INSTALL"
+  trap - EXIT
   ok "Hotovo."
 fi
 
@@ -179,6 +211,11 @@ curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 \
 # ──────────────────── 5. Modely ────────────────────────────────────────────
 step "5. Modely (gemma4-e4b-32k, gemma4-26b-32k)"
 
+# Sentinel directory pro install state (mtime markery, build logy).
+# Vytváříme bez ohledu na --skip-models, protože step 6 ho používá pro CMAKE_LOG.
+STATE_DIR="$ROOT/voice/.install-state"
+mkdir -p "$STATE_DIR"
+
 if [[ "$SKIP_MODELS" == "1" ]]; then
   warn "Přeskočeno (--skip-models)."
 else
@@ -187,17 +224,33 @@ else
     "gemma4-26b-32k:modelfiles/gemma4-26b-32k.Modelfile"
   )
 
-  EXISTING=$(ollama list 2>/dev/null | awk 'NR>1 {print $1}')
+  # `ollama list` může selhat pokud daemon ještě startuje; chytíme to do
+  # proměnné s `|| true` aby pipefail nezabil celý skript.
+  if ! EXISTING=$(ollama list 2>/dev/null); then
+    fatal "Ollama daemon neodpovídá na 'ollama list'. Zkus 'systemctl status ollama' a pusť install.sh znova."
+  fi
+  EXISTING=$(awk 'NR>1 {print $1}' <<<"$EXISTING" || true)
 
   for entry in "${MODELS_TO_BUILD[@]}"; do
     tag="${entry%%:*}"
     file="${entry##*:}"
-    if grep -q "^${tag}" <<<"$EXISTING" 2>/dev/null; then
-      skip "Model ${tag} už je v Ollamě"
+    [[ -f "$file" ]] || { warn "Modelfile $file neexistuje, přeskakuju ${tag}"; continue; }
+
+    stamp_file="$STATE_DIR/model-${tag}.mtime"
+    current_mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+    stored_mtime=$(cat "$stamp_file" 2>/dev/null || echo "")
+
+    if grep -q "^${tag}" <<<"$EXISTING" 2>/dev/null \
+       && [[ "$current_mtime" == "$stored_mtime" ]]; then
+      skip "Model ${tag} už je v Ollamě (Modelfile beze změny)"
     else
-      [[ -f "$file" ]] || { warn "Modelfile $file neexistuje, přeskakuju ${tag}"; continue; }
-      warn "Stahuju ${tag} (může to trvat 10-20 minut, ~10-17 GB)..."
+      if grep -q "^${tag}" <<<"$EXISTING" 2>/dev/null; then
+        warn "Modelfile ${file} změněn — přestavuji ${tag}..."
+      else
+        warn "Stahuji ${tag} (~10-17 GB, 10-20 minut)..."
+      fi
       ollama create "$tag" -f "$file"
+      echo "$current_mtime" > "$stamp_file"
       ok "${tag} hotovo."
     fi
   done
@@ -206,35 +259,62 @@ fi
 # ──────────────────── 6. whisper.cpp (STT) ─────────────────────────────────
 step "6. whisper.cpp (STT engine)"
 
+CMAKE_LOG="$STATE_DIR/whisper-cmake.log"
+
 if [[ -d whisper.cpp/build ]] && [[ -f whisper.cpp/build/bin/whisper-cli ]]; then
   skip "whisper.cpp už zbuildován"
 else
+  # Detekce partial clone (interrupted git clone může nechat adresář).
+  # Validní whisper.cpp checkout MUSÍ mít .git/ + CMakeLists.txt.
+  if [[ -d whisper.cpp ]] && { [[ ! -d whisper.cpp/.git ]] || [[ ! -f whisper.cpp/CMakeLists.txt ]]; }; then
+    warn "Detekován partial whisper.cpp clone — přesouvám stranou..."
+    mv whisper.cpp "whisper.cpp.broken.$(date +%s)"
+  fi
   if [[ ! -d whisper.cpp ]]; then
-    git clone https://github.com/ggerganov/whisper.cpp.git
+    # Klonujeme do tmp dirname, po úspěchu přejmenujeme — atomic safe.
+    TMP_CLONE="whisper.cpp.cloning.$$"
+    git clone https://github.com/ggerganov/whisper.cpp.git "$TMP_CLONE"
+    mv "$TMP_CLONE" whisper.cpp
   fi
   cd whisper.cpp
   # CUDA build pokud máme nvcc, jinak CPU.
+  # Output do log file aby silent failure nezůstalo skryté (Gemini review).
   if command -v nvcc >/dev/null 2>&1; then
-    warn "Build s CUDA akcelerací (může to trvat pár minut)..."
-    cmake -B build -DGGML_CUDA=1 >/dev/null
+    warn "Build s CUDA akcelerací (log: $CMAKE_LOG)..."
+    cmake -B build -DGGML_CUDA=1 &>"$CMAKE_LOG" \
+      || fatal "cmake configure selhal. Zkontroluj $CMAKE_LOG"
   else
-    warn "Build CPU-only (chybí nvcc)..."
-    cmake -B build >/dev/null
+    warn "Build CPU-only (chybí nvcc, log: $CMAKE_LOG)..."
+    cmake -B build &>"$CMAKE_LOG" \
+      || fatal "cmake configure selhal. Zkontroluj $CMAKE_LOG"
   fi
-  cmake --build build -j --config Release >/dev/null
+  cmake --build build -j --config Release &>>"$CMAKE_LOG" \
+    || fatal "cmake build selhal. Zkontroluj $CMAKE_LOG"
   cd "$ROOT"
   ok "Hotovo."
 fi
 
-# Model — large-v3-turbo (cca 1.5 GB)
-if [[ -f whisper.cpp/models/ggml-large-v3-turbo.bin ]]; then
+# Model — large-v3-turbo (cca 1.5 GB). Sentinel file `.complete` zabrání
+# že partial/corrupt download se na rerun bere jako hotovo.
+WHISPER_MODEL="whisper.cpp/models/ggml-large-v3-turbo.bin"
+WHISPER_SENTINEL="${WHISPER_MODEL}.complete"
+
+if [[ -f "$WHISPER_MODEL" ]] && [[ -f "$WHISPER_SENTINEL" ]]; then
   skip "Whisper model large-v3-turbo už stažen"
 else
+  [[ -f "$WHISPER_MODEL" ]] && warn "Existující soubor bez .complete sentinel — mažu (může být partial)..."
+  rm -f "$WHISPER_MODEL"
   warn "Stahuju Whisper large-v3-turbo (~1.5 GB)..."
   cd whisper.cpp
   bash ./models/download-ggml-model.sh large-v3-turbo
   cd "$ROOT"
-  ok "Hotovo."
+  # Sentinel = atomic marker že download dokončil
+  if [[ -f "$WHISPER_MODEL" ]] && [[ $(stat -c %s "$WHISPER_MODEL") -gt 100000000 ]]; then
+    touch "$WHISPER_SENTINEL"
+    ok "Hotovo."
+  else
+    fatal "Whisper model nestáhl správně (chybí nebo příliš malý). Zkus znova."
+  fi
 fi
 
 # ──────────────────── 7. Python venv ───────────────────────────────────────
@@ -288,15 +368,20 @@ if [[ "$NO_OPTIONAL" != "1" ]]; then
     echo "  Brave Search má 2000 dotazů zdarma měsíčně. Klíč získáš na:"
     echo "  https://api.search.brave.com/  (klíč začíná BSA-...)"
     echo
-    read -r -p "  Vlož klíč (Enter = přeskočit): " brave_key
+    # `-s` skryje klíč na obrazovce (citlivý secret). `-p` neumí kombinaci
+    # s -s na všech shellech, proto si vypisujeme prompt manuálně.
+    printf '  Vlož klíč (Enter = přeskočit): '
+    read -r -s brave_key
+    echo
     if [[ -n "${brave_key:-}" ]]; then
-      umask 077
-      echo "$brave_key" > "$HOME/.brave-search-api"
+      # Subshell pro umask — neovlivní zbytek skriptu (Gemini review HIGH).
+      ( umask 077; echo "$brave_key" > "$HOME/.brave-search-api" )
       chmod 600 "$HOME/.brave-search-api"
       ok "Uložen do ~/.brave-search-api (chmod 600)."
     else
       warn "Přeskočeno — web_search tool bude vracet chybu, vše ostatní funguje."
     fi
+    unset brave_key
   fi
 fi
 
@@ -314,7 +399,15 @@ if [[ "$NO_OPTIONAL" != "1" ]]; then
   else
     read -r -p "  Nainstalovat Claude Code CLI? [Y/n] " yn
     if [[ ! "$yn" =~ ^[Nn] ]]; then
-      curl -fsSL https://claude.ai/install.sh | sh
+      # Stáhneme do tmp + ukáže se hash — uživatel může zkontrolovat
+      # před spuštěním (curl|sh trade-off, viz Ollama install výše).
+      TMP_CLAUDE=$(mktemp -t claude-install-XXXXXX.sh)
+      trap 'rm -f "$TMP_CLAUDE"' EXIT
+      curl -fsSL https://claude.ai/install.sh -o "$TMP_CLAUDE"
+      ok "Stáhnuto (sha256: $(sha256sum "$TMP_CLAUDE" | awk '{print $1}' | head -c 16)…)"
+      sh "$TMP_CLAUDE"
+      rm -f "$TMP_CLAUDE"
+      trap - EXIT
       ok "Hotovo. PO instalaci spusť ručně: 'claude auth login' (otevře browser)."
     else
       warn "Přeskočeno — claude mode + ask_claude tool budou vracet chybu."
