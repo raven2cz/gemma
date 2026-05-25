@@ -75,22 +75,182 @@ Code bloky se nikdy nečtou nahlas. Sentence chunker je vyseparuje a pošle do U
 
 Před TTS synth se uvolní Ollama LLM z VRAM (`keep_alive=0` na `/api/generate`). Bez toho gemma4-26b (10 GB) + Chatterbox TTS (3 GB) přetlačí 16 GB RTX 5070 Ti při activations peak a první synth OOM-ne. Cena: další turn re-loadne LLM (3-5 s).
 
+## Instalace krok za krokem (Linux)
+
+Pro úplné začátečníky. Předpoklady: čerstvá instalace Linuxu, NVIDIA GPU, terminál.
+Veškeré příkazy se kopírují **do terminálu** (pravým klikem → Paste, nebo `Ctrl+Shift+V`).
+
+### 1. Systémové balíky
+
+```bash
+# Co potřebujeme: kompilátor (cc/gcc), git pro stažení projektu, ffmpeg pro
+# audio (whisper/TTS), tmux pro persistentní Claude session, base-devel
+# pro build whisper.cpp z C++ zdrojáků.
+sudo pacman -S --needed base-devel git ffmpeg tmux python python-pip cmake
+```
+
+Na Ubuntu/Debian:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential git ffmpeg tmux python3 python3-venv python3-pip cmake
+```
+
+### 2. NVIDIA + CUDA
+
+Na Arch (až po instalaci ovladače `nvidia` z `pacman`):
+
+```bash
+# CUDA toolkit pro PyTorch/whisper.cpp GPU akceleraci.
+sudo pacman -S --needed cuda
+```
+
+Ověř, že GPU vidíš:
+
+```bash
+# Mělo by ti vypsat tabulku s grafikou + verzí CUDA driveru.
+nvidia-smi
+```
+
+### 3. Stáhnout projekt
+
+```bash
+# Vytvoř si někam pracovní složku a klonuj projekt do ní.
+mkdir -p ~/git/github
+cd ~/git/github
+git clone https://github.com/raven2cz/gemma.git
+cd gemma
+```
+
+### 4. Ollama (LLM runtime)
+
+```bash
+# Instaluje Ollama jako systemd službu.
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Zapne ji a nahodí teď i po restartu.
+sudo systemctl enable --now ollama
+```
+
+Pak nahraj recept na model (Modelfile říká Ollamě jak se má model sestavit z gemma4 base + parametrů). Pro začátek vezmi nejmenší `gemma4-e4b-32k` (cca 10 GB stažení):
+
+```bash
+# Vytvoří v Ollamě model tagem `gemma4-e4b-32k`. Stahuje cca 10 GB,
+# trvá to podle rychlosti připojení.
+ollama create gemma4-e4b-32k -f modelfiles/gemma4-e4b-32k.Modelfile
+
+# Ověř, že je tam:
+ollama list
+```
+
+### 5. whisper.cpp (STT — speech-to-text)
+
+```bash
+# Klonuj whisper.cpp do podsložky projektu.
+git clone https://github.com/ggerganov/whisper.cpp.git
+cd whisper.cpp
+
+# Build s CUDA akcelerací. Trvá pár minut.
+cmake -B build -DGGML_CUDA=1
+cmake --build build -j --config Release
+
+# Stáhne large-v3 model (~3 GB) - používá ho gemma na rozeznávání řeči.
+bash ./models/download-ggml-model.sh large-v3-turbo
+
+cd ..
+```
+
+### 6. Python venv + závislosti
+
+Gemma má vlastní virtuální prostředí ve `voice/.venv-tts/`. Vytvoř ho a nainstaluj balíky:
+
+```bash
+# Vytvoř venv pomocí Python 3.11 (Chatterbox TTS jiné verze nepodporuje).
+python3.11 -m venv voice/.venv-tts
+
+# Aktivuj a upgrade pip.
+source voice/.venv-tts/bin/activate
+pip install --upgrade pip
+
+# PyTorch s CUDA 12.8 support (pro Blackwell GPU jako RTX 5070 Ti).
+# Pokud máš jinou generaci, podívej se na https://pytorch.org/get-started/
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Server stack + parser + testy.
+pip install fastapi uvicorn[standard] httpx pydantic python-multipart \
+            pyte pytest pytest-asyncio pytest-timeout
+
+# Chatterbox TTS (český hlasový model).
+pip install chatterbox-tts
+```
+
+### 7. Volitelné — Brave Search API (pro `web_search` tool)
+
+Zdarma účet má 2000 dotazů měsíčně. Bez klíče tool jen vrátí chybu, vše ostatní funguje.
+
+```bash
+# Zaregistruj se na https://api.search.brave.com/, vezmi klíč začínající BSA-...
+# Ulož do souboru s permissions 0600 (server odmítne načíst world-readable file):
+echo "BSA-tvuj_klic_sem" > ~/.brave-search-api
+chmod 600 ~/.brave-search-api
+```
+
+### 8. Volitelné — Claude Code CLI (pro `claude` mode + `ask_claude` tool)
+
+```bash
+# Instalace Claude Code CLI:
+curl -fsSL https://claude.ai/install.sh | sh
+
+# Login (otevře browser, OAuth do keychainu):
+claude auth login
+
+# Ověř, že to funguje:
+claude --version
+```
+
+Bez Claude CLI funguje `chat` a `agent` mode normálně, jen `claude` mode + `ask_claude` tool budou hlásit chybu.
+
+### 9. Spustit Gemmu
+
+```bash
+# Z adresáře projektu (sandbox = aktuální PWD; vyhni se HOME).
+# Vytvoř si nějakou pracovní složku, kde ti agent bude moct vytvářet soubory:
+mkdir -p ~/git/github/muj-projekt
+cd ~/git/github/muj-projekt
+
+# Spustí webapp na http://127.0.0.1:8080
+~/git/github/gemma/scripts/agent.sh
+```
+
+První spuštění trvá ~30 s (Chatterbox stahuje váhy z HuggingFace). Pak otevři prohlížeč na **http://127.0.0.1:8080** a můžeš mluvit.
+
+### 10. Trvalý alias (volitelné)
+
+```bash
+# Vytvoř symlink, aby šlo spouštět `gemma` z libovolného adresáře.
+mkdir -p ~/bin
+ln -s ~/git/github/gemma/scripts/gemma ~/bin/gemma
+
+# Pokud ~/bin není v $PATH:
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+
+# Teď stačí:
+cd ~/nejaky-projekt && gemma
+```
+
 ## Spuštění
 
 ```bash
-# Ollama už musí běžet (systemd)
-ollama create gemma4-e4b-32k -f modelfiles/gemma4-e4b-32k.Modelfile
-
-# Spouštěč. WORKDIR = aktuální adresář (sandbox root pro agenta).
+# WORKDIR = aktuální adresář (sandbox root pro agenta).
 ./scripts/agent.sh
 
-# Nebo symlink do PATH a pak `gemma` z libovolného PWD:
-ln -s $PWD/scripts/gemma ~/bin/gemma
+# Nebo když máš `gemma` v PATH:
 gemma                # port 8080
 gemma --port 9000
 gemma --dangerous    # ASK -> AUTO (destructive stále vyžaduje frázi)
 
-# Claude mode v tmux adapteru (persistent sessions):
+# Claude mode v tmux adapteru (persistent sessions, kontext napříč turny):
 AGENT_CLAUDE_BRIDGE_MODE=tmux gemma
 ```
 
