@@ -75,6 +75,20 @@ Code bloky se nikdy nečtou nahlas. Sentence chunker je vyseparuje a pošle do U
 
 Před TTS synth se uvolní Ollama LLM z VRAM (`keep_alive=0` na `/api/generate`). Bez toho gemma4-26b (10 GB) + Chatterbox TTS (3 GB) přetlačí 16 GB RTX 5070 Ti při activations peak a první synth OOM-ne. Cena: další turn re-loadne LLM (3-5 s).
 
+## Rychlá instalace (automatický skript)
+
+Pro Arch / Debian / Ubuntu existuje `scripts/install.sh` který provede vše níže automaticky:
+
+```bash
+git clone https://github.com/raven2cz/gemma.git ~/git/github/gemma
+cd ~/git/github/gemma
+./scripts/install.sh
+```
+
+Skript je **idempotentní** — projde-li někde napůl, lze ho pustit znovu, přeskočí co už je hotové. NEinstaluje NVIDIA ovladač (vyžaduje reboot), jen ověří, že je. Stáhne `gemma4-e4b-32k` + `gemma4-26b-32k`, nainstaluje Ollamu, whisper.cpp s CUDA, Python venv + Chatterbox TTS. Volitelně se zeptá na Brave API klíč, Claude Code CLI, `~/bin/gemma` symlink.
+
+Pro tu manuální cestu (krok za krokem s vysvětlením) pokračuj dál.
+
 ## Instalace krok za krokem (Linux)
 
 Pro úplné začátečníky. Předpoklady: čerstvá instalace Linuxu, NVIDIA GPU, terminál.
