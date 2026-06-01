@@ -36,6 +36,8 @@ Webová aplikace, ve které mluvíš na mikrofon (nebo píšeš), model ti odpov
 | `ask_claude` | Consult-only Claude Code subprocess (bez FS, bez shellu, jen vrátí text) |
 | `echo` | Test pipeline |
 
+Navíc dynamicky discovered tooly z **MCP serverů** (Model Context Protocol). Default integrace: [HOTOVO](https://github.com/raven2cz/todo-list) (todo-list správa, 8 tooly s prefixem `hotovo_*` — `get_state`, `list_projects`, `create_task`, `complete_task`, `delete_task`, …). Viz [MCP integrace](#mcp-integrace) níže.
+
 ## Claude mode
 
 Samostatný režim oddělený od `ask_claude` toolu. Místo jednorázového consultu ti dá **plnohodnotného Claude Code agenta** s workdir editací.
@@ -52,6 +54,57 @@ Samostatný režim oddělený od `ask_claude` toolu. Místo jednorázového cons
 Žádná textová approval fráze (`ano povoluju`) v claude módu už není — vstup do režimu = implicit consent. Pokud někdy přibude friction pro nevratné operace, půjde to přes UI modal Allow/Deny, ne text prefix.
 
 Audit a observability: každý turn loguje `claude emit stage=… count=N`, `_read_stream START/EOF/RESULT`, `claude gen YIELD #N`. Diagnostika progress eventů je na INFO leveli per design (silent failures = mrtvé UI, viz [feedback memory](#dev-notes)).
+
+## MCP integrace
+
+Gemma podporuje [Model Context Protocol](https://spec.modelcontextprotocol.io/) — standardizovaný JSON-RPC stdio protokol pro externí AI nástroje. Při startu webapp:
+
+1. Pro každý nakonfigurovaný MCP server (`get_mcp_server_configs()` v `voice/agent/config.py`):
+2. **Health probe** (HTTP GET na `health_probe_url`) — pokud server nedostupný, tooly se nezaregistrují, agent loop pokračuje bez nich
+3. **Spawn** subprocess + `initialize` + `tools/list` → každý tool se zabalí do gemma `Tool` (name = `<server>_<mcp_tool>`)
+4. **Classifier** dostane hinty z configu: `auto_tools` (read-only) → AUTO, `requires_explicit_tools` (destruktivní) → ASK + fráze; ostatní → ASK + medium
+5. **Idle timeout** 5 min: po neaktivitě subprocess umírá, na další call se respawne (lazy management)
+6. **Lifespan shutdown**: SIGTERM → 2 s → SIGKILL
+
+### HOTOVO (default integrace)
+
+Pro [HOTOVO todo-list](https://github.com/raven2cz/todo-list) (lokální správa úkolů na Raspberry Pi + Express + SQLite). Stačí mít projekt naklonovaný:
+
+```bash
+git clone https://github.com/raven2cz/todo-list.git ~/git/github/todo-list
+cd ~/git/github/todo-list
+npm run install:all
+./scripts/start-app.sh   # nahodí Express na :3000
+```
+
+Při dalším spuštění gemmy se 8 HOTOVO tools (get_state, list_projects, create_project, list_tasks, create_task, update_task, complete_task, delete_task) automaticky zaregistrují. Override cesty: `AGENT_HOTOVO_MCP_PATH`. Port: `AGENT_HOTOVO_PORT`.
+
+Auth (volitelně, pokud HOTOVO server má nastavený token):
+
+```bash
+echo "tvuj-token" > ~/.hotovo-api
+chmod 600 ~/.hotovo-api   # server odmítne world/group readable
+```
+
+Alternativně env var `HOTOVO_API_TOKEN` (méně bezpečné, viditelné v `ps`).
+
+### Vlastní MCP server
+
+Přidej do `voice/agent/config.py` v `get_mcp_server_configs()`:
+
+```python
+McpServerConfig(
+    name="muj_server",
+    command=("python", "/path/to/server.py"),
+    env={"MY_PORT": "4000"},
+    auto_tools=frozenset({"read_only_tool"}),
+    requires_explicit_tools=frozenset({"dangerous_delete"}),
+    health_probe_url="http://127.0.0.1:4000/health",  # nebo None pro skip
+    idle_timeout_sec=300.0,
+)
+```
+
+Server musí mluvit JSON-RPC 2.0 přes stdin/stdout (`initialize`, `tools/list`, `tools/call`), per [MCP spec 2024-11-05](https://spec.modelcontextprotocol.io/specification/2024-11-05/).
 
 ## Bezpečnost agenta
 

@@ -20,6 +20,19 @@ from voice.agent.tools import shell as _shell_mod
 from voice.agent.tools import web as _web_mod
 
 
+# MCP discovered tools — populated z webapp lifespan startupu (async),
+# čtené sync z default_registry(). Pokud webapp nepoužívá MCP, list zůstane prázdný.
+_MCP_DISCOVERED_TOOLS: list[Tool] = []
+
+
+def set_mcp_tools(tools: list[Tool]) -> None:
+    """Setter pro async MCP discovery. Webapp lifespan startup volá po
+    discover_and_register(); subsequent default_registry() calls vidí tooly.
+    """
+    global _MCP_DISCOVERED_TOOLS
+    _MCP_DISCOVERED_TOOLS = list(tools)
+
+
 def default_registry(mode: str = "agent") -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(_echo_mod.TOOL)
@@ -34,7 +47,12 @@ def default_registry(mode: str = "agent") -> ToolRegistry:
     # Phase 5: Philips Hue smart-home tooly (light_list, light_set).
     for tool in _hue_mod.ALL_TOOLS:
         reg.register(tool)
+    # MCP discovered tools (HOTOVO atd.) — async-discovered při startu webapp,
+    # cached pro sync default_registry call. Pokud žádný MCP server nepoběží,
+    # list je prázdný.
+    for tool in _MCP_DISCOVERED_TOOLS:
+        reg.register(tool)
     return reg
 
 
-__all__ = ["Tool", "ToolRegistry", "default_registry"]
+__all__ = ["Tool", "ToolRegistry", "default_registry", "set_mcp_tools"]

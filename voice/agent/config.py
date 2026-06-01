@@ -374,3 +374,90 @@ DANGEROUS_MODE: bool = os.environ.get("AGENT_DANGEROUS", "0").strip() == "1"
 
 APPROVE_PHRASES: tuple[str, ...] = ("ano", "jo", "ok", "okej", "okay", "povol", "povoluju", "jasně", "jasne", "fajn", "yes")
 DENY_PHRASES: tuple[str, ...] = ("ne", "stop", "zruš", "zrus", "nepovoluju", "nechci", "no")
+
+
+# ──────────────── MCP servers ───────────────────────────────────────────────
+# Model Context Protocol = standardizovaný JSON-RPC stdio protokol pro
+# integraci externích nástrojů do AI agentů. Specifikace:
+# https://spec.modelcontextprotocol.io/
+#
+# Každý MCP server = subprocess (např. `node server/mcp.js`) co exposne
+# tools/list + tools/call. Spawn je LAZY (až při prvním tool callu);
+# idle timeout vrátí RAM po 5 minutách ticha.
+#
+# Pro autentizaci preferujeme soubor 0600 (jako Brave) místo env var
+# (env je viditelné v ps/proc).
+
+# HOTOVO todo-list MCP server (https://github.com/raven2cz/todo-list).
+# Pokud cesta neexistuje, server se nezaregistruje (registry probe).
+_HOTOVO_MCP_PATH = os.environ.get(
+    "AGENT_HOTOVO_MCP_PATH",
+    str(Path.home() / "git" / "github" / "todo-list" / "server" / "mcp.js"),
+)
+_HOTOVO_API_PORT = os.environ.get("AGENT_HOTOVO_PORT", "3000")
+
+
+def _read_hotovo_token() -> str:
+    """Soubor 0600 v $HOME (~/.hotovo-api) NEBO env var HOTOVO_API_TOKEN.
+    Server odmítne načíst soubor world/group readable. Bez tokenu jede
+    loopback bypass (HOTOVO server umí auth-less localhost requesty)."""
+    env = os.environ.get("HOTOVO_API_TOKEN", "").strip()
+    if env:
+        return env
+    token_file = os.environ.get(
+        "HOTOVO_API_TOKEN_FILE",
+        str(Path.home() / ".hotovo-api"),
+    )
+    p = Path(token_file)
+    if not p.is_file():
+        return ""
+    try:
+        st = p.stat()
+    except OSError:
+        return ""
+    if st.st_mode & 0o077:
+        # World/group readable — odmítnout (security hardening)
+        import logging as _logging
+        _logging.getLogger("agent-config").warning(
+            "HOTOVO API token file %s has mode %o (group/other readable) — ignoring",
+            p, st.st_mode & 0o777,
+        )
+        return ""
+    try:
+        return p.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _hotovo_mcp_config():
+    """Vrátí McpServerConfig pro HOTOVO, NEBO None pokud mcp.js path neexistuje.
+
+    Import claude_bridge.config je drahý → líný import.
+    """
+    if not Path(_HOTOVO_MCP_PATH).is_file():
+        return None
+    from voice.agent.mcp import McpServerConfig
+    env = {"PORT": _HOTOVO_API_PORT}
+    token = _read_hotovo_token()
+    if token:
+        env["HOTOVO_API_TOKEN"] = token
+    return McpServerConfig(
+        name="hotovo",
+        command=("node", _HOTOVO_MCP_PATH),
+        env=env,
+        auto_tools=frozenset({"get_state", "list_projects", "list_tasks"}),
+        requires_explicit_tools=frozenset({"delete_task"}),
+        health_probe_url=f"http://127.0.0.1:{_HOTOVO_API_PORT}/api/lists",
+        health_probe_timeout_sec=1.5,
+        idle_timeout_sec=300.0,
+        request_timeout_sec=30.0,
+    )
+
+
+def get_mcp_server_configs() -> list:
+    """Sestaví seznam aktivních MCP server configs (lazy, neimportuje cyklicky)."""
+    configs = []
+    hotovo = _hotovo_mcp_config()
+    if hotovo is not None:
+        configs.append(hotovo)
+    return configs

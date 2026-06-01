@@ -595,6 +595,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         log.warning("claude adapter init failed: %s (claude mode bude vrácet error)", e)
         _CLAUDE_ADAPTER = None
+    # MCP server discovery (HOTOVO atd.) — health probe + tools/list +
+    # registrace classifierů. Pokud server neběží, tooly se nezaregistrují.
+    try:
+        await _init_mcp_servers()
+    except Exception as e:
+        log.warning("mcp init failed: %s (MCP tooly nebudou k dispozici)", e)
     # Headline: agent sandbox root. Když je == HOME, ŘVAŤ - to byl reálný
     # incident (write_file kamkoli pod ~ projde jako AUTO bez ptaní).
     from voice.agent.config import WORKDIR as _WORKDIR
@@ -645,6 +651,10 @@ async def lifespan(app: FastAPI):
         _SHUTTING_DOWN = True
         if _WATCHDOG_TASK is not None:
             _WATCHDOG_TASK.cancel()
+        # Shutdown MCP subprocesses (graceful SIGTERM → SIGKILL po 2s).
+        with suppress(Exception):
+            from voice.agent.tools.mcp_tool import shutdown_all as _mcp_shutdown_all
+            await _mcp_shutdown_all()
 
 
 async def _set_tts_ready():
@@ -1948,6 +1958,44 @@ async def _init_claude_adapter():
             log.warning("reattach_persisted_sessions failed: %s", e)
     log.info("claude bridge adapter ready: mode=%s", bridge_mode.value)
     return adapter
+
+
+async def _init_mcp_servers() -> None:
+    """Probe + discover + register MCP tools z config.get_mcp_server_configs().
+
+    Pro každý server: health probe → spawn + tools/list → wrap into Tool +
+    register classifier. Pokud server nedostupný, skip (nezaregistruje se).
+    """
+    from voice.agent.config import get_mcp_server_configs
+    from voice.agent.tools import set_mcp_tools
+    from voice.agent.tools.mcp_tool import discover_and_register, remember_client
+    from voice.agent.permissions import register_mcp_classifier
+
+    configs = get_mcp_server_configs()
+    if not configs:
+        log.info("no MCP servers configured")
+        return
+
+    all_tools = []
+    for cfg in configs:
+        client, tools = await discover_and_register(cfg)
+        if client is None:
+            continue
+        remember_client(cfg.name, client)
+        for tool in tools:
+            # Tool name = "<server>_<mcp_tool>" (per mcp_tool.py)
+            mcp_name = tool.name[len(cfg.name) + 1:]  # strip "<server>_" prefix
+            register_mcp_classifier(
+                gemma_tool_name=tool.name,
+                mcp_tool_name=mcp_name,
+                server_name=cfg.name,
+                auto=mcp_name in cfg.auto_tools,
+                requires_explicit=mcp_name in cfg.requires_explicit_tools,
+            )
+            all_tools.append(tool)
+    set_mcp_tools(all_tools)
+    if all_tools:
+        log.info("mcp ready: %d tools across %d servers", len(all_tools), len(configs))
 
 
 _CLAUDE_NO_CAS = object()  # sentinel: no CAS check, unconditional write

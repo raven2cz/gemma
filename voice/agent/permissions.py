@@ -1219,3 +1219,53 @@ def _cls_ask_claude(args: dict, workdir: Path) -> PermissionResult:
         summary=f'ask_claude ({model_label}): "{short}"',
         risk="medium",
     )
+
+
+# ──────────────── MCP tool classifier ───────────────────────────────────────
+# MCP tooly mají jméno ve tvaru "<server>_<mcp_tool>" (např. "hotovo_get_state").
+# Classifier rozhoduje podle config.auto_tools / requires_explicit_tools
+# konkrétního MCP server configu. Tooly co nejsou v žádné kategorii dostanou
+# ASK + risk=medium.
+#
+# Registrace probíhá DYNAMICALLY při webapp startupu po async discovery
+# (volá register_mcp_classifier per discovered tool).
+
+
+def register_mcp_classifier(
+    gemma_tool_name: str,        # "hotovo_get_state" — prefix.<tool>
+    mcp_tool_name: str,          # "get_state"
+    server_name: str,            # "hotovo"
+    auto: bool,                  # AUTO read-only
+    requires_explicit: bool,     # destruktivní → vyžaduje frázi
+) -> None:
+    """Zaregistruj classifier pro discovered MCP tool. Volá se z mcp_tool.py
+    discovery — jedna registrace per tool, idempotentní."""
+    if auto and requires_explicit:
+        # Sanity: destruktivní nemůže být AUTO
+        auto = False
+
+    def _classify(args: dict, workdir: Path) -> PermissionResult:
+        if auto:
+            return PermissionResult(
+                decision=Decision.AUTO,
+                reason=f"MCP {server_name} read-only tool",
+                summary=f"{server_name}: {mcp_tool_name}",
+                risk="low",
+            )
+        if requires_explicit:
+            return PermissionResult(
+                decision=Decision.ASK,
+                reason=f"MCP {server_name} destructive mutation",
+                summary=f"{server_name}: {mcp_tool_name} (NEVRATNÉ)",
+                risk="destructive",
+                requires_explicit=True,
+            )
+        # Default mutation: ASK + medium
+        return PermissionResult(
+            decision=Decision.ASK,
+            reason=f"MCP {server_name} mutation tool",
+            summary=f"{server_name}: {mcp_tool_name}",
+            risk="medium",
+        )
+
+    _CLASSIFIERS[gemma_tool_name] = _classify
