@@ -1269,3 +1269,61 @@ def register_mcp_classifier(
         )
 
     _CLASSIFIERS[gemma_tool_name] = _classify
+
+
+# ──────────────── HOTOVO classifier (REST tooly) ────────────────────────────
+# Registrace probíhá při importu modulu (hotovo_* tool names jsou fixní).
+# Mapování:
+#   - HOTOVO_AUTO_TOOLS (get_state, list_*) → AUTO + low
+#   - HOTOVO_DESTRUCTIVE_TOOLS (delete_task) → ASK + destructive (vyžaduje frázi)
+#   - ostatní (create_*, update_*, complete_*) → ASK + medium (UI modal Allow/Deny)
+
+def _register_hotovo_classifiers() -> None:
+    from voice.agent.config import HOTOVO_AUTO_TOOLS, HOTOVO_DESTRUCTIVE_TOOLS
+
+    all_hotovo = (
+        "hotovo_get_state", "hotovo_list_projects", "hotovo_create_project",
+        "hotovo_list_tasks", "hotovo_create_task", "hotovo_update_task",
+        "hotovo_complete_task", "hotovo_delete_task",
+    )
+    for tool_name in all_hotovo:
+        short = tool_name.removeprefix("hotovo_")
+        if tool_name in HOTOVO_AUTO_TOOLS:
+            def _make_auto(s):
+                def _c(args, workdir):
+                    return PermissionResult(
+                        decision=Decision.AUTO,
+                        reason=f"HOTOVO read-only ({s})",
+                        summary=f"HOTOVO: {s}",
+                        risk="low",
+                    )
+                return _c
+            _CLASSIFIERS[tool_name] = _make_auto(short)
+        elif tool_name in HOTOVO_DESTRUCTIVE_TOOLS:
+            def _make_dest(s):
+                def _c(args, workdir):
+                    tid = args.get("id", "?")
+                    return PermissionResult(
+                        decision=Decision.ASK,
+                        reason=f"HOTOVO destructive ({s})",
+                        summary=f"HOTOVO: {s} id={tid} (NEVRATNÉ)",
+                        risk="destructive",
+                        requires_explicit=True,
+                    )
+                return _c
+            _CLASSIFIERS[tool_name] = _make_dest(short)
+        else:
+            def _make_ask(s):
+                def _c(args, workdir):
+                    title = args.get("title") or args.get("name") or args.get("id") or "?"
+                    return PermissionResult(
+                        decision=Decision.ASK,
+                        reason=f"HOTOVO mutation ({s})",
+                        summary=f"HOTOVO: {s} \"{str(title)[:40]}\"",
+                        risk="medium",
+                    )
+                return _c
+            _CLASSIFIERS[tool_name] = _make_ask(short)
+
+
+_register_hotovo_classifiers()

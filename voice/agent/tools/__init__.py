@@ -18,19 +18,50 @@ from voice.agent.tools import fs as _fs_mod
 from voice.agent.tools import hue as _hue_mod
 from voice.agent.tools import shell as _shell_mod
 from voice.agent.tools import web as _web_mod
+from voice.agent.tools import hotovo as _hotovo_mod
 
 
 # MCP discovered tools — populated z webapp lifespan startupu (async),
-# čtené sync z default_registry(). Pokud webapp nepoužívá MCP, list zůstane prázdný.
+# čtené sync z default_registry(). Pokud žádný MCP server neběží, list je prázdný.
 _MCP_DISCOVERED_TOOLS: list[Tool] = []
 
 
 def set_mcp_tools(tools: list[Tool]) -> None:
     """Setter pro async MCP discovery. Webapp lifespan startup volá po
-    discover_and_register(); subsequent default_registry() calls vidí tooly.
-    """
+    discover_and_register(); subsequent default_registry() calls vidí tooly."""
     global _MCP_DISCOVERED_TOOLS
     _MCP_DISCOVERED_TOOLS = list(tools)
+
+
+def _build_hotovo_tools() -> list[Tool]:
+    """HOTOVO REST tooly. Registrují se JEN když HOTOVO_API_URL je nastaveno,
+    jinak prázdný list. Lazy providers čtou config při každém execute → umožňuje
+    runtime token reload (např. po `chmod 600 ~/.hotovo-api`)."""
+    from voice.agent import config as _cfg
+
+    if not _cfg.HOTOVO_API_URL:
+        return []
+
+    def _url(): return _cfg.HOTOVO_API_URL
+    def _token(): return _cfg.get_hotovo_token()
+    def _timeout(): return _cfg.HOTOVO_HTTP_TIMEOUT_SEC
+
+    tools = _hotovo_mod.build_tools(
+        base_url_provider=_url,
+        token_provider=_token,
+        timeout_provider=_timeout,
+    )
+    # complete_task má speciální body shape — apply post-build patch
+    for i, t in enumerate(tools):
+        if t.name == "hotovo_complete_task":
+            tools[i] = _hotovo_mod.fix_complete_task_execute(
+                t,
+                base_url_provider=_url,
+                token_provider=_token,
+                timeout_provider=_timeout,
+            )
+            break
+    return tools
 
 
 def default_registry(mode: str = "agent") -> ToolRegistry:
@@ -47,9 +78,11 @@ def default_registry(mode: str = "agent") -> ToolRegistry:
     # Phase 5: Philips Hue smart-home tooly (light_list, light_set).
     for tool in _hue_mod.ALL_TOOLS:
         reg.register(tool)
-    # MCP discovered tools (HOTOVO atd.) — async-discovered při startu webapp,
-    # cached pro sync default_registry call. Pokud žádný MCP server nepoběží,
-    # list je prázdný.
+    # HOTOVO todo-list REST tooly (pokud HOTOVO_API_URL je nastaveno).
+    for tool in _build_hotovo_tools():
+        reg.register(tool)
+    # MCP discovered tools — async-discovered při startu webapp pro LOKÁLNÍ
+    # MCP servery (HOTOVO není MCP, je REST).
     for tool in _MCP_DISCOVERED_TOOLS:
         reg.register(tool)
     return reg
