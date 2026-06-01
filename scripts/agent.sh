@@ -164,6 +164,26 @@ free_port() {
 }
 free_port "$PORT"
 
+# User-defined env config (volitelné, persistuje napříč shelly).
+# ~/.gemma-env je bash-style soubor s `export KEY=VALUE` řádky. Slouží pro
+# per-user nastavení (HOTOVO_API_URL, AGENT_CLAUDE_BRIDGE_MODE, ...) bez
+# nutnosti psát si je do shell rc nebo do command line pokaždé.
+# Soubor MUSÍ být chmod 600 pokud obsahuje tokens/secrets.
+GEMMA_ENV_FILE="${GEMMA_ENV_FILE:-$HOME/.gemma-env}"
+if [[ -f "$GEMMA_ENV_FILE" ]]; then
+  # Hardening: pokud user dá secrets do souboru, world/group readable = riziko.
+  perms=$(stat -c %a "$GEMMA_ENV_FILE" 2>/dev/null || echo "")
+  if [[ -n "$perms" ]] && (( 8#$perms & 0o077 )); then
+    echo "⚠️  $GEMMA_ENV_FILE má mode $perms (world/group readable). Pokud" >&2
+    echo "    obsahuje secrets, spusť: chmod 600 $GEMMA_ENV_FILE" >&2
+  fi
+  # shellcheck disable=SC1090
+  set -a
+  source "$GEMMA_ENV_FILE"
+  set +a
+  echo ">>> načteno env z $GEMMA_ENV_FILE"
+fi
+
 # Spuštění -------------------------------------------------------------
 export AGENT_WORKDIR="$WORKDIR"
 if [[ "$DANGEROUS" == "1" ]]; then

@@ -1,0 +1,39 @@
+# Gemma per-user env config — bash-style soubor s `export KEY=VALUE` řádky.
+#
+# Použití: zkopíruj do ~/.gemma-env, nastav permissions a uprav hodnoty:
+#
+#   cp .gemma-env.example ~/.gemma-env
+#   chmod 600 ~/.gemma-env
+#   $EDITOR ~/.gemma-env
+#
+# scripts/agent.sh ho sourcuje při každém spuštění gemmy. Override cesty
+# přes env: `GEMMA_ENV_FILE=/jiny/path/file gemma`.
+#
+# Pokud sem dáš tokens/secrets, drž `chmod 600` (gemma warne pokud ne).
+
+# ──────────────── HOTOVO todo-list ────────────────
+# Remote backend přes nginx (Pi4) nebo lokální server.
+# export HOTOVO_API_URL=https://fishlive.org:17854
+# export HOTOVO_API_URL=http://localhost:3000
+
+# Token loaduje se primárně z ~/.gemma-hotovo-token (0600) — alternativně
+# přímo zde (ale méně bezpečné, env je viditelný v `ps`):
+# export HOTOVO_API_TOKEN=agent_...
+
+# ──────────────── Claude bridge ────────────────
+# Mode: print (default, per-turn subprocess) | tmux (persistent session, continuity)
+# export AGENT_CLAUDE_BRIDGE_MODE=tmux
+
+# Default model v claude mode: opus | sonnet | haiku
+# export AGENT_CLAUDE_MODEL=claude-haiku-4-5
+
+# ──────────────── Agent timeouts a limity ────────────────
+# Auto-degrade okno (sekundy) po destruktivní akci (default 300).
+# export AGENT_AUTO_DEGRADE_SEC=300
+
+# Audio filler delay — filler audio pokud tool běží déle (default 2.0s, 0 = vypnuto)
+# export AGENT_AUDIO_FILLER_DELAY_SEC=2.0
+
+# ──────────────── Brave Search ────────────────
+# Klíč preferuj v souboru ~/.brave-search-api (0600), ale lze i zde:
+# export BRAVE_SEARCH_API_KEY=BSA-...

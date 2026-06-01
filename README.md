@@ -328,12 +328,31 @@ cd ~/nejaky-projekt && gemma
 gemma                # port 8080
 gemma --port 9000
 gemma --dangerous    # ASK -> AUTO (destructive stále vyžaduje frázi)
-
-# Claude mode v tmux adapteru (persistent sessions, kontext napříč turny):
-AGENT_CLAUDE_BRIDGE_MODE=tmux gemma
 ```
 
 Webapp na `http://127.0.0.1:8080`. Skript sám detekuje a zabije starou zombie webapp na portu (`/proc/$pid/stat` race-guard přes starttime). Cizí proces na portu odmítne s chybou.
+
+### Persistentní env config (`~/.gemma-env`)
+
+Místo psaní env vars do command line pokaždé, drž je v `~/.gemma-env`. Launcher (`scripts/agent.sh`) ho sourcuje při každém spuštění:
+
+```bash
+cp .gemma-env.example ~/.gemma-env
+chmod 600 ~/.gemma-env
+$EDITOR ~/.gemma-env
+```
+
+Typický obsah:
+
+```bash
+# HOTOVO todo-list (REST API)
+export HOTOVO_API_URL=https://fishlive.org:17854
+
+# Claude bridge: persistent tmux session pro kontext napříč turny
+export AGENT_CLAUDE_BRIDGE_MODE=tmux
+```
+
+Tokens a klíče **drž v samostatných souborech 0600** (`~/.gemma-hotovo-token`, `~/.brave-search-api`) — `~/.gemma-env` jen pro URLs a non-secret nastavení. Launcher varuje, pokud `~/.gemma-env` má slabší permissions.
 
 ## Externí služby
 
