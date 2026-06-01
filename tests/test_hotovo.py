@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from voice.agent.tools.base import ExecuteContext
-from voice.agent.tools.hotovo import build_tools, fix_complete_task_execute
+from voice.agent.tools.hotovo import build_tools
 
 
 def _ctx() -> ExecuteContext:
@@ -49,16 +49,6 @@ def _make_mock_tools(handler):
         token_provider=lambda: "TEST-TOKEN",
         timeout_provider=lambda: 5.0,
     )
-    # Patch complete_task body shape
-    for i, t in enumerate(tools):
-        if t.name == "hotovo_complete_task":
-            tools[i] = fix_complete_task_execute(
-                t,
-                base_url_provider=lambda: "https://test.local",
-                token_provider=lambda: "TEST-TOKEN",
-                timeout_provider=lambda: 5.0,
-            )
-            break
     return tools, captured, _restore
 
 
@@ -295,6 +285,111 @@ async def test_unauthorized_surfaces_message():
         result = await tools[0].execute({}, _ctx())
         assert result["ok"] is False
         assert "API token" in result["error"]
+    finally:
+        restore()
+
+
+# ──────────────── Codex review fixes ────────────────
+
+
+@pytest.mark.asyncio
+async def test_http_remote_url_rejected_to_protect_token():
+    """Codex HIGH #1: http:// na remote host by poslal Bearer token v plaintextu."""
+    tools = build_tools(
+        base_url_provider=lambda: "http://fishlive.org:17854",  # http + remote!
+        token_provider=lambda: "secret-token",
+        timeout_provider=lambda: 1.0,
+    )
+    result = await tools[0].execute({}, _ctx())
+    assert result["ok"] is False
+    assert "plaintext" in result["error"].lower() or "https" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_http_loopback_url_allowed():
+    """http:// na localhost je OK (token neopustí stroj)."""
+    tools, captured, restore = _make_mock_tools(lambda r: (200, {"ok": True}))
+    try:
+        # Override base_url provider na http loopback
+        import voice.agent.tools.hotovo as hm
+        local_tools = build_tools(
+            base_url_provider=lambda: "http://127.0.0.1:3000",
+            token_provider=lambda: "TEST-TOKEN",
+            timeout_provider=lambda: 5.0,
+        )
+        result = await local_tools[0].execute({}, _ctx())
+        # Mock transport vrací 200 → projde scheme validací
+        assert result["ok"] is True
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+async def test_https_url_accepted():
+    tools, _, restore = _make_mock_tools(lambda r: (200, {"ok": True}))
+    try:
+        result = await tools[0].execute({}, _ctx())  # base_url = https://test.local
+        assert result["ok"] is True
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+async def test_update_task_sends_explicit_null_due_date():
+    """Codex HIGH #2: due_date:null musí JÍT do body (= smaž termín),
+    ne se dropnout."""
+    tools, captured, restore = _make_mock_tools(lambda r: (200, {"id": "x"}))
+    try:
+        update = next(t for t in tools if t.name == "hotovo_update_task")
+        await update.execute({"id": "task-1", "due_date": None}, _ctx())
+        body = json.loads(captured[0].content)
+        assert "due_date" in body
+        assert body["due_date"] is None
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+async def test_update_task_sends_explicit_null_parent_id():
+    """parent_id:null = odpoj od rodiče → musí JÍT do body."""
+    tools, captured, restore = _make_mock_tools(lambda r: (200, {"id": "x"}))
+    try:
+        update = next(t for t in tools if t.name == "hotovo_update_task")
+        await update.execute({"id": "task-1", "parent_id": None}, _ctx())
+        body = json.loads(captured[0].content)
+        assert "parent_id" in body
+        assert body["parent_id"] is None
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+async def test_create_task_still_drops_null():
+    """create_task NEMÁ nullable keys → None se dál dropuje (server defaultuje)."""
+    tools, captured, restore = _make_mock_tools(lambda r: (201, {"id": "x"}))
+    try:
+        create = next(t for t in tools if t.name == "hotovo_create_task")
+        await create.execute({
+            "title": "x", "list_id": "y", "due_date": None, "parent_id": None,
+        }, _ctx())
+        body = json.loads(captured[0].content)
+        assert "due_date" not in body
+        assert "parent_id" not in body
+    finally:
+        restore()
+
+
+@pytest.mark.asyncio
+async def test_complete_task_self_contained_from_build_tools():
+    """Codex HIGH #3: build_tools() vrací funkční complete_task BEZ externího
+    patche — static_body {status:completed} je přímo v definici."""
+    tools, captured, restore = _make_mock_tools(lambda r: (200, {"status": "completed"}))
+    try:
+        complete = next(t for t in tools if t.name == "hotovo_complete_task")
+        result = await complete.execute({"id": "abc"}, _ctx())
+        assert result["ok"] is True
+        body = json.loads(captured[0].content)
+        assert body == {"status": "completed"}
     finally:
         restore()
 

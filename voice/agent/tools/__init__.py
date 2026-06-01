@@ -46,22 +46,13 @@ def _build_hotovo_tools() -> list[Tool]:
     def _token(): return _cfg.get_hotovo_token()
     def _timeout(): return _cfg.HOTOVO_HTTP_TIMEOUT_SEC
 
-    tools = _hotovo_mod.build_tools(
+    # build_tools() je self-contained — complete_task má static_body
+    # {"status":"completed"} přímo v definici (codex review HIGH #3).
+    return _hotovo_mod.build_tools(
         base_url_provider=_url,
         token_provider=_token,
         timeout_provider=_timeout,
     )
-    # complete_task má speciální body shape — apply post-build patch
-    for i, t in enumerate(tools):
-        if t.name == "hotovo_complete_task":
-            tools[i] = _hotovo_mod.fix_complete_task_execute(
-                t,
-                base_url_provider=_url,
-                token_provider=_token,
-                timeout_provider=_timeout,
-            )
-            break
-    return tools
 
 
 def default_registry(mode: str = "agent") -> ToolRegistry:

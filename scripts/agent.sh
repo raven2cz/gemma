@@ -173,7 +173,9 @@ GEMMA_ENV_FILE="${GEMMA_ENV_FILE:-$HOME/.gemma-env}"
 if [[ -f "$GEMMA_ENV_FILE" ]]; then
   # Hardening: pokud user dá secrets do souboru, world/group readable = riziko.
   perms=$(stat -c %a "$GEMMA_ENV_FILE" 2>/dev/null || echo "")
-  if [[ -n "$perms" ]] && (( 8#$perms & 0o077 )); then
+  # Bash oktalová syntaxe je `0NNN`/`8#NNN`, NE Python `0oNNN`. Mask 077 =
+  # group+other bity. (( )) vrátí truthy pokud má soubor group/other práva.
+  if [[ -n "$perms" ]] && (( 8#$perms & 8#077 )); then
     echo "⚠️  $GEMMA_ENV_FILE má mode $perms (world/group readable). Pokud" >&2
     echo "    obsahuje secrets, spusť: chmod 600 $GEMMA_ENV_FILE" >&2
   fi

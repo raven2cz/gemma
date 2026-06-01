@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -34,7 +35,33 @@ from voice.agent.tools.base import ExecuteContext, Tool
 
 log = logging.getLogger("agent-hotovo")
 
+# Loopback hosty kde tolerujeme http:// (token neopustí stroj).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
 # ──────────────── Helpers ────────────────
+
+
+def _validate_base_url(base_url: str) -> str | None:
+    """Vrátí chybovou hlášku pokud base_url není bezpečné, jinak None.
+
+    Bearer token NESMÍ jít přes plaintext http:// na remote host (codex review).
+    Povolujeme https:// kamkoli + http:// jen na loopback.
+    """
+    try:
+        u = urlparse(base_url)
+    except Exception:
+        return f"neplatné HOTOVO_API_URL: {base_url!r}"
+    if u.scheme == "https":
+        return None
+    if u.scheme == "http":
+        host = (u.hostname or "").lower()
+        if host in _LOOPBACK_HOSTS:
+            return None
+        return (
+            f"HOTOVO_API_URL používá http:// na remote host {host!r} — Bearer "
+            "token by šel v plaintextu. Použij https:// (nebo http jen na localhost)."
+        )
+    return f"HOTOVO_API_URL musí být http(s)://, dostal {u.scheme!r}"
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -62,26 +89,21 @@ async def _request(
 ) -> dict:
     """Sjednocený REST call → vrací gemma-friendly dict {ok, result|error}."""
     url = f"{base_url.rstrip('/')}{path}"
+    # POZN: cancel_event NEPOUŽÍVÁME přes .wait() — turn_state cancel_event je
+    # threading.Event (ne asyncio.Event), takže asyncio.create_task(ev.wait())
+    # by sync-blocking voláním zmrazilo celý event loop (stejný bug jako měl
+    # claude bridge). Cancelaci řeší volající loop přes asyncio.wait_for kolem
+    # tool.execute() + httpx vlastní `timeout`. Pre-flight is_set() check stačí.
+    if cancel_event is not None and cancel_event.is_set():
+        return {"ok": False, "error": "canceled"}
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            req_task = asyncio.create_task(client.request(
+            resp = await client.request(
                 method, url,
                 headers=_headers(token),
                 params=_drop_empty(params or {}),
                 json=body,
-            ))
-            waiters: list[asyncio.Task] = [req_task]
-            cancel_task = None
-            if cancel_event is not None:
-                cancel_task = asyncio.create_task(cancel_event.wait())
-                waiters.append(cancel_task)
-            done, pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-            if cancel_task is not None and cancel_task in done:
-                req_task.cancel()
-                return {"ok": False, "error": "canceled"}
-            for t in pending:
-                t.cancel()
-            resp = req_task.result()
+            )
     except httpx.TimeoutException:
         return {"ok": False, "error": f"HOTOVO timeout po {timeout}s ({method} {path})"}
     except httpx.HTTPError as e:
@@ -122,17 +144,27 @@ def _make_tool(
     path_template: str,                  # např. "/api/tasks/{id}"
     body_keys: tuple[str, ...] = (),     # které args jdou do body (POST/PUT)
     query_keys: tuple[str, ...] = (),    # které do query string (GET filter, ?confirm)
+    nullable_body_keys: tuple[str, ...] = (),  # keys kde explicit None SE POSÍLÁ
+    static_body: dict | None = None,     # vždy přidané do body (např. status:completed)
     base_url_provider,                   # callable → str (lazy, lze monkeypatch)
     token_provider,                      # callable → str
     timeout_provider,                    # callable → float
 ) -> Tool:
-    """Vyrobí Tool s execute callbackem, který sestaví REST request z args."""
+    """Vyrobí Tool s execute callbackem, který sestaví REST request z args.
+
+    `nullable_body_keys`: pro update_task — `due_date: null` (smaž termín) a
+    `parent_id: null` (odpoj rodiče) jsou sémanticky platné, takže explicit
+    None se MUSÍ poslat (ne dropnout jako u create_task). Codex review.
+    """
     async def _execute(args: dict, ctx: ExecuteContext) -> dict:
         base_url = base_url_provider()
         token = token_provider()
         timeout = timeout_provider()
         if not base_url:
             return {"ok": False, "error": "HOTOVO_API_URL není nastavený (export HOTOVO_API_URL=...)"}
+        url_err = _validate_base_url(base_url)
+        if url_err:
+            return {"ok": False, "error": url_err}
 
         # Path s {id}, {list_id} substitucí
         path = path_template
@@ -146,7 +178,18 @@ def _make_tool(
                 from urllib.parse import quote
                 path = path.replace(token_marker, quote(val, safe=""))
 
-        body = {k: args[k] for k in body_keys if k in args and args[k] is not None} or None
+        # Body: nenull keys jen pokud non-None; nullable keys i s explicit None.
+        body: dict = {}
+        for k in body_keys:
+            if k not in args:
+                continue
+            if args[k] is None and k not in nullable_body_keys:
+                continue  # drop implicit/empty None (create_task default behavior)
+            body[k] = args[k]
+        if static_body:
+            body.update(static_body)
+        body = body or None
+
         params = {k: args[k] for k in query_keys if k in args and args[k] is not None}
 
         return await _request(
@@ -301,6 +344,9 @@ def build_tools(
             method="PUT", path_template="/api/tasks/{id}",
             body_keys=("title", "description", "status", "priority",
                        "due_date", "list_id", "parent_id"),
+            # due_date:null = smaž termín, parent_id:null = odpoj rodiče — explicit
+            # None SE POSÍLÁ (codex review HIGH #2).
+            nullable_body_keys=("due_date", "parent_id"),
             base_url_provider=base_url_provider,
             token_provider=token_provider,
             timeout_provider=timeout_provider,
@@ -319,14 +365,13 @@ def build_tools(
                 "additionalProperties": False,
             },
             method="PUT", path_template="/api/tasks/{id}",
-            body_keys=(),  # nepoužíváme — vidíme níže, status posíláme manuálně
+            # static_body zajistí {"status":"completed"} vždy — žádný externí
+            # patch (codex review HIGH #3: build_tools() je teď self-contained).
+            static_body={"status": "completed"},
             base_url_provider=base_url_provider,
             token_provider=token_provider,
             timeout_provider=timeout_provider,
         ),
-        # complete_task musí poslat body {"status":"completed"} bez ohledu na args.
-        # Above _make_tool fungoval pro generic case; pro tento override:
-        # Přepíšeme execute zvlášť níže.
         _make_tool(
             gemma_name="hotovo_delete_task",
             description=(
@@ -349,33 +394,3 @@ def build_tools(
             timeout_provider=timeout_provider,
         ),
     ]
-
-
-def fix_complete_task_execute(
-    tool: Tool,
-    *, base_url_provider, token_provider, timeout_provider,
-) -> Tool:
-    """Override execute pro complete_task — vždy posílá body {'status':'completed'}.
-    Generický _make_tool to neumí (body_keys=() znamená body=None)."""
-    async def _execute(args: dict, ctx: ExecuteContext) -> dict:
-        base_url = base_url_provider()
-        token = token_provider()
-        timeout = timeout_provider()
-        if not base_url:
-            return {"ok": False, "error": "HOTOVO_API_URL není nastavený"}
-        task_id = args.get("id")
-        if not isinstance(task_id, str) or not task_id:
-            return {"ok": False, "error": "chybí povinný parametr 'id'"}
-        from urllib.parse import quote
-        path = f"/api/tasks/{quote(task_id, safe='')}"
-        return await _request(
-            "PUT", base_url, path, token, timeout,
-            body={"status": "completed"},
-            cancel_event=ctx.cancel_event,
-        )
-    return Tool(
-        name=tool.name,
-        description=tool.description,
-        parameters_schema=tool.parameters_schema,
-        execute=_execute,
-    )
