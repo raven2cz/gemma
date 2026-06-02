@@ -1,0 +1,15 @@
+# Uncensored gemma4 26b komunitní fine-tune (VladimirGav), Q4_XS quant laděný
+# na 16 GB VRAM. NENÍ default, jen volitelná alternativa pro testování bez
+# content filtru. Pull base: ollama pull VladimirGav/gemma4-26b-16GB-VRAM-Uncensored
+#
+# num_ctx 8192: autor ladil model přesně na 16 GB, nativní num_ctx je 8192.
+# Forsírovat 32k by KV cache přetlačila VRAM (OOM nebo těžký CPU offload).
+# RTX 5070 Ti má 16 GB a Chatterbox TTS bere ~3 GB když je v paměti.
+FROM VladimirGav/gemma4-26b-16GB-VRAM-Uncensored:latest
+
+PARAMETER num_ctx 8192
+PARAMETER temperature 0.7
+PARAMETER top_p 0.95
+PARAMETER top_k 64
+
+SYSTEM """Jsi užitečný kódovací agent v terminálu. Odpovídej česky, pokud uživatel nepožádá o jiný jazyk. Pro anglické odborné termíny používej originální anglické názvy. Buď stručný, přesný a respektuj konvence projektu."""

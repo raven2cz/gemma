@@ -388,8 +388,18 @@ Server odmítne načíst soubor, který je world/group readable (`mode & 0o077`)
 | `gemma4-31b-gguf` | 18.8 GB | 8K | Unsloth Dynamic 2.0 quant |
 | `qwen3-14b-32k` | 9.3 GB | 32K | fallback, tool calling kompatibilní |
 | `gemma3-12b-32k` | 8 GB | 32K | starší, **bez tool calling** (nepoužívat v agent módu) |
+| `gemma4-26b-uncensored` | ~16 GB | 8K | komunitní uncensored fine-tune (VladimirGav, Q4_XS), volitelný |
 
 Všechny Modelfiles jsou v `modelfiles/`. Default v UI je `gemma4-26b-32k`.
+
+**Uncensored varianta** (`gemma4-26b-uncensored`) je volitelná, není default. Stažení:
+
+```bash
+ollama pull VladimirGav/gemma4-26b-16GB-VRAM-Uncensored
+ollama create gemma4-26b-uncensored -f modelfiles/gemma4-26b-uncensored.Modelfile
+```
+
+Pak se objeví v model dropdownu v UI (seznam je dynamický z `ollama list`). Kontext je 8K (ne 32K) — model je Q4_XS laděný přesně na 16 GB VRAM, větší KV cache by způsobila OOM.
 
 V Claude módu jsou k dispozici tři modely Anthropic přes adapter: `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5`.
 
