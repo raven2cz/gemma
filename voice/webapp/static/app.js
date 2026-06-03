@@ -1186,6 +1186,13 @@ async function runTurn() {
           }
           case 'audio_error':
             console.warn(`tts chunk ${ev.seq} failed: ${ev.msg}`);
+            // Zobraz JEN první audio_error v turnu viditelně (banner), ať user
+            // ví proč nehraje zvuk (typicky VRAM OOM). Další chunky téhož turnu
+            // už jen do konzole - žádný spam.
+            if (!ctx._audioErrShown) {
+              ctx._audioErrShown = true;
+              showError(`🔇 TTS: ${ev.msg || 'syntéza selhala'}`, { sticky: true });
+            }
             break;
           case 'lang':
             outLang = ev.lang;

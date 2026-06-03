@@ -578,7 +578,9 @@ async def _synth_chunk_and_emit(
                         tid, seq, err_name)
             await out_queue.put({
                 "type": "audio_error", "seq": seq,
-                "msg": "TTS nemá dost VRAM. Přepni LLM na menší model nebo restartuj Ollamu.",
+                "msg": ("TTS nemá dost VRAM (velký LLM + Chatterbox se nevejdou "
+                        "na 16 GB). Řešení: menší model (gemma4-e4b-32k), nebo "
+                        "přepni TTS backend na OpenAI (settings), nebo agent mód."),
             })
             return
         log.exception("turn %s: tts chunk %d failed", tid, seq)
