@@ -9,6 +9,7 @@ import sys
 import threading
 from pathlib import Path
 import numpy as np
+from num2words import num2words
 import soundfile as sf
 import torch
 import torch.nn.functional as F
@@ -268,7 +269,7 @@ HERE = Path(__file__).parent
 CKPT = HERE / "chatterbox-cs" / "t3_cs.safetensors"
 REF = HERE / "ref_female.wav"
 
-# Cenzorované vzory → CS slovy, ať TTS nehláskuje
+# Digit-by-digit fallback (jen pro extrémně dlouhé řetězce číslic - IDs, hashe).
 DIGITS_CS = {"0":"nula","1":"jedna","2":"dva","3":"tři","4":"čtyři","5":"pět","6":"šest","7":"sedm","8":"osm","9":"devět"}
 ABBREV = {
     "atd.":"a tak dále", "apod.":"a podobně", "např.":"například", "tj.":"to jest",
@@ -278,8 +279,93 @@ ABBREV = {
     "GPU":"gépéúčko", "CPU":"sépéúčko", "CS":"česky", "EN":"anglicky",
     "LLM":"el el em", "TTS":"té té es", "STT":"es té té",
 }
+
+# Symboly → CS slova (před číselnou normalizací, ať "70%" → "70 procent").
+SYMBOLS_CS = {
+    "%": " procent", "‰": " promile", "°C": " stupňů celsia", "°": " stupňů",
+    "€": " eur", "$": " dolarů", "£": " liber", "&": " a ", "+": " plus ",
+    "×": " krát ", "÷": " děleno ", "=": " rovná se ",
+}
+
+# Anglické termíny → fonetický přepis do češtiny. Chatterbox jede přes
+# polský checkpoint (pl trik), takže anglická slova čte polsko/česky =
+# šíleně. Tady nejčastější tech termíny. Rozšiřitelné. Case-insensitive
+# match jako celá slova. Best-effort - nepokryje vše, ale ty nejčastější ano.
+EN_PHONETIC_CS = {
+    "email": "ímejl", "e-mail": "ímejl", "online": "onlajn", "offline": "oflajn",
+    "software": "softvér", "hardware": "hardvér", "default": "defolt",
+    "browser": "brauzr", "feature": "fíčr", "file": "fajl", "files": "fajly",
+    "commit": "komit", "deploy": "deploj", "release": "rilís", "update": "apdejt",
+    "upgrade": "apgrejd", "download": "daunloud", "upload": "aplout",
+    "frontend": "frontend", "backend": "bekend", "framework": "frejmvork",
+    "open source": "oupn sors", "open-source": "oupn sors", "issue": "išjú",
+    "pull request": "pul rikvest", "merge": "mardž", "branch": "brenč",
+    "username": "júzrnejm", "password": "pasvord", "login": "logyn",
+    "cache": "keš", "queue": "kjú", "timeout": "tajmaut", "thread": "tred",
+    "token": "token", "endpoint": "endpojnt", "request": "rikvest",
+    "response": "respons", "debug": "dýbag", "build": "bild",
+}
+
 MAX_CHARS = 180  # Chatterbox 1000 kroků ~ 8 s audia ~ 150-200 znaků CS
+MIN_CHARS = 12   # kratší chunky Chatterbox halucinuje (GitHub #97) → merge
 PAUSE_MS = 120
+
+
+def _int_to_cs(num_str: str) -> str:
+    """Celé číslo → česká slova přes num2words. Velmi dlouhé řetězce (IDs,
+    hashe, telefon) → po číslicích (číst 16místné číslo jako jeden číselný
+    výraz je nesmysl). num2words selhání → digit fallback (nikdy nespadne)."""
+    if len(num_str) > 12:
+        return " ".join(DIGITS_CS[c] for c in num_str)
+    try:
+        return num2words(int(num_str), lang="cs")
+    except Exception:
+        return " ".join(DIGITS_CS.get(c, c) for c in num_str)
+
+
+def _num_to_cs(m: "re.Match") -> str:
+    """Match handler: desetinné (3.14 / 3,14) i celé. Desetinné jen bez mezer
+    kolem oddělovače (chrání před '3, 4 a 5' = výčet, ne 3.4)."""
+    s = m.group(0)
+    if re.fullmatch(r"\d+[.,]\d+", s):
+        try:
+            return num2words(float(s.replace(",", ".")), lang="cs")
+        except Exception:
+            return s
+    return _int_to_cs(s)
+
+
+def _version_to_cs(m: "re.Match") -> str:
+    """Verze / IP (0.1.7, 192.168.1.1) → každé číslo kardinálně, tečky jako
+    'tečka'. Jinak by decimal regex rozbil '0.1.7' na 'nula celá jedna.sedm'."""
+    parts = m.group(0).split(".")
+    return " tečka ".join(_int_to_cs(p) for p in parts)
+
+
+def _version_to_en(m: "re.Match") -> str:
+    parts = m.group(0).split(".")
+    spoken = []
+    for p in parts:
+        try:
+            spoken.append(num2words(int(p), lang="en"))
+        except Exception:
+            spoken.append(p)
+    return " dot ".join(spoken)
+
+
+def _int_to_en(m: "re.Match") -> str:
+    s = m.group(0)
+    if re.fullmatch(r"\d+[.,]\d+", s):
+        try:
+            return num2words(float(s.replace(",", ".")), lang="en")
+        except Exception:
+            return s
+    if len(s) > 12:
+        return " ".join(s)
+    try:
+        return num2words(int(s), lang="en")
+    except Exception:
+        return s
 
 ANSI_ESC = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07")
 THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -337,14 +423,22 @@ def normalize_cs(text: str) -> str:
     # Zkratky jako celá slova (case-sensitive pro VRAM apod.)
     for k, v in sorted(ABBREV.items(), key=lambda kv: -len(kv[0])):
         text = re.sub(rf"(?<!\w){re.escape(k)}(?!\w)", v, text)
-    # Čísla → slova, pouze pro 1-3místná čísla
-    def num_to_words(m):
-        n = m.group(0)
-        if len(n) == 1:
-            return DIGITS_CS[n]
-        return " ".join(DIGITS_CS[c] for c in n)
-    text = re.sub(r"\b\d{1,3}\b", num_to_words, text)
-    # Akronymy 2+ velkými → hláskovat
+    # Anglické termíny → fonetický CS přepis (case-insensitive, celá slova).
+    # Delší fráze ("open source") před kratšími slovy.
+    for k, v in sorted(EN_PHONETIC_CS.items(), key=lambda kv: -len(kv[0])):
+        text = re.sub(rf"(?<!\w){re.escape(k)}(?!\w)", v, text, flags=re.IGNORECASE)
+    # Symboly → slova (před čísly: "70%" → "70 procent" → "sedmdesát procent").
+    for k, v in sorted(SYMBOLS_CS.items(), key=lambda kv: -len(kv[0])):
+        text = text.replace(k, v)
+    # Spojené tisíce s mezerou: "1 000" / "10 000" → "1000" ať num2words trefí.
+    text = re.sub(r"(?<=\d) (?=\d{3}(?:\D|$))", "", text)
+    # Verze / IP (X.Y.Z, 2+ tečky) PŘED desetinnými (jinak rozbije 0.1.7).
+    text = re.sub(r"\b\d+(?:\.\d+){2,}\b", _version_to_cs, text)
+    # Čísla → slova přes num2words (desetinné i celé, libovolná délka).
+    # Desetinné MUSÍ být před celými (jinak "3.14" rozbije na "3" "." "14").
+    text = re.sub(r"\d+[.,]\d+", _num_to_cs, text)
+    text = re.sub(r"\d+", _num_to_cs, text)
+    # Akronymy 2+ velkými → hláskovat (po ABBREV/EN, ať NASA → "N A S A").
     def spell_caps(m):
         return " ".join(m.group(0))
     text = re.sub(r"\b[A-Z]{2,}\b", spell_caps, text)
@@ -357,8 +451,13 @@ def normalize_cs(text: str) -> str:
 def normalize_en(text: str) -> str:
     """Minimální normalizace pro anglický TTS. Nepoužívá CZ ABBREV (GPU → "gépéúčko"
     je špatně) ani spell_caps (v EN se „NASA" čte jako slovo, ne hláskování).
-    Ponechává apostrofy ("don't", "it's") a běžnou interpunkci."""
+    Ponechává apostrofy ("don't", "it's") a běžnou interpunkci.
+    Čísla expanduje num2words (lang=en) - Chatterbox je sám nerozvíjí."""
     text = _strip_control(text)
+    text = re.sub(r"(?<=\d) (?=\d{3}(?:\D|$))", "", text)
+    text = re.sub(r"\b\d+(?:\.\d+){2,}\b", _version_to_en, text)
+    text = re.sub(r"\d+[.,]\d+", _int_to_en, text)
+    text = re.sub(r"\d+", _int_to_en, text)
     text = re.sub(r"[*_`#~]+", " ", text)
     text = re.sub(r"[^\w\s.,;:!?\-–—()\"']+", " ", text, flags=re.UNICODE)
     text = re.sub(r"\s+", " ", text).strip()
@@ -393,7 +492,25 @@ def chunk(text: str) -> list[str]:
                 buf = p
         if buf:
             out.append(buf)
-    return out
+    return _merge_short(out)
+
+
+def _merge_short(chunks: list[str]) -> list[str]:
+    """Slij příliš krátké chunky (< MIN_CHARS) se sousedem. Chatterbox na
+    krátkých segmentech (jednotlivé slovo/číslo) halucinuje šum nebo jiné slovo
+    (GitHub #97). Sloučení dá modelu víc kontextu. Zachová pořadí; pokud by
+    sloučení překročilo MAX_CHARS, neslévá (radši krátký než hallucinující dlouhý)."""
+    if not chunks:
+        return chunks
+    merged: list[str] = []
+    for c in chunks:
+        if merged and (len(c) < MIN_CHARS or len(merged[-1]) < MIN_CHARS):
+            joined = merged[-1] + " " + c
+            if len(joined) <= MAX_CHARS:
+                merged[-1] = joined
+                continue
+        merged.append(c)
+    return merged
 
 def main():
     if len(sys.argv) < 3:

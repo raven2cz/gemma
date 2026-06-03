@@ -138,6 +138,10 @@ Default `tts_scope=final`: nahlas se přečte jen finální odpověď. Mezikola 
 
 Code bloky se nikdy nečtou nahlas. Sentence chunker je vyseparuje a pošle do UI jako `kind: "code", speakable: false`. System prompt to modelu explicitně dovoluje: žádný markdown styling, ale ` ```jazyk … ``` ` fences jsou OK (a u `read_file` výstupu má strip-nout line-number prefixy `     1\t…`).
 
+**Text normalizace** (`voice/tts_cs.py`): Chatterbox sám čísla ani symboly nerozvíjí, takže to děláme my před synth. `normalize_cs` / `normalize_en` převedou čísla na slova přes `num2words` (`42` → "čtyřicet dva", `9875` → "devět tisíc osmset sedmdesát pět", `3.14` → "tři celá čtrnáct"), verze a IP čtou tečky jako "tečka" (`0.1.7` → "nula tečka jedna tečka sedm"), symboly (`%` → "procent"), a anglické tech termíny mají fonetický CS přepis (`commit` → "komit", `email` → "ímejl", protože model jede přes polský checkpoint a anglickou výslovnost komolí). Příliš krátké chunky se slévají — Chatterbox na jednotlivých slovech/číslech halucinuje šum nebo jiné slovo ([upstream issue #97](https://github.com/resemble-ai/chatterbox/issues/97)).
+
+Český hlas je community finetune [Thomcles/Chatterbox-TTS-Czech](https://huggingface.co/Thomcles/Chatterbox-TTS-Czech) (CC0) načtený přes multilingual model s `language_id="pl"` trikem (oficiální `cs` Chatterbox zatím nemá). `chatterbox-tts` je pinnutý na `0.1.7` (nejnovější) kvůli monkey-patchi no-CFG cesty v `tts_cs.py`.
+
 Před TTS synth se uvolní Ollama LLM z VRAM (`keep_alive=0` na `/api/generate`). Bez toho gemma4-26b (10 GB) + Chatterbox TTS (3 GB) přetlačí 16 GB RTX 5070 Ti při activations peak a první synth OOM-ne. Cena: další turn re-loadne LLM (3-5 s).
 
 ## Rychlá instalace (automatický skript)
@@ -257,7 +261,7 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 
 # Server stack + parser + testy.
 pip install fastapi uvicorn[standard] httpx pydantic python-multipart \
-            pyte pytest pytest-asyncio pytest-timeout
+            pyte num2words pytest pytest-asyncio pytest-timeout
 
 # Chatterbox TTS (český hlasový model).
 pip install chatterbox-tts

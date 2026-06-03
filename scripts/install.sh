@@ -349,7 +349,7 @@ else
 
   warn "Instaluju server stack (FastAPI, httpx, pyte, pytest)..."
   pip install fastapi 'uvicorn[standard]' httpx pydantic python-multipart \
-    pyte pytest pytest-asyncio pytest-timeout >/dev/null
+    pyte num2words pytest pytest-asyncio pytest-timeout >/dev/null
 
   warn "Instaluju Chatterbox TTS..."
   pip install chatterbox-tts >/dev/null
