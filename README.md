@@ -436,6 +436,11 @@ Environment="OLLAMA_MODELS=/home/box/git/github/gemma/models/ollama"
 Environment="OLLAMA_KEEP_ALIVE=4m"
 Environment="OLLAMA_FLASH_ATTENTION=1"
 Environment="OLLAMA_KV_CACHE_TYPE=q8_0"
+# KRITICKÉ na 16 GB: drž jen JEDEN model ve VRAM. Bez tohoto ollama při
+# přepnutí modelu nechá starý resident (keep_alive) → dva ~10-13 GB modely
+# naráz → OOM (a lokální TTS pak nemá VRAM). Na single-GPU 16 GB se dva
+# velké modely stejně nikdy nevejdou.
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
 ProtectHome=no
 ReadWritePaths=/home/box/git/github/gemma
 ```
