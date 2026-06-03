@@ -79,8 +79,31 @@
         <p class="group-hint">Voice family se automaticky přepne podle detekovaného jazyka (např. <code>ref_{family}_{lang}.wav</code>).</p>
 
         <label class="field">
+          <span class="field-label">TTS backend</span>
+          <select id="tts-backend" class="select field-control">
+            <option value="local">lokální (Chatterbox, zdarma/offline)</option>
+            <option value="openai">OpenAI (cloud, kvalita, čísla+angličtina)</option>
+          </select>
+        </label>
+
+        <label class="field" id="voice-field">
           <span class="field-label">voice</span>
           <select id="voice-select" class="select field-control"></select>
+        </label>
+
+        <label class="field" id="openai-voice-field" hidden>
+          <span class="field-label">OpenAI hlas</span>
+          <select id="openai-voice" class="select field-control">
+            <option value="nova">nova (ženský)</option>
+            <option value="shimmer">shimmer (ženský)</option>
+            <option value="coral">coral (ženský)</option>
+            <option value="alloy">alloy (neutrální)</option>
+            <option value="sage">sage (neutrální)</option>
+            <option value="echo">echo (mužský)</option>
+            <option value="onyx">onyx (mužský)</option>
+            <option value="ash">ash (mužský)</option>
+            <option value="ballad">ballad (mužský)</option>
+          </select>
         </label>
 
         <div class="field-advanced" id="ref-field" hidden>

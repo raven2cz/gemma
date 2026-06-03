@@ -126,6 +126,13 @@ _TTS_READY = asyncio.Event()
 # (historický workaround, nejlepší kvalita).
 LANG_TO_ID = {"cs": "pl", "en": "en"}
 
+# TTS backend: "local" (Chatterbox, default, zdarma/offline) | "openai"
+# (cloud, platí se, ale zvládá čeština+angličtina+čísla nativně bez normalizace).
+# Default z env, per-request override přes body `tts_backend`.
+TTS_BACKEND_DEFAULT = os.environ.get("TTS_BACKEND", "local").lower().strip()
+OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip()
+OPENAI_TTS_VOICE_DEFAULT = os.environ.get("OPENAI_TTS_VOICE", "nova").strip()
+
 
 def _import_tts_cs():
     """Import tts_cs (side-effect: monkey-patch). Single-entry point."""
@@ -431,6 +438,21 @@ def _tts_synth_chunk_blocking(
     """
     import numpy as np
     import soundfile as sf
+
+    # OpenAI backend: cloud synth, žádný lokální model, žádná tts_cs normalizace
+    # (OpenAI zvládá čísla i angličtinu nativně). Zapíše WAV přímo na out_path.
+    if turn_state.get("tts_backend") == "openai":
+        from voice import openai_tts as _oai
+        cancel_event = turn_state.get("cancel_event")
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        return _oai.synth_openai_blocking(
+            text, out_path,
+            voice=turn_state.get("openai_voice") or _oai.DEFAULT_VOICE,
+            model=OPENAI_TTS_MODEL,
+            lang=lang,
+            cancel_event=cancel_event,
+        )
 
     _switch_tts_blocking(lang)
     model = _TTS_MODEL
@@ -1730,8 +1752,10 @@ async def _run_agent_turn(
                 # a /api/ps po-check chvíli ukazuje staré modely. Pokud po
                 # 5 pokusech (= 2.5s) VRAM nepuští, raději skip audio než OOM
                 # (TTS by stejně padl a tool_result text nepřišel by k user).
-                _vram_ok = False
-                for _attempt in range(5):
+                # OpenAI backend nepotřebuje lokální VRAM → neuvolňuj LLM
+                # (bonus: LLM zůstane hot, žádný 3-5s reload na příští turn).
+                _vram_ok = turn_state.get("tts_backend") == "openai"
+                for _attempt in range(0 if _vram_ok else 5):
                     _unloaded, _residual = await _unload_all_llms(verify=True)
                     if _residual is not None and _residual <= 1024**3:
                         _vram_ok = True
@@ -2448,6 +2472,11 @@ async def turn(req: Request):
     fast = bool(body.get("fast"))
     want_tts = bool(body.get("want_tts", True))
     stream_tts = bool(body.get("stream_tts", True))
+    # TTS backend: local (Chatterbox) | openai. Per-request override + env default.
+    tts_backend = (body.get("tts_backend") or TTS_BACKEND_DEFAULT).lower().strip()
+    if tts_backend not in {"local", "openai"}:
+        tts_backend = "local"
+    openai_voice = (body.get("openai_voice") or OPENAI_TTS_VOICE_DEFAULT).strip()
     # tts_scope: jen pro agent mode (final/off). Pro chat mode ignorováno.
     _tts_scope_raw = (body.get("tts_scope") or "").lower().strip()
     if mode == "agent":
@@ -2509,8 +2538,9 @@ async def turn(req: Request):
     # který může být jiný než user_lang (assistant odpoví v EN na CZ otázku).
     # Tady jen pre-fetch default, aby pádná chybka propadla dřív.
 
-    # TTS readiness (když ho chceme). Agent + scope=off → neblokujeme.
-    if effective_tts:
+    # TTS readiness (když ho chceme). OpenAI backend NEČEKÁ na lokální Chatterbox
+    # load (cloud, žádný lokální model). Agent + scope=off → neblokujeme vůbec.
+    if effective_tts and tts_backend == "local":
         if not _TTS_READY.is_set():
             try:
                 await asyncio.wait_for(_TTS_READY.wait(), timeout=60.0)
@@ -2518,8 +2548,16 @@ async def turn(req: Request):
                 raise HTTPException(503, "TTS se ještě načítá, zkus to za chvíli.")
         if _TTS_ERROR:
             raise HTTPException(503, f"TTS preload selhal: {_TTS_ERROR}")
+    elif effective_tts and tts_backend == "openai":
+        from voice import openai_tts as _oai
+        if not _oai.is_available():
+            raise HTTPException(503, "OpenAI TTS: chybí OPENAI_API_KEY")
 
     tid, turn_state = await _register_turn()
+    # Stash TTS backend volby do turn_state — synth chunk je čte (minimální
+    # threading; chunk synth už turn_state dostává).
+    turn_state["tts_backend"] = tts_backend
+    turn_state["openai_voice"] = openai_voice
 
     if mode == "claude":
         return await _run_claude_turn(

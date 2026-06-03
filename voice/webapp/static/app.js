@@ -147,6 +147,8 @@ const state = {
   // Agent-mode TTS scope: 'final' = jen finální odpověď po toolech (default),
   // 'off' = bez TTS v agent módu. V chat módu ignorováno (chat má vlastní stream_tts).
   ttsScope: (localStorage.getItem('ttsScope') === 'off') ? 'off' : 'final',
+  // TTS backend: 'local' (Chatterbox) | 'openai'. Default local.
+  ttsBackend: (localStorage.getItem('ttsBackend') === 'openai') ? 'openai' : 'local',
   // Per-turn kontext (audio queue, cancel flag, turn id). Inicializuje runTurn().
   turnCtx: null,
   // Conversation mode. 'chat' = klasický single-turn LLM; 'agent' = tool-calling
@@ -973,6 +975,9 @@ async function runTurn() {
         claude_model: state.mode === 'claude'
           ? (document.getElementById('claude-model-select')?.value || localStorage.getItem('claudeModel') || 'opus')
           : undefined,
+        // TTS backend (local Chatterbox | openai) + OpenAI hlas.
+        tts_backend: state.ttsBackend,
+        openai_voice: document.getElementById('openai-voice')?.value || 'nova',
       }),
       signal: abort.signal,
     });
@@ -2217,6 +2222,36 @@ modelSelect.addEventListener('change', () => {
   console.info(`[model] changed → ${modelSelect.value}`);
 });
 voiceSelect.addEventListener('change', () => localStorage.setItem('voice', voiceSelect.value));
+
+// TTS backend přepínač: persist + toggle viditelnosti voice fieldů.
+const _ttsBackendSel = document.getElementById('tts-backend');
+const _openaiVoiceSel = document.getElementById('openai-voice');
+const _voiceField = document.getElementById('voice-field');
+const _openaiVoiceField = document.getElementById('openai-voice-field');
+const _refFieldEl = document.getElementById('ref-field');
+function _syncTtsBackendUI() {
+  const isOpenai = state.ttsBackend === 'openai';
+  if (_voiceField) _voiceField.hidden = isOpenai;
+  if (_openaiVoiceField) _openaiVoiceField.hidden = !isOpenai;
+  // legacy explicit ref nedává smysl pro openai
+  if (_refFieldEl && isOpenai) _refFieldEl.hidden = true;
+}
+if (_ttsBackendSel) {
+  const savedB = localStorage.getItem('ttsBackend');
+  if (savedB === 'openai' || savedB === 'local') _ttsBackendSel.value = savedB;
+  _ttsBackendSel.addEventListener('change', () => {
+    state.ttsBackend = _ttsBackendSel.value === 'openai' ? 'openai' : 'local';
+    localStorage.setItem('ttsBackend', state.ttsBackend);
+    _syncTtsBackendUI();
+    console.info(`[tts] backend → ${state.ttsBackend}`);
+  });
+}
+if (_openaiVoiceSel) {
+  const savedV = localStorage.getItem('openaiVoice');
+  if (savedV) _openaiVoiceSel.value = savedV;
+  _openaiVoiceSel.addEventListener('change', () => localStorage.setItem('openaiVoice', _openaiVoiceSel.value));
+}
+_syncTtsBackendUI();
 refSelect.addEventListener('change', () => {
   localStorage.setItem('refExplicit', refSelect.value);
 });

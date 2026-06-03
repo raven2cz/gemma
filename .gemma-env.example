@@ -20,6 +20,16 @@
 # přímo zde (ale méně bezpečné, env je viditelný v `ps`):
 # export HOTOVO_API_TOKEN=agent_...
 
+# ──────────────── TTS backend ────────────────
+# local (default, Chatterbox, zdarma/offline) | openai (cloud, kvalita,
+# čeština+angličtina+čísla nativně). Přepínatelné i v UI per-turn.
+# export TTS_BACKEND=openai
+# export OPENAI_TTS_MODEL=gpt-4o-mini-tts   # nebo tts-1-hd / tts-1
+# export OPENAI_TTS_VOICE=nova              # alloy/echo/onyx/shimmer/...
+#
+# OpenAI klíč: ~/.gemma-openai-key (0600) má přednost, pak OPENAI_API_KEY env.
+# export OPENAI_API_KEY=sk-proj-...
+
 # ──────────────── Claude bridge ────────────────
 # Mode: print (default, per-turn subprocess) | tmux (persistent session, continuity)
 # export AGENT_CLAUDE_BRIDGE_MODE=tmux

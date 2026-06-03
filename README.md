@@ -142,6 +142,19 @@ Code bloky se nikdy nečtou nahlas. Sentence chunker je vyseparuje a pošle do U
 
 Český hlas je community finetune [Thomcles/Chatterbox-TTS-Czech](https://huggingface.co/Thomcles/Chatterbox-TTS-Czech) (CC0) načtený přes multilingual model s `language_id="pl"` trikem (oficiální `cs` Chatterbox zatím nemá). `chatterbox-tts` je pinnutý na `0.1.7` (nejnovější) kvůli monkey-patchi no-CFG cesty v `tts_cs.py`.
 
+### TTS backend: lokální vs OpenAI
+
+Přepínatelné (v UI nebo `TTS_BACKEND` env), default **lokální**:
+
+| | lokální Chatterbox (default) | OpenAI TTS (opt-in) |
+|---|---|---|
+| Cena | zdarma | ~$0.015/1000 znaků (gpt-4o-mini-tts), ~$4-13/měs běžné použití |
+| Offline / privátní | ano | ne (text jde do cloudu) |
+| Čeština + angličtina + čísla | text-normalizace (num2words, fonetika) | **nativně, bez hacků** |
+| Latence | lokální GPU (+ LLM unload) | ~2-3 s síť, ale LLM zůstane hot |
+
+OpenAI backend přeskočí veškerou `tts_cs` normalizaci (model čísla i code-switching zvládá sám) a nepotřebuje uvolnit LLM z VRAM (žádný lokální TTS model). Klíč: `~/.gemma-openai-key` (0600, má přednost) nebo `OPENAI_API_KEY`. Model přes `OPENAI_TTS_MODEL` (default `gpt-4o-mini-tts`), hlas `OPENAI_TTS_VOICE` (default `nova`) nebo per-turn v UI.
+
 Před TTS synth se uvolní Ollama LLM z VRAM (`keep_alive=0` na `/api/generate`). Bez toho gemma4-26b (10 GB) + Chatterbox TTS (3 GB) přetlačí 16 GB RTX 5070 Ti při activations peak a první synth OOM-ne. Cena: další turn re-loadne LLM (3-5 s).
 
 ## Rychlá instalace (automatický skript)
